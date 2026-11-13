@@ -1,3 +1,8 @@
+> Historical standalone-stack workflow. Its motion entry points are retired from
+> the current installation. Use the [current architecture](autonomy_stack.md)
+> and [change audit](simplification_audit.md); these earlier steps are not the
+> current startup procedure.
+
 # Lite3 daily startup: return to the verified milestone
 
 Prepared 2026-11-12 for group 8, robot 4, ROS 2 Humble.

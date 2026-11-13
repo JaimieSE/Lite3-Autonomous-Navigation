@@ -14,7 +14,6 @@ def main(args=None):
     from rclpy.executors import SingleThreadedExecutor
     from rclpy.node import Node
     from std_srvs.srv import Trigger
-    from lite3_locomotion.guarded_adapter import ARM, STOP
     from lite3_locomotion.exploration_coordinator import START, MISSION_STOP
 
     context = Context()
@@ -44,25 +43,13 @@ def main(args=None):
 
     try:
         if options.command == 'start':
-            call(ARM)
-            # Allow the coordinator to receive the adapter's enabled heartbeat.
-            deadline = time.monotonic() + 0.2
-            while time.monotonic() < deadline:
-                executor.spin_once(timeout_sec=0.02)
             call(START)
         else:
-            errors = []
-            for service in (STOP, MISSION_STOP):
-                try:
-                    call(service)
-                except Exception as error:
-                    errors.append(str(error))
-            if errors:
-                raise RuntimeError('; '.join(errors))
+            call(MISSION_STOP)
     except Exception as error:
         if options.command == 'start':
             try:
-                call(STOP)
+                call(MISSION_STOP)
             except Exception:
                 pass
         raise SystemExit(str(error))

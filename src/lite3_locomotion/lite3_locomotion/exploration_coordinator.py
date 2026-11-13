@@ -1,27 +1,43 @@
-"""Explicitly started, bounded frontier mission using Nav2 NavigateToPose."""
+"""Bounded frontier missions consuming existing Nav2; preview by default.
+
+No velocity publisher, transport, lifecycle transitions or mode commands.
+Enabling action dispatch can move a robot through its existing navigation stack.
+"""
 
 import argparse
 import json
 import math
+import re
 import sys
 import time
 
 from lite3_locomotion.exploration_preview import grid_from_message
 from lite3_locomotion.frontiers import FrontierConfig, select_frontiers
-from lite3_locomotion.guarded_adapter import ENABLED, STOP
+from lite3_locomotion.movement_guard import scan_is_clear
 
 
-ACTION = '/lite3_autonomy/navigate_to_pose'
+ACTION = '/navigate_to_pose'
 START = '/lite3_locomotion/start_exploration'
 MISSION_STOP = '/lite3_locomotion/stop_exploration'
 
 
 def parse_options(args):
-    parser = argparse.ArgumentParser(description='Disarmed-by-default Nav2 frontier coordinator', allow_abbrev=False)
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument('--radius', type=float, default=3.0)
+    parser.add_argument('--session-seconds', type=float, default=60.0)
+    parser.add_argument('--nav2-namespace', default='')
+    parser.add_argument('--enable-navigation', action='store_true',
+                        help='Permit goals to the existing Nav2 server; may cause physical motion')
     options = parser.parse_args(args)
     try:
         FrontierConfig(radius=options.radius, clearance=0.4)
+        if not math.isfinite(options.session_seconds) or not 0 < options.session_seconds <= 300:
+            raise ValueError('session-seconds must be in (0, 300]')
+        namespace = options.nav2_namespace.strip('/')
+        if namespace and any(re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', part) is None
+                             for part in namespace.split('/')):
+            raise ValueError('Invalid Nav2 namespace')
+        options.nav2_namespace = '/' + namespace if namespace else ''
     except ValueError as error:
         parser.error(str(error))
     return options
@@ -34,9 +50,10 @@ def create_node(options, context):
     from lifecycle_msgs.srv import GetState
     from rclpy.action import ActionClient
     from rclpy.node import Node
-    from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+    from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
     from rclpy.time import Time
-    from std_msgs.msg import Bool, String
+    from std_msgs.msg import String
+    from sensor_msgs.msg import LaserScan
     from std_srvs.srv import Trigger
     from tf2_ros import Buffer, TransformException, TransformListener
 
@@ -47,8 +64,12 @@ def create_node(options, context):
             self.running = False
             self.epoch = 0
             self.grid = self.map_received = None
-            self.guard_enabled = False
-            self.guard_received = None
+            self.scan_received = self.scan_stamp = None
+            self.scan_clear = False
+            self.started_at = None
+            self.inflight = {}
+            self.cancel_deadlines = {}
+            self.cancel_failed = False
             self.center = None
             self.goal_handle = None
             self.pending = False
@@ -60,17 +81,18 @@ def create_node(options, context):
             self.lifecycle_states = {}
             self.lifecycle_pending = set()
             self.lifecycle_clients = {name: self.create_client(
-                GetState, '/lite3_autonomy/' + name + '/get_state')
+                GetState, options.nav2_namespace + '/' + name + '/get_state')
                 for name in ('controller_server', 'planner_server', 'bt_navigator')}
             self.buffer = Buffer()
             self.listener = TransformListener(self.buffer, self)
             qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
                              durability=DurabilityPolicy.TRANSIENT_LOCAL)
             self.map_sub = self.create_subscription(OccupancyGrid, '/map', self.on_map, qos)
-            self.enabled_sub = self.create_subscription(Bool, ENABLED, self.on_enabled, qos)
+            self.scan_sub = self.create_subscription(LaserScan, '/scan', self.on_scan, qos_profile_sensor_data)
             self.status_pub = self.create_publisher(String, '/lite3_locomotion/exploration_status', qos)
-            self.client = ActionClient(self, NavigateToPose, ACTION)
-            self.stop_client = self.create_client(Trigger, STOP)
+            # Preview cannot submit a goal even if a navigation server is present.
+            self.client = (ActionClient(self, NavigateToPose, options.nav2_namespace + ACTION)
+                           if options.enable_navigation else None)
             self.start_service = self.create_service(Trigger, START, self.start)
             self.stop_service = self.create_service(Trigger, MISSION_STOP, self.stop_service_callback)
             self.timer = self.create_timer(2.0, self.tick)
@@ -100,17 +122,24 @@ def create_node(options, context):
                 if self.running:
                     self.stop_mission('invalid_map')
 
-        def on_enabled(self, message):
-            self.guard_enabled = message.data
-            self.guard_received = time.monotonic()
-            if self.running and not message.data:
-                self.stop_mission('guard_disarmed', request_guard_stop=False)
+        def on_scan(self, message):
+            self.scan_stamp = Time.from_msg(message.header.stamp)
+            coverage = abs(message.angle_increment) * max(0, len(message.ranges) - 1)
+            self.scan_clear = (message.header.frame_id == 'base_link' and
+                               math.isfinite(coverage) and 6.0 <= coverage <= 6.4 and
+                               scan_is_clear(message.ranges, message.range_min, message.range_max))
+            self.scan_received = time.monotonic()
+            if self.running and not self.scan_clear:
+                self.stop_mission('scan_obstacle_or_invalid')
 
         def ready(self):
             now = time.monotonic()
-            return (self.guard_enabled and self.guard_received is not None and now - self.guard_received <= 0.5 and
+            scan_age = ((self.get_clock().now() - self.scan_stamp).nanoseconds / 1e9
+                        if self.scan_stamp is not None else math.inf)
+            return (self.scan_clear and self.scan_received is not None and
+                    0 <= now - self.scan_received <= 0.5 and -0.2 <= scan_age <= 0.5 and
                     self.grid is not None and self.map_received is not None and now - self.map_received <= 30 and
-                    self.nav2_active() and self.client.server_is_ready())
+                    (self.client is None or (self.nav2_active() and self.client.server_is_ready())))
 
         def nav2_active(self):
             now = time.monotonic()
@@ -133,47 +162,81 @@ def create_node(options, context):
             if self.running:
                 response.success, response.message = True, 'Mission already running; bounds unchanged'
                 return response
+            if self.inflight or self.cancel_failed:
+                response.success, response.message = False, 'Previous goal termination is unconfirmed'
+                return response
             if not self.ready() or p is None:
                 response.success = False
-                response.message = 'Requires fresh map/TF, active Nav2 lifecycle nodes, and an explicitly armed adapter'
+                response.message = 'Requires fresh map/TF/clear scan and, for dispatch, active existing Nav2'
                 return response
             self.epoch += 1
             self.running = True
             self.center = p
+            self.started_at = time.monotonic()
+            self.current = None
             self.failures = self.goals_sent = 0
             self.blocked.clear()
             self.reason = 'running'
-            response.success, response.message = True, 'Bounded frontier mission started'
+            response.success, response.message = True, ('Bounded frontier mission started' if self.client
+                                                        else 'Preview started; navigation output disabled')
             self.tick()
             return response
 
         def stop_service_callback(self, request, response):
             self.stop_mission('operator_stop')
-            response.success, response.message = True, 'Mission stopped; cancellation and software stop requested'
+            response.success, response.message = True, 'Mission stopped; goal cancellation requested, not physical stop confirmation'
             return response
 
-        def stop_mission(self, reason, request_guard_stop=True):
+        def stop_mission(self, reason):
             self.running = False
             self.epoch += 1  # Late goal-accept callbacks must cancel, never resume.
             self.reason = reason
-            if self.goal_handle is not None:
-                self.goal_handle.cancel_goal_async()
+            for epoch, handle in list(self.inflight.items()):
+                if handle is not None:
+                    self.cancel_goal(epoch, handle)
             self.goal_handle = None
             self.pending = False
             self.sent_at = None
-            if request_guard_stop and self.stop_client.service_is_ready():
-                self.stop_client.call_async(Trigger.Request())
+
+        def cancel_goal(self, epoch, handle):
+            if epoch in self.cancel_deadlines:
+                return
+            self.cancel_deadlines[epoch] = time.monotonic() + 3.0
+            try:
+                handle.cancel_goal_async().add_done_callback(lambda done: self.cancel_response(done, epoch))
+            except Exception:
+                self.cancel_failed = True
+
+        def cancel_response(self, future, epoch):
+            if epoch not in self.inflight:
+                return  # Terminal result already received.
+            try:
+                response = future.result()
+                if response.return_code != 0 or not response.goals_canceling:
+                    self.cancel_failed = True
+            except Exception:
+                self.cancel_failed = True
 
         def supervise(self):
             if self.running and (not self.ready() or self.pose() is None):
-                self.stop_mission('map_tf_guard_or_nav2_unavailable')
+                self.stop_mission('map_tf_scan_or_nav2_unavailable')
+            if self.running and (time.monotonic() - self.started_at >= options.session_seconds or
+                                 math.dist(self.pose() or self.center, self.center) >= options.radius):
+                self.stop_mission('session_deadline_or_radius')
             if self.running and self.sent_at is not None and time.monotonic() - self.sent_at >= 30:
                 self.stop_mission('goal_deadline')
+            if any(time.monotonic() >= deadline for deadline in self.cancel_deadlines.values()):
+                self.cancel_failed = True
+            if self.cancel_failed:
+                self.reason = 'goal_termination_unconfirmed'
 
         def tick(self):
             message = String()
             message.data = json.dumps(dict(running=self.running, reason=self.reason, goals_sent=self.goals_sent,
-                                          nav2_active=self.nav2_active()))
+                                          nav2_active=self.nav2_active(), navigation_enabled=self.client is not None,
+                                          pending_termination=bool(self.inflight) and not self.running,
+                                          selected_goal=(dict(x=self.current.x, y=self.current.y, yaw=self.current.yaw)
+                                                         if self.current else None)))
             self.status_pub.publish(message)
             if not self.running or self.pending or self.goal_handle is not None:
                 return
@@ -194,6 +257,9 @@ def create_node(options, context):
                 self.stop_mission('no_eligible_frontiers_in_session_area')
                 return
             self.current = choices[0]
+            if self.client is None:
+                self.reason = 'preview_goal_selected'
+                return
             goal = NavigateToPose.Goal()
             goal.pose.header.frame_id = 'map'
             goal.pose.header.stamp = self.get_clock().now().to_msg()
@@ -204,8 +270,13 @@ def create_node(options, context):
             self.sent_at = now
             self.goals_sent += 1
             epoch = self.epoch
-            future = self.client.send_goal_async(goal)
-            future.add_done_callback(lambda done: self.accepted(done, epoch))
+            self.inflight[epoch] = None
+            try:
+                future = self.client.send_goal_async(goal)
+                future.add_done_callback(lambda done: self.accepted(done, epoch))
+            except Exception:
+                self.cancel_failed = True
+                self.stop_mission('goal_submission_unconfirmed')
 
         @staticmethod
         def key(candidate):
@@ -215,28 +286,38 @@ def create_node(options, context):
             try:
                 handle = future.result()
             except Exception:
+                self.cancel_failed = True
                 if epoch == self.epoch:
-                    self.stop_mission('goal_submission_failed')
+                    self.stop_mission('goal_submission_unconfirmed')
                 return
+            if not handle.accepted:
+                self.inflight.pop(epoch, None)
+            else:
+                self.inflight[epoch] = handle
+                handle.get_result_async().add_done_callback(lambda done: self.completed(done, epoch))
             if epoch != self.epoch or not self.running:
                 if handle.accepted:
-                    handle.cancel_goal_async()
+                    self.cancel_goal(epoch, handle)
                 return
             self.pending = False
             if not handle.accepted:
                 self.finish_goal(False)
                 return
             self.goal_handle = handle
-            handle.get_result_async().add_done_callback(lambda done: self.completed(done, epoch))
 
         def completed(self, future, epoch):
-            if epoch != self.epoch or not self.running:
-                return
             try:
-                succeeded = future.result().status == GoalStatus.STATUS_SUCCEEDED
+                status = future.result().status
+                if status not in (GoalStatus.STATUS_SUCCEEDED, GoalStatus.STATUS_ABORTED, GoalStatus.STATUS_CANCELED):
+                    raise ValueError('Nonterminal navigation result')
             except Exception:
-                succeeded = False
-            self.finish_goal(succeeded)
+                self.cancel_failed = True
+                self.stop_mission('goal_result_unconfirmed')
+                return
+            self.inflight.pop(epoch, None)
+            self.cancel_deadlines.pop(epoch, None)
+            if epoch == self.epoch and self.running:
+                self.finish_goal(status == GoalStatus.STATUS_SUCCEEDED)
 
         def finish_goal(self, succeeded):
             if self.current is not None:
@@ -258,10 +339,11 @@ def main(args=None):
     import rclpy
     from rclpy.context import Context
     from rclpy.executors import ExternalShutdownException, SingleThreadedExecutor
+    from rclpy.signals import SignalHandlerOptions
     context = Context()
     node = executor = None
     try:
-        rclpy.init(args=[], context=context)
+        rclpy.init(args=[], context=context, signal_handler_options=SignalHandlerOptions.NO)
         node = create_node(options, context)
         executor = SingleThreadedExecutor(context=context)
         executor.add_node(node)
@@ -272,6 +354,11 @@ def main(args=None):
         try:
             if node is not None and context.ok():
                 node.stop_mission('shutdown')
+                deadline = time.monotonic() + 3.0
+                while executor is not None and node.inflight and context.ok() and time.monotonic() < deadline:
+                    executor.spin_once(timeout_sec=0.05)
+                if node.inflight:
+                    node.get_logger().error('Navigation termination unconfirmed during shutdown')
         finally:
             if executor is not None:
                 executor.shutdown()

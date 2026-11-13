@@ -1,4 +1,4 @@
-"""Bounded 2D frontier selection for visualization only; no ROS or actuation."""
+"""Bounded 2D frontier selection shared by preview and missions; no ROS I/O."""
 
 from collections import deque
 from dataclasses import dataclass

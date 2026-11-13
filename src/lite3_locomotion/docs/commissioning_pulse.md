@@ -1,3 +1,8 @@
+> Historical standalone-stack workflow. Its motion entry points are retired from
+> the current installation. Use the [current architecture](autonomy_stack.md)
+> and [change audit](simplification_audit.md); these earlier steps are not the
+> current startup procedure.
+
 # Single-process commissioning pulse
 
 ## Why this runner exists
