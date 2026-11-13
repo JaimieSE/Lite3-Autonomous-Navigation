@@ -126,7 +126,7 @@ def harness():
     assert os.environ['FASTDDS_DEFAULT_PROFILES_FILE'] == profile
     assert 'ROS_DISCOVERY_SERVER' not in os.environ
     assert 'ROS_SUPER_CLIENT' not in os.environ
-    executable = ROOT / '.colcon/install/lite3_locomotion/lib/lite3_locomotion/locomotion_controller'
+    executable = ROOT / '.colcon/audit_install/lite3_locomotion/lib/lite3_locomotion/locomotion_controller'
     assert os.environ['LITE3_TEST_EXECUTABLE'] == str(executable)
 
     import rclpy
@@ -137,7 +137,7 @@ def harness():
 
     # Verify the installed package is tested, rather than implicitly importing source.
     import lite3_locomotion
-    assert (ROOT / '.colcon/install') in Path(lite3_locomotion.__file__).resolve().parents
+    assert (ROOT / '.colcon/audit_install') in Path(lite3_locomotion.__file__).resolve().parents
     context = Context()
     rclpy.init(args=[], context=context)
     node = None

@@ -12,7 +12,7 @@ import sys
 import time
 
 from lite3_locomotion.command_policy import Velocity
-from lite3_locomotion.movement_guard import MovementGuard, scan_is_clear
+from lite3_legacy.movement_guard import MovementGuard, scan_is_clear
 
 
 NAV_COMMAND = '/lite3_autonomy/nav_cmd_vel'

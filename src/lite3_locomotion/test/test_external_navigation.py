@@ -1,4 +1,4 @@
-"""Existing NavigateToPose contract, synthetic sensors, no Nav2 or transport.
+"""Nav2 client, preview and real-planner checks with no motion transport.
 
 Only tools/run_autonomy_integration.py may opt into this real-DDS suite.
 """
@@ -321,7 +321,7 @@ def test_missing_server_and_invalid_map_fail_closed(world):
 def test_cli_calls_only_mission_services(world):
     import subprocess
     root = Path(__file__).resolve().parents[1]
-    executable = root / '.colcon/university_install/lite3_locomotion/lib/lite3_locomotion/autonomy_control'
+    executable = root / '.colcon/audit_install/lite3_locomotion/lib/lite3_locomotion/autonomy_control'
     for command in ('start', 'stop'):
         process = subprocess.Popen([str(executable), command], stdout=subprocess.PIPE,
                                    stderr=subprocess.STDOUT, text=True)
@@ -371,3 +371,117 @@ def test_installed_launch_starts_one_preview_node_without_navigation_servers():
                 process.kill()
                 process.wait(timeout=3)
         world.close()
+
+
+def test_university_navfn_plans_on_synthetic_map_without_motion(tmp_path):
+    """Run only the real university planner plugin in the isolated test domain."""
+    import signal
+    import subprocess
+    import yaml
+    from lifecycle_msgs.srv import ChangeState
+    from nav2_msgs.action import ComputePathToPose
+    from rclpy.action import ActionClient
+
+    university = Path(os.environ.get('LITE3_UNIVERSITY_PARAMS',
+        '/home/user/ros2_ws/src/lite3_launcher/config/nav2_params.yaml'))
+    if not university.is_file():
+        pytest.skip('University parameter source unavailable; mock contract tests still run')
+    parameters = yaml.safe_load(university.read_text())
+    assert parameters['planner_server']['ros__parameters']['GridBased']['plugin'] == \
+        'nav2_navfn_planner/NavfnPlanner'
+    # Match university RewrittenYaml namespace handling without changing its file.
+    config = tmp_path / 'university_planner.yaml'
+    config.write_text(yaml.safe_dump({'planning_check': parameters}))
+    world = World(dispatch=False)
+    process = client = None
+    log = (tmp_path / 'planner.log').open('w')
+    try:
+        process = subprocess.Popen([
+            'ros2', 'run', 'nav2_planner', 'planner_server', '--ros-args',
+            '-r', '__ns:=/planning_check', '--params-file', str(config),
+            '-r', '/planning_check/map:=/map',
+            '-r', '/planning_check/tf:=/tf', '-r', '/planning_check/tf_static:=/tf_static'],
+            stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+        lifecycle = world.node.create_client(ChangeState, '/planning_check/planner_server/change_state')
+        world.wait(lifecycle.service_is_ready, timeout=10)
+        for transition in (1, 3):  # configure, activate: isolated test instance only
+            request = ChangeState.Request()
+            request.transition.id = transition
+            future = lifecycle.call_async(request)
+            world.wait(future.done, timeout=15)
+            assert future.result().success, (tmp_path / 'planner.log').read_text()
+        client = ActionClient(world.node, ComputePathToPose, '/planning_check/compute_path_to_pose')
+        world.wait(client.server_is_ready)
+        goal = ComputePathToPose.Goal()
+        goal.start.header.frame_id = goal.goal.header.frame_id = 'map'
+        goal.start.pose.orientation.w = goal.goal.pose.orientation.w = 1.0
+        goal.goal.pose.position.x = 1.0
+        goal.planner_id, goal.use_start = 'GridBased', True
+        submitted = client.send_goal_async(goal)
+        world.wait(submitted.done)
+        handle = submitted.result()
+        assert handle.accepted
+        result = handle.get_result_async()
+        world.wait(result.done, timeout=10)
+        assert result.result().status == 4, (tmp_path / 'planner.log').read_text()
+        path = result.result().result.path
+        assert path.header.frame_id == 'map' and len(path.poses) > 2
+        assert path.poses[-1].pose.position.x == pytest.approx(1.0, abs=0.1)
+        assert not world.goals
+        assert not any('cmd_vel' in name for name, _ in world.node.get_topic_names_and_types())
+    finally:
+        if client is not None:
+            client.destroy()
+        if process is not None and process.poll() is None:
+            os.killpg(process.pid, signal.SIGINT)
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait(timeout=3)
+        log.close()
+        world.close()
+
+
+def test_result_subscription_failure_cancels_and_latches_restart(world):
+    from concurrent.futures import Future
+    pending = Future()
+    canceled = []
+
+    def unavailable_result():
+        raise RuntimeError('Result service unavailable')
+
+    def cancel():
+        canceled.append(True)
+        response = Future()
+        response.set_result(SimpleNamespace(return_code=0, goals_canceling=[object()]))
+        return response
+
+    handle = SimpleNamespace(accepted=True, get_result_async=unavailable_result, cancel_goal_async=cancel)
+    world.coordinator.client = SimpleNamespace(server_is_ready=lambda: True, send_goal_async=lambda _: pending)
+    assert world.start().success
+    pending.set_result(handle)
+    assert canceled == [True]
+    assert not world.coordinator.running and world.coordinator.cancel_failed
+    assert not world.start().success
+
+
+def test_immediate_result_does_not_restore_completed_goal_handle(world):
+    from concurrent.futures import Future
+    pending, next_pending, terminal = Future(), Future(), Future()
+    terminal.set_result(SimpleNamespace(status=4))  # success already available
+    submissions = []
+
+    def send(goal):
+        submissions.append(goal)
+        return pending if len(submissions) == 1 else next_pending
+
+    handle = SimpleNamespace(accepted=True, get_result_async=lambda: terminal)
+    world.coordinator.client = SimpleNamespace(server_is_ready=lambda: True, send_goal_async=send)
+    assert world.start().success
+    pending.set_result(handle)
+    assert len(submissions) == 2
+    assert world.coordinator.running and world.coordinator.pending
+    assert world.coordinator.goal_handle is None  # first goal must not become active again
+    world.stop()
+    next_pending.set_result(SimpleNamespace(accepted=False))

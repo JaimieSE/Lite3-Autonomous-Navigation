@@ -12,11 +12,11 @@ def main():
     root = Path(__file__).resolve().parents[1]
     results = root / '.colcon' / 'integration'
     results.mkdir(parents=True, exist_ok=True)
-    prefix = root / '.colcon' / 'install' / 'lite3_locomotion'
+    prefix = root / '.colcon' / 'audit_install' / 'lite3_locomotion'
     executable = prefix / 'lib' / 'lite3_locomotion' / 'locomotion_controller'
     site_packages = prefix / 'lib' / f'python{sys.version_info.major}.{sys.version_info.minor}' / 'site-packages'
     if not executable.is_file() or not site_packages.is_dir():
-        raise SystemExit('Build the package into .colcon/install first; see README.md')
+        raise SystemExit('Build the package into .colcon/audit_install first; see README.md')
     profile = str(root / 'test' / 'loopback_dds.xml')
     env = os.environ.copy()
     # No discovery-server forwarding, custom transport overrides, daemon, or SHM.

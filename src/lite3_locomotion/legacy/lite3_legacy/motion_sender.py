@@ -16,7 +16,7 @@ import time
 import uuid
 
 from lite3_locomotion.command_policy import PolicyConfig, Velocity, ZERO
-from lite3_locomotion.protocol_preview import preview_packets
+from lite3_legacy.protocol_preview import preview_packets
 
 
 COMMAND = '/lite3_robot_link/cmd_vel'

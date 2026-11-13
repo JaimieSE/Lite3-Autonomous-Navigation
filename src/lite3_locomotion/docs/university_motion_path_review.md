@@ -183,7 +183,7 @@ uninspected server as a verified working or fewer-change implementation.
 The local autonomy stack and university stack use different topic families:
 `/lite3_autonomy/nav_cmd_vel` is not `/nav_cmd_vel` or `/cmd_vel`.
 
-The [guard](../lite3_locomotion/guarded_adapter.py) currently pins robot output
+The [guard](../legacy/lite3_legacy/guarded_adapter.py) currently pins robot output
 to `/lite3_robot_link/cmd_vel` and requires the new local sender's ready/session
 handshake and specific node identities. The legacy vendor bridge has no such
 handshake. Publishing to its `/cmd_vel` or simply renaming the vendor node will

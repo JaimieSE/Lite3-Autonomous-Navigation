@@ -20,7 +20,7 @@ flowchart TD
     N --> C[University planner, controller and costmaps]
     C --> VS[Velocity smoother]
     VS --> MX[Twist mux: navigation and joystick]
-    MX --> B[Existing university bridge, remote deployment unverified]
+    MX --> B[Existing university motion_sender, system domain 64]
     B --> R[Vendor locomotion]
     T[Future terrain assessment] -.->|Traversability and speed policies| C
 ```
@@ -87,7 +87,8 @@ successful mission stop service response or cancellation acknowledgement.
 A terminal action result confirms navigation termination, not measured robot rest.
 
 The former velocity clamp, per-command watchdog and sender-session mechanism
-remain in retained legacy source and unit tests, but are **not in the university
+remain in [excluded legacy source](../legacy/README.md) and offline regression
+tests, but are **not in the university
 command path**. Do not claim their protection for this architecture. The
 university mux's expiry does not establish crash-safe braking. Before live
 exploration, inspect the deployed bridge and all command inputs, independent
@@ -105,11 +106,24 @@ namespaced action bindings, disabled output, mission CLI, success/rejection/abor
 cancellation, stale input and deadlines. This verifies the installed action
 contract, not performance of the university planner or the physical robot.
 
-The current live domain exposed only `/lite3_domain_bridge_8` and telemetry,
-not `/map`, `/scan`, Nav2 or outbound motion subscriptions. Nothing was started
-to change that. The inspected installed university launch files resolve to the
-available source. Deployment remains with the existing university operators.
-See the [audit](simplification_audit.md) for evidence and retirement decisions.
+The earlier group-domain inspection did not expose Nav2 or a map. Subsequent
+read-only inspection of the system computer's domain 64 found `/motion_sender`
+subscribing to `/cmd_vel`, `/cmd_vel_corrected`, `/simple_cmd` and `/complex_cmd`,
+with live target parameters `192.168.1.120:43893`. No shared service was changed
+to obtain this evidence. Runtime forward navigation remains unverified; see
+the historical [supervised trial](walking_trial_2026-11-13.md), which produced
+stepping in place and an operator-confirmed stop.
+
+The complete [file inventory and dependency audit](code_audit.md) records the
+second cleanup. Only the pure scan predicate remains in active
+[safety.py](../lite3_locomotion/safety.py); the velocity gate and all custom
+transport modules are excluded from installation. The active coordinator never
+imports them. The fixed-topic non-actuating controller is retained as an
+optional regression harness, not a production motion path.
+
+The isolated integration suite additionally exercises real university Navfn
+planning against a synthetic map; it launches no velocity-producing controller.
+This verifies planning and client behavior, not full navigation/firmware behavior.
 
 ## Terrain traversal
 

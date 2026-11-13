@@ -7,7 +7,7 @@ import struct
 import pytest
 
 from lite3_locomotion.command_policy import Velocity
-from lite3_locomotion.motion_sender import TransportGate, parse_options
+from lite3_legacy.motion_sender import TransportGate, parse_options
 
 
 @pytest.fixture

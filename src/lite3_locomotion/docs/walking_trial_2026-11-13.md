@@ -32,7 +32,7 @@ was unavailable, so no system source, services or configuration were changed.
    This is the previously documented posture toggle; it was not repeated.
    The local observer received the same message. The operator then confirmed
    standing. An earlier sender initialization error occurred before publication.
-2. The retained [commissioning pulse](../lite3_locomotion/commissioning_pulse.py)
+2. The retained [commissioning pulse](../legacy/lite3_legacy/commissioning_pulse.py)
    was invoked from source with explicit physical-test options. It used the
    existing group-domain-8 `/cmd_vel` bridge and observed system domain 64.
    An initial import-path error occurred before any command; after fixing the

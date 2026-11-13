@@ -56,7 +56,7 @@ All processes created by these checks have exited.
 | --- | --- |
 | [Vendor Jetson2Motion.cpp](../vendor/Lite3_ROS/src/transfer/src/Jetson2Motion.cpp) | Actual official ROS/UDP movement-command source; `MotionSender::CmdVelCallback` |
 | [Source manifest](../vendor/Lite3_ROS/SOURCE_MANIFEST.json) | Pinned source commit and per-file SHA256 hashes; downloaded bytes checked against upstream Git blob hashes |
-| [bounded_test.py](../lite3_locomotion/bounded_test.py) | Proposed one-shot movement/stop/handback sequencer; returns intents only |
+| [bounded_test.py](../legacy/lite3_legacy/bounded_test.py) | Proposed one-shot movement/stop/handback sequencer; returns intents only |
 | [Unit tests](../test/test_bounded_test.py) | Preconditions, speed/duration bounds, watchdog, kill, shutdown, no rearming, and missing/late handback confirmation |
 | [Dry-run tool](../tools/preview_movement_test.py) | Writes simulated normal and killed runs without importing ROS or opening sockets |
 | [Recorded dry run](../.colcon/review/movement_plan.json) | JSON intent trace; all mode confirmations are explicitly simulated |

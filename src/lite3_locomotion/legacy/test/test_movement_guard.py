@@ -4,8 +4,8 @@ import math
 import pytest
 
 from lite3_locomotion.command_policy import Velocity, ZERO
-from lite3_locomotion.movement_guard import MovementGuard, scan_is_clear
-from lite3_locomotion.guarded_adapter import parse_options
+from lite3_legacy.movement_guard import MovementGuard, scan_is_clear
+from lite3_legacy.guarded_adapter import parse_options
 
 
 @pytest.fixture

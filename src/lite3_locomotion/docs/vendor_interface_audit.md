@@ -24,7 +24,7 @@ stale-command timer or shutdown zero-command transmission.
 Each packet contains three signed 32-bit header fields (`cmd_code`, `size=8`,
 `type=1`) and a double value, under 4-byte C++ struct packing. Upstream transmits
 native struct memory without explicit byte-order conversion. The Python
-[preview module](../lite3_locomotion/protocol_preview.py) assumes little-endian
+[preview module](../legacy/lite3_legacy/protocol_preview.py) assumes little-endian
 encoding and a 20-byte packet. Actual firmware ABI and version remain unverified.
 The module validates and limits commands using the existing policy, returns
 bytes only, and contains no socket, transport, startup, or mode-switching code.

@@ -1,6 +1,6 @@
 import pytest
 
-from lite3_locomotion.bounded_test import (
+from lite3_legacy.bounded_test import (
     BoundedMovementTest, MANUAL_MODE_CODE, TestPlan, TestState,
 )
 from lite3_locomotion.command_policy import ZERO

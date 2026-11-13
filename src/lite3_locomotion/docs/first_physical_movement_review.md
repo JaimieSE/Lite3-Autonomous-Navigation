@@ -74,7 +74,7 @@ Source evidence, not deployment evidence:
 - Its callback sends UDP codes 320/325/321 for forward/lateral/negative ROS yaw,
   with double payloads. Its IP/port parameters default to `192.168.1.120:43893`.
   A source default is not this robot's deployed configuration.
-- The new [local sender](../lite3_locomotion/motion_sender.py) expects
+- The new [local sender](../legacy/lite3_legacy/motion_sender.py) expects
   `/lite3_robot_link/cmd_vel`, requires an explicit target and opt-in for
   non-loopback output, but is not active on the live graph.
 
@@ -245,17 +245,17 @@ No integration runner or robot-output executable was launched for this review.
 
 Blocking gaps for the requested first movement:
 
-1. [bounded_test.py](../lite3_locomotion/bounded_test.py) implements a 0.5 s,
+1. [bounded_test.py](../legacy/lite3_legacy/bounded_test.py) implements a 0.5 s,
    0.03 m/s pulse only as OFFLINE intents. Its duration cap is 1 s; the earlier
    proposed two-second test is outside that sequencer's existing bounds.
 2. [autonomy_control.py](../lite3_locomotion/autonomy_control.py) starts frontier
    exploration, not a forward-only timed pulse. Do not use it as a first-pulse
    command. Nav2 may turn or send a different sequence, or find no goals.
-3. [motion_sender.py](../lite3_locomotion/motion_sender.py) bounds a session
+3. [motion_sender.py](../legacy/lite3_legacy/motion_sender.py) bounds a session
    (default 30 s), not a pulse measured from first nonzero output. It permits
    reverse/yaw within limits and has no measured stop detector or mode feedback.
    `physical_stop_verified` is explicitly always false.
-4. [guarded_adapter.py](../lite3_locomotion/guarded_adapter.py) permits only the
+4. [guarded_adapter.py](../legacy/lite3_legacy/guarded_adapter.py) permits only the
    expected Nav2 publisher in robot mode. An ad-hoc test publisher will fail the
    check. Do not spoof `controller_server` or remap around the guard to make a
    pulse work. A separately reviewed commissioning path is needed.

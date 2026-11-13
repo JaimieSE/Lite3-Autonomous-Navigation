@@ -1,10 +1,10 @@
 from glob import glob
-from setuptools import find_packages, setup
+from setuptools import setup
 
 setup(
     name='lite3_locomotion',
     version='0.1.0',
-    packages=find_packages(exclude=['test']),
+    packages=['lite3_locomotion'],
     data_files=[
         ('share/ament_index/resource_index/packages', ['resource/lite3_locomotion']),
         ('share/lite3_locomotion', ['package.xml', 'README.md']),

@@ -13,7 +13,7 @@ The operator observed no walking. It did not establish robot acceptance or
 stopping. Separate publisher processes introduced a **1.436 s gap** between
 the last forward callback and first zero, so that procedure must not be reused.
 
-[commissioning_pulse.py](../lite3_locomotion/commissioning_pulse.py) replaces
+[commissioning_pulse.py](../legacy/lite3_legacy/commissioning_pulse.py) replaces
 that sequence with one publisher and monotonic deadlines. It is a manual
 commissioning tool, **not** a LiDAR collision guard or autonomy integration.
 It never changes control mode, gait or posture and never automatically sits.

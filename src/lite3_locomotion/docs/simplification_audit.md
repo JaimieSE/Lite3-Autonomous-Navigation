@@ -127,3 +127,24 @@ Before live exploration, inspect the existing system-computer bridge, command
 sources, independent watchdog/stop behavior and current action ownership using
 read-only access. No service start, Auto Mode or physical trial is part of this
 refactor.
+
+## Complete follow-up code audit
+
+The [file-by-file inventory and final verification](code_audit.md) covers the
+second cleanup, preserved first at commit `11e4776` and branch
+`preserve/pre-code-audit-2026-11-13`. Six retained legacy motion modules have
+now moved outside the installed Python package, with their offline tests and
+bounded simulation preserved. The active scan predicate remains in
+[safety.py](../lite3_locomotion/safety.py). The fresh supported installation is
+`.colcon/audit_install`; old generated installations are retained as historical
+artifacts and are not selected by current test runners.
+
+Final follow-up validation: 153 active unit tests passed, 153 legacy offline
+regression tests passed, 21 navigation/planning/preview integration tests passed
+and 11 non-actuating controller integration tests passed. Real Navfn planning
+was exercised with the university configuration and synthetic inputs. No shared
+university service was changed or restarted, no extra motion bridge was started
+and no physical commands were sent during this audit. The existing motion
+sender is now verified read-only in system domain 64; full physical navigation
+remains unverified. See the inventory for the exact distinction between mock
+action tests, real planning and actual robot operation.

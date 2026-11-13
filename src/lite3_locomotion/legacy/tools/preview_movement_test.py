@@ -6,10 +6,11 @@ from pathlib import Path
 import sys
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "legacy"))
 
-from lite3_locomotion.bounded_test import BoundedMovementTest, TestState
+from lite3_legacy.bounded_test import BoundedMovementTest, TestState
 
 
 def simulate(kill_at=None):

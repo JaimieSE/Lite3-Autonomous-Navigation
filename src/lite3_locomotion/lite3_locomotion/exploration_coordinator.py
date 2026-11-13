@@ -13,7 +13,7 @@ import time
 
 from lite3_locomotion.exploration_preview import grid_from_message
 from lite3_locomotion.frontiers import FrontierConfig, select_frontiers
-from lite3_locomotion.movement_guard import scan_is_clear
+from lite3_locomotion.safety import scan_is_clear
 
 
 ACTION = '/navigate_to_pose'
@@ -285,25 +285,32 @@ def create_node(options, context):
         def accepted(self, future, epoch):
             try:
                 handle = future.result()
+                accepted = handle.accepted
             except Exception:
                 self.cancel_failed = True
                 if epoch == self.epoch:
                     self.stop_mission('goal_submission_unconfirmed')
                 return
-            if not handle.accepted:
+            if not accepted:
                 self.inflight.pop(epoch, None)
-            else:
-                self.inflight[epoch] = handle
+                if epoch == self.epoch and self.running:
+                    self.pending = False
+                    self.finish_goal(False)
+                return
+            self.inflight[epoch] = handle
+            # Set state before registering callbacks: a completed future may
+            # invoke its callback immediately and submit the next frontier.
+            if epoch == self.epoch and self.running:
+                self.pending = False
+                self.goal_handle = handle
+            try:
                 handle.get_result_async().add_done_callback(lambda done: self.completed(done, epoch))
-            if epoch != self.epoch or not self.running:
-                if handle.accepted:
-                    self.cancel_goal(epoch, handle)
+            except Exception:
+                self.cancel_failed = True
+                self.stop_mission('goal_result_subscription_failed')
                 return
-            self.pending = False
-            if not handle.accepted:
-                self.finish_goal(False)
-                return
-            self.goal_handle = handle
+            if (epoch != self.epoch or not self.running) and epoch in self.inflight:
+                self.cancel_goal(epoch, handle)
 
         def completed(self, future, epoch):
             try:

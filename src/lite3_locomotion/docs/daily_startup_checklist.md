@@ -438,5 +438,5 @@ frontier exploration. Do not run the recovery candidate or separate custom UDP
 sender alongside the already working university motion bridge.
 
 Related implementation details: [autonomy stack](autonomy_stack.md),
-[guarded adapter](../lite3_locomotion/guarded_adapter.py),
+[guarded adapter](../legacy/lite3_legacy/guarded_adapter.py),
 [control client](../lite3_locomotion/autonomy_control.py).

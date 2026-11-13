@@ -3,7 +3,7 @@ import struct
 import pytest
 
 from lite3_locomotion.command_policy import PolicyConfig, Velocity
-from lite3_locomotion.protocol_preview import preview_packets
+from lite3_legacy.protocol_preview import preview_packets
 
 
 def test_packet_layout_headers_axis_order_and_yaw_sign():

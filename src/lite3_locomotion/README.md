@@ -23,13 +23,17 @@ flowchart LR
 
 The source-verified default action is `/navigate_to_pose`, type
 `nav2_msgs/action/NavigateToPose`; the coordinator supports an explicit Nav2
-namespace. The active domain inspected on 2026-11-13 exposed telemetry, with no
-Nav2 server or command bridge visible. Source compatibility and isolated tests
-are verified separately from live bridge availability.
+namespace. Read-only system-domain-64 inspection confirms the existing
+`/motion_sender` and its `/cmd_vel` input. The group-domain navigation server
+has not been demonstrated running. Bridge discovery and isolated planning tests
+are separate from successful physical autonomous navigation.
 
 See [architecture and usage](docs/autonomy_stack.md), the
 [change and interface audit](docs/simplification_audit.md), and
 [terrain work remaining](docs/autonomy_stack.md#terrain-traversal).
+The [complete code inventory](docs/code_audit.md) lists every file and its
+keep/modify/archive decision. Six retired transport/commissioning modules now
+live outside the installable Python package in [legacy](legacy/README.md).
 The original implementation is preserved on Git branch
 `preserve/pre-university-reuse-2026-11-13` (baseline `e2e0552`). Work is on
 `refactor/university-navigation`. The workspace initially had an empty Git
@@ -41,26 +45,35 @@ From this package directory, with the existing ROS Humble environment sourced:
 
 ```bash
 colcon --log-base "$PWD/.colcon/log" build --base-paths "$PWD" \
-  --packages-select lite3_locomotion --build-base "$PWD/.colcon/university_build" \
-  --install-base "$PWD/.colcon/university_install"
+  --packages-select lite3_locomotion --build-base "$PWD/.colcon/audit_build" \
+  --install-base "$PWD/.colcon/audit_install"
 PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q -p no:cacheprovider test
 PYTHONDONTWRITEBYTECODE=1 python3 tools/run_autonomy_integration.py
+PYTHONDONTWRITEBYTECODE=1 python3 tools/run_ros_integration.py
 ```
 
 The integration runner uses only localhost DDS in test domains 40–89. It starts
-synthetic map/scan/TF sources and a **mock NavigateToPose server**. It starts no
-Nav2, SLAM, vendor bridge, UDP motion sender, robot services or mode controls.
+synthetic map/scan/TF sources and a **mock NavigateToPose server**. A separate
+test starts the real university Navfn planner in an isolated namespace, using
+a copy of university parameters and synthetic inputs. No controller, SLAM,
+vendor bridge, UDP motion sender, shared robot service or mode control is started.
 It verifies goal submission and results, cancellation and late callbacks,
 mission limits, unavailable inputs and the default no-dispatch behavior.
 Normal pytest skips real-DDS cases. Logs and JUnit results go under
-`.colcon/autonomy_integration`.
+`.colcon/autonomy_integration`. The second runner verifies the optional
+non-actuating controller on fixed test topics, including limits and kill/reset.
+It uses the same fresh audited installation, with results in `.colcon/integration`.
+
+Legacy protocol, guard and bounded-simulation regression tests remain supported
+through the explicit commands in [legacy/README.md](legacy/README.md). They are
+separate from the installed navigation client. No motion transport is installed.
 
 ## Preview with an already running university map
 
 Source the isolated build, then launch:
 
 ```bash
-source .colcon/university_install/local_setup.bash
+source .colcon/audit_install/local_setup.bash
 ros2 launch lite3_locomotion autonomy.launch.py
 ```
 

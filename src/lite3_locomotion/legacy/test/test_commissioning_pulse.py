@@ -6,7 +6,7 @@ import time
 import threading
 import pytest
 
-from lite3_locomotion.commissioning_pulse import PulsePlan, parse_options, run_pulse
+from lite3_legacy.commissioning_pulse import PulsePlan, parse_options, run_pulse
 
 
 def fixture_clock():
