@@ -381,17 +381,20 @@ class SequenceRunner:
             if p['end_mode'] == 'silence':
                 # Stop publishing entirely and watch whether the robot comes to rest by itself
                 # (what happens if the upstream planner/mux dies). Zeros follow in `finally`.
+                # Criterion: rest must BEGIN within silence_timeout_s; confirming it needs a
+                # further hold window, so observation continues up to timeout + hold.
                 hold = self.seq.safety.stop_hold_s
                 while True:
                     self._check()
                     still, rest = self._stationary(hold)
                     elapsed = self.robot.now() - forward_end
-                    if still:
+                    onset = max(0.0, elapsed - hold)
+                    if still and onset <= p['silence_timeout_s']:
                         motion['silence'] = {'stopped': True,
-                                             'rest_onset_after_s': _r(max(0.0, elapsed - hold), 2),
+                                             'rest_onset_after_s': _r(onset, 2),
                                              'verified_after_s': _r(elapsed, 2)}
                         break
-                    if elapsed >= p['silence_timeout_s']:
+                    if elapsed >= p['silence_timeout_s'] + hold:
                         motion['silence'] = {'stopped': False, 'waited_s': _r(elapsed, 2),
                                              'reasons': rest.get('reasons')}
                         motion['reason'] = 'no_stop_on_command_silence'

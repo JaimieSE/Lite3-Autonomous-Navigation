@@ -20,7 +20,7 @@ STANDING_POSE = (0.05, 0.85, -1.65, -0.05, 0.85, -1.65,
                  0.05, 0.85, -1.65, -0.05, 0.85, -1.65)
 
 FAULTS = ('none', 'march_in_place', 'ignore_posture', 'no_stop', 'telemetry_dropout',
-          'tilt', 'remote_takeover', 'slow_stand', 'runaway', 'no_silence_stop')
+          'tilt', 'remote_takeover', 'slow_stand', 'runaway', 'no_silence_stop', 'slow_silence_stop')
 
 
 class SimLite3:
@@ -66,6 +66,8 @@ class SimLite3:
     def effective_command(self, t):
         if self.fault == 'no_stop' and t - self.last_nonzero_time < 30.0:
             return self.last_nonzero
+        if self.fault == 'slow_silence_stop':   # like the real robot: keeps going ~1.6 s
+            return self.cmd if t - self.cmd_time < 1.6 else (0.0, 0.0)
         if self.fault == 'no_silence_stop':
             return self.cmd   # holds the last command forever when commands stop arriving
         return self.cmd if t - self.cmd_time < self.COMMAND_TIMEOUT_S else (0.0, 0.0)

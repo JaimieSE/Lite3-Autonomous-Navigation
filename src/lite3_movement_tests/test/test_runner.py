@@ -181,3 +181,13 @@ def test_range_failure_does_not_continue_past_unverified_stop():
     report, robot, steps = run_envelope('no_stop')
     assert report['verdict'] == 'INTERVENTION_REQUIRED'
     assert steps['lie_down']['status'] == NOT_RUN
+
+
+def test_silence_stop_onset_within_timeout_passes_even_if_hold_extends_past_it():
+    # Regression for the 2026-11-13 physical run: rest began ~1.6 s after silence, but the
+    # 1.5 s hold window could not complete inside a 3 s timeout, so it was wrongly failed.
+    report, robot, steps = run_envelope('slow_silence_stop')
+    silence = steps['silence_stop_005']
+    assert silence['status'] == PASSED, silence['summary']
+    onset = silence['measurements']['motion']['silence']['rest_onset_after_s']
+    assert 1.4 <= onset <= 3.0
