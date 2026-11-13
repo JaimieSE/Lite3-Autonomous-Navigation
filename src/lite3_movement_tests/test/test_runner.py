@@ -137,3 +137,47 @@ def test_physical_mode_requires_authorization():
     robot = FakeRobot(Telemetry(), SimLite3())
     with pytest.raises(ValueError):
         SequenceRunner(load_sequence(SEQUENCE), robot, 'physical')
+
+
+ENVELOPE = Path(__file__).resolve().parents[1] / 'config' / 'envelope_step1.yaml'
+
+
+def run_envelope(fault='none'):
+    robot = FakeRobot(Telemetry(), SimLite3(fault=fault))
+    report = SequenceRunner(load_sequence(ENVELOPE), robot, MODE_SIM, log=lambda *_: None).run()
+    return report, robot, {s['id']: s for s in report['steps']}
+
+
+def test_envelope_nominal_passes_and_silence_stop_is_measured():
+    report, robot, steps = run_envelope()
+    assert report['verdict'] == 'PASSED', [(s['id'], s['status'], s['summary']) for s in report['steps']]
+    silence = steps['silence_stop_005']['measurements']['motion']['silence']
+    assert silence['stopped'] and silence['rest_onset_after_s'] < 2.0
+    assert steps['turn_left_02']['measurements']['measured']['yaw_change_rad'] > 0.3
+
+
+def test_envelope_range_misses_continue_only_with_verified_stops():
+    report, robot, steps = run_envelope('march_in_place')
+    moves = [s for s in report['steps'] if s['type'] == 'velocity_move' and s['id'] != 'silence_stop_005']
+    assert all(s['status'] == FAILED for s in moves[:6])          # linear moves do not translate
+    assert all(steps['stop_' + s['id']]['status'] == PASSED for s in moves)
+    assert len(report['range_failures_continued']) >= 6
+    assert report['verdict'] == 'FAILED_SAFE'
+    assert steps['lie_down']['status'] == PASSED
+
+
+def test_envelope_detects_robot_that_keeps_walking_when_commands_stop():
+    report, robot, steps = run_envelope('no_silence_stop')
+    silence = steps['silence_stop_005']
+    assert silence['status'] == FAILED and 'silence' in silence['summary']
+    assert silence['measurements']['motion']['silence']['stopped'] is False
+    last_nonzero = max(t for t, kind, *v in robot.sent if kind == 'vel' and any(v))
+    assert any(kind == 'vel' and not any(v) and t > last_nonzero + 2.9 for t, kind, *v in robot.sent)
+    assert report['safe_stop']['rest_verified'] is True
+    assert report['verdict'] == 'FAILED_SAFE'
+
+
+def test_range_failure_does_not_continue_past_unverified_stop():
+    report, robot, steps = run_envelope('no_stop')
+    assert report['verdict'] == 'INTERVENTION_REQUIRED'
+    assert steps['lie_down']['status'] == NOT_RUN

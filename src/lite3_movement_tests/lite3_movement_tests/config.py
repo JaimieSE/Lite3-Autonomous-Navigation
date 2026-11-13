@@ -113,6 +113,12 @@ def _parse_step(raw, index):
         p['duration_s'] = _finite(take('duration_s'), f'{step_id}.duration_s', 0.2, HARD_MAX_MOVE_S)
         p['warmup_s'] = _finite(take('warmup_s', 0.5), f'{step_id}.warmup_s', 0.2, 2.0)
         p['settle_s'] = _finite(take('settle_s', 1.0), f'{step_id}.settle_s', 0.0, 3.0)
+        p['end_mode'] = take('end_mode', 'zeros')
+        if p['end_mode'] not in ('zeros', 'silence'):
+            raise ConfigError(f'{step_id}.end_mode must be zeros or silence')
+        p['silence_timeout_s'] = _finite(take('silence_timeout_s', 3.0),
+                                         f'{step_id}.silence_timeout_s', 1.0, 5.0)
+        p['continue_on_range_failure'] = take('continue_on_range_failure', False) is True
         p['delivery_deadline_s'] = _finite(take('delivery_deadline_s', 0.5),
                                            f'{step_id}.delivery_deadline_s', 0.1, 1.0)
         expect = take('expect') or {}
@@ -125,7 +131,8 @@ def _parse_step(raw, index):
         if set(expect) - set(p['expect']):
             raise ConfigError(f'{step_id}.expect has unknown keys {set(expect) - set(p["expect"])}')
         # Timeout covers warmup, motion and settling plus margin; not user-extendable.
-        timeout = p['warmup_s'] + p['duration_s'] + p['settle_s'] + 2.0
+        timeout = (p['warmup_s'] + p['duration_s'] + p['settle_s'] + 2.0 +
+                   (p['silence_timeout_s'] if p['end_mode'] == 'silence' else 0.0))
     if kind == 'stop_verify':
         p['zero_min_s'] = _finite(take('zero_min_s', 1.0), f'{step_id}.zero_min_s', 0.5, 5.0)
     timeout = _finite(timeout, f'{step_id}.timeout_s', 0.5, HARD_MAX_STEP_TIMEOUT_S)

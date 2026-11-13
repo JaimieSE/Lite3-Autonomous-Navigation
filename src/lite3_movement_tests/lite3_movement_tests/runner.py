@@ -63,6 +63,7 @@ class SequenceRunner:
         self.posture_latched_off = False
         self.uncertain = False
         self.events = []
+        self.range_failures = []
         self.origin = None
         self.start = None
         self._last_health = (-math.inf, True, {})
@@ -377,6 +378,25 @@ class SequenceRunner:
                 self.robot.wait(min(lim.command_period_s,
                                     max(0.0, forward_start + p['duration_s'] - self.robot.now())))
             forward_end = self.robot.now()
+            if p['end_mode'] == 'silence':
+                # Stop publishing entirely and watch whether the robot comes to rest by itself
+                # (what happens if the upstream planner/mux dies). Zeros follow in `finally`.
+                hold = self.seq.safety.stop_hold_s
+                while True:
+                    self._check()
+                    still, rest = self._stationary(hold)
+                    elapsed = self.robot.now() - forward_end
+                    if still:
+                        motion['silence'] = {'stopped': True,
+                                             'rest_onset_after_s': _r(max(0.0, elapsed - hold), 2),
+                                             'verified_after_s': _r(elapsed, 2)}
+                        break
+                    if elapsed >= p['silence_timeout_s']:
+                        motion['silence'] = {'stopped': False, 'waited_s': _r(elapsed, 2),
+                                             'reasons': rest.get('reasons')}
+                        motion['reason'] = 'no_stop_on_command_silence'
+                        break
+                    self.robot.wait(lim.command_period_s)
         except SafetyAbort as error:
             motion['reason'] = f'aborted: {error}'
             forward_end = self.robot.now()
@@ -402,6 +422,10 @@ class SequenceRunner:
             'expect': {k: list(v) for k, v in p['expect'].items()},
         }
         trace = self._trace(t0)
+        if motion['reason'] == 'no_stop_on_command_silence':
+            detail['diagnosis'] = ('robot kept moving after commands stopped; fallback zeros sent. '
+                                   'A crashed planner/mux would leave it walking.')
+            return FAILED, 'no rest within silence timeout (fallback zeros sent)', detail, trace
         if motion['reason'] != 'duration_complete':
             return ABORTED, motion['reason'], detail, trace
         failures = [f'{k}={measured.get(k, float("nan")):.3f} outside {list(v)}'
@@ -412,6 +436,7 @@ class SequenceRunner:
                 detail['diagnosis'] = 'stepping without translation (marching in place)'
             elif activity is not None and activity < 0.05:
                 detail['diagnosis'] = 'no locomotion response in joint telemetry'
+            detail['range_failure_only'] = True
             return FAILED, '; '.join(failures), detail, trace
         return PASSED, 'odometry displacement within expected ranges', detail, trace
 
@@ -497,6 +522,14 @@ class SequenceRunner:
                 break
             result = self._run_step(step)
             results.append(result)
+            if (result.status == FAILED and step.type == 'velocity_move'
+                    and step.params.get('continue_on_range_failure')
+                    and result.measurements.get('range_failure_only')):
+                # Characterization: a measured-range miss with zeros already sent is recorded,
+                # and the sequence continues only if the following stop_verify proves rest.
+                self.range_failures.append(step.id)
+                self._event('range_failure_continue', step=step.id)
+                continue
             if result.status not in (PASSED, SKIPPED):
                 failed = result
                 results += [StepResult(s.id, s.type, NOT_RUN, f'not run: {step.id} {result.status}',
@@ -536,7 +569,8 @@ class SequenceRunner:
         counts = {}
         for r in results:
             counts[r.status] = counts.get(r.status, 0) + 1
-        all_ok = failed is None and all(r.status in (PASSED, SKIPPED, PREVIEW) for r in results)
+        all_ok = (failed is None and not self.range_failures and
+                  all(r.status in (PASSED, SKIPPED, PREVIEW) for r in results))
         verdict = ('INTERVENTION_REQUIRED' if self.uncertain else
                    'PASSED' if all_ok and self.mode != MODE_READONLY else
                    'READONLY_CHECKS_PASSED' if all_ok else 'FAILED_SAFE')
@@ -551,7 +585,7 @@ class SequenceRunner:
                 'source': self.auth.source},
             'started_utc': started_utc.isoformat(timespec='seconds'),
             'duration_s': _r(self.robot.now() - self.start, 2),
-            'verdict': verdict, 'counts': counts,
+            'verdict': verdict, 'counts': counts, 'range_failures_continued': self.range_failures,
             'commands_sent': self.commands_sent,
             'posture_commands_latched_off': self.posture_latched_off,
             'state_uncertain': self.uncertain,
