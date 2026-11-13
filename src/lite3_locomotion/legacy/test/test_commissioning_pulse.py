@@ -17,16 +17,17 @@ def fixture_clock():
     return now, emitted, sleep
 
 
-def test_one_process_deadline_and_zero_gap():
+@pytest.mark.parametrize('duration', [1.0, 2.0])
+def test_one_process_deadline_and_zero_gap(duration):
     now, emitted, sleep = fixture_clock()
     result = run_pulse(lambda value: emitted.append((now[0], value)),
-                       clock=lambda: now[0], sleep=sleep)
+                       plan=PulsePlan(duration=duration), clock=lambda: now[0], sleep=sleep)
     assert result['reason'] == 'duration_complete'
-    assert 19 <= result['forward_messages'] <= 21
-    assert result['first_forward_to_first_zero_s'] == pytest.approx(1.0)
+    assert duration * 20 - 1 <= result['forward_messages'] <= duration * 20 + 1
+    assert result['first_forward_to_first_zero_s'] == pytest.approx(duration)
     assert result['last_forward_to_first_zero_s'] <= 0.0500001
     assert all(value == 0 for _, value in emitted[:10])
-    assert emitted[-1][0] - 1.5 >= 2.0 - 1e-6
+    assert emitted[-1][0] - (0.5 + duration) >= 2.0 - 1e-6
     assert not result['physical_stop_verified']
 
 
@@ -96,7 +97,7 @@ def test_observer_exception_does_not_prevent_zero_burst():
 
 
 @pytest.mark.parametrize('kwargs', [
-    {'speed': math.nan}, {'speed': 0.031}, {'duration': 1.01},
+    {'speed': math.nan}, {'speed': 0.031}, {'duration': 2.01},
     {'zero_seconds': 0.5}, {'duration': True}, {'max_gap': 0.01},
 ])
 def test_invalid_plan(kwargs):
@@ -106,6 +107,11 @@ def test_invalid_plan(kwargs):
 
 def test_physical_requires_explicit_confirmations_and_default_is_dry():
     assert not parse_options([]).physical
+    assert parse_options([]).duration == 1.0
+    assert parse_options(['--duration', '2']).duration == 2.0
+    for value in ('0', '2.01', 'nan', 'inf'):
+        with pytest.raises(SystemExit):
+            parse_options(['--duration', value])
     with pytest.raises(SystemExit):
         parse_options(['--physical'])
     assert parse_options(['--physical', '--navigation-confirmed', '--operator-ready',
@@ -114,7 +120,8 @@ def test_physical_requires_explicit_confirmations_and_default_is_dry():
 
 @pytest.mark.skipif(os.environ.get('LITE3_RUN_PULSE_LOOPBACK') != '1',
                     reason='Opt-in isolated ROS loopback timing check')
-def test_real_ros_loopback_timing():
+@pytest.mark.parametrize('duration', [1.0, 2.0])
+def test_real_ros_loopback_timing(duration):
     # Refuse the test unless discovery/traffic is constrained to loopback.
     assert os.environ.get('ROS_LOCALHOST_ONLY') == '1'
     assert os.environ.get('FASTRTPS_DEFAULT_PROFILES_FILE', '').endswith('/test/loopback_dds.xml')
@@ -144,7 +151,7 @@ def test_real_ros_loopback_timing():
         while pub.get_subscription_count() == 0 and time.monotonic() < deadline:
             time.sleep(0.02)
         assert pub.get_subscription_count() == 1
-        result = run_pulse(emit)
+        result = run_pulse(emit, plan=PulsePlan(duration=duration))
         time.sleep(0.3)
         forward = [stamp for stamp, value in received if value != 0]
         assert forward
@@ -154,9 +161,9 @@ def test_real_ros_loopback_timing():
         print({'local': result, 'receiver_last_forward_to_zero_s': gap,
                'receiver_first_forward_to_zero_s': span})
         assert result['reason'] == 'duration_complete'
-        assert result['first_forward_to_first_zero_s'] < 1.15
+        assert result['first_forward_to_first_zero_s'] < duration + 0.15
         assert gap < 0.15
-        assert 0.9 <= span < 1.15
+        assert duration - 0.1 <= span < duration + 0.15
     finally:
         executor.shutdown()
         observer.join(timeout=2)

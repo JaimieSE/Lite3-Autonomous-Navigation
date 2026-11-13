@@ -26,7 +26,7 @@ class PulsePlan:
     max_gap: float = 0.15
 
     def __post_init__(self):
-        for name, upper in [('speed', 0.03), ('duration', 1.0),
+        for name, upper in [('speed', 0.03), ('duration', 2.0),
                             ('period', 0.05), ('zero_seconds', 5.0),
                             ('warmup_seconds', 2.0), ('max_gap', 0.15)]:
             value = getattr(self, name)
@@ -116,10 +116,16 @@ def run_pulse(emit, *, plan=PulsePlan(), clock=time.monotonic, sleep=time.sleep,
 def parse_options(args=None):
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument('--physical', action='store_true')
+    parser.add_argument('--duration', type=float, default=1.0,
+                        help='Requested forward duration in seconds, at most 2; default 1')
     for name in ('navigation-confirmed', 'operator-ready', 'standing-confirmed',
                  'exclusive-control', 'accept-no-lidar'):
         parser.add_argument('--' + name, action='store_true')
     options = parser.parse_args(args)
+    try:
+        PulsePlan(duration=options.duration)
+    except ValueError as error:
+        parser.error(str(error))
     if options.physical and not all((options.navigation_confirmed, options.operator_ready,
                                     options.standing_confirmed, options.exclusive_control,
                                     options.accept_no_lidar)):
@@ -129,6 +135,7 @@ def parse_options(args=None):
 
 def main(args=None):
     options = parse_options(args)
+    plan = PulsePlan(duration=options.duration)
     import rclpy
     from rclpy.context import Context
     from rclpy.executors import SingleThreadedExecutor
@@ -202,8 +209,8 @@ def main(args=None):
                 raise RuntimeError('Preflight failed: absent sender/link or competing velocity publisher')
         print(json.dumps({'topic': topic, 'physical': options.physical,
                           'lidar_protected': False, 'requested_speed_m_s': 0.03,
-                          'requested_duration_s': 1.0}), flush=True)
-        result = run_pulse(emit, pump=pump, healthy=healthy,
+                          'requested_duration_s': plan.duration}), flush=True)
+        result = run_pulse(emit, plan=plan, pump=pump, healthy=healthy,
                            cancelled=lambda: cancelled[0])
         # Allow delayed observations of trailing zeros; this does not send commands.
         deadline = time.monotonic() + 0.3

@@ -37,3 +37,10 @@ suite skips its opt-in ROS timing test; no physical command runner is invoked.
 Protocol framing uses a local loopback socket. These tests do not commission a
 robot bridge. The older end-to-end Nav2/sender fixtures in this directory still
 require the original branch and are not part of this supported offline command.
+
+The excluded commissioning tool retains a one-second default and now accepts
+an explicit `--duration` up to two seconds for the separately authorized
+supervised trial. Its maximum requested speed remains 0.03 m/s. Both durations
+passed deterministic and isolated ROS timing tests. It does not infer posture,
+prove physical rest, automatically toggle stand/sit, or constitute autonomous
+navigation. See the [two-second trial record](../docs/walking_trial_two_seconds_2026-11-13.md).
