@@ -1,0 +1,66 @@
+{
+  "repository": "DeepRoboticsLab/Lite3_ROS",
+  "commit": "e4ab5dc1c7f3ff46274162a1ef302253936578aa",
+  "files": [
+    {
+      "path": "LICENSE",
+      "sha256": "49a6e137748b934e2f78b15cf74704fd8fdcb26107c5d210d783648287345750"
+    },
+    {
+      "path": "README.md",
+      "sha256": "d572c4e777b85f385f4c8d6e41851c60e0cf97d0a2314a5622a351e7b6cf61d6"
+    },
+    {
+      "path": "README_ZH.md",
+      "sha256": "94e73a286f1a9ca2cf7ec6231dce25d5aa2378bb2f76f4f7d03bfe3957b1b056"
+    },
+    {
+      "path": "src/transfer/CMakeLists.txt",
+      "sha256": "0e34e935f64dd4b003714a615700c6717c6ee754cfdabff4708ee66c6003f13c"
+    },
+    {
+      "path": "src/transfer/include/protocol.hpp",
+      "sha256": "df60817a96e7a813cb7e5dfc7a60258a2207363c41fcea48651fee7c5042fd9c"
+    },
+    {
+      "path": "src/transfer/launch/transfer_launch.py",
+      "sha256": "4bff5808c3c177da9c1bb57004bc560c85831adcab8071d6ebaadea68f378426"
+    },
+    {
+      "path": "src/transfer/package.xml",
+      "sha256": "fc83accbef6800c7fff74bd7168162a9e295b78784ae6424d0685af1f8ffaaa1"
+    },
+    {
+      "path": "src/transfer/src/Jetson2App.cpp",
+      "sha256": "b3f6c7b5f5abb8de140bb67d9d478540a219dad9c0a3853b52a05e7df27cd228"
+    },
+    {
+      "path": "src/transfer/src/Jetson2Motion.cpp",
+      "sha256": "169383cc460a702bcf2374a5a5321889f57111eb98033e5330c93591c69c9edc"
+    },
+    {
+      "path": "src/transfer/src/SensorChecker.cpp",
+      "sha256": "520ac1eaf373b79c8631bdf4bf67e7b5e5a8db3bcb824dc64f84732778a1bac1"
+    },
+    {
+      "path": "src/transfer/src/SensorsLogger.hpp",
+      "sha256": "3a479c8f52a64c3852abaac3881bc7ce4961094fb523dee1dc40a3a6b143c151"
+    },
+    {
+      "path": "src/transfer_interfaces/CMakeLists.txt",
+      "sha256": "f71bc2e323aaa2ff07a4a1cd12732db1aa72732b825b1f3b629e56364a5319fd"
+    },
+    {
+      "path": "src/transfer_interfaces/msg/MotionComplexCMD.msg",
+      "sha256": "4464d17fb3fdb8ee18d5a82515eddde88cec147175e30d726bd23721575f95dc"
+    },
+    {
+      "path": "src/transfer_interfaces/msg/MotionSimpleCMD.msg",
+      "sha256": "6669517a8b5b0d7266ce32ae24c60d308f1640e5ffddf6818ad62052558ac954"
+    },
+    {
+      "path": "src/transfer_interfaces/package.xml",
+      "sha256": "564104302f130ec66ccf610832aa98441bd6e2d68499aaef1011a15796a44478"
+    }
+  ]
+}

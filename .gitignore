@@ -1,0 +1,14 @@
+/build/
+/install/
+/log/
+/.vscode/
+/.agents/
+/.aws/
+/.codex/
+/src/livox_ros_driver2/
+/src/transfer_interfaces/
+**/.colcon/
+**/log/
+**/__pycache__/
+**/.pytest_cache/
+**/*.egg-info/
