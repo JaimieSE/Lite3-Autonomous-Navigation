@@ -39,6 +39,14 @@ The original implementation is preserved on Git branch
 `refactor/university-navigation`. The workspace initially had an empty Git
 folder, so a local repository and baseline commit were created before refactoring.
 
+## Automated movement testing
+
+Bounded, telemetry-verified physical movement tests (readiness, stand/sit by joint
+geometry, short moves verified by leg odometry, verified stop) live in the sibling
+package [lite3_movement_tests](../lite3_movement_tests/README.md). It reuses the
+existing bridge and telemetry, keeps this package non-actuating, and requires one
+explicit session authorization file for physical runs.
+
 ## Build and test
 
 From this package directory, with the existing ROS Humble environment sourced:
