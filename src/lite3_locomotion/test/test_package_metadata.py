@@ -22,7 +22,8 @@ def test_active_install_has_no_duplicate_stack_or_motion_entry_points(monkeypatc
     runpy.run_path(str(root / 'setup.py'))
     assert captured['packages'] == ['lite3_locomotion']
     names = {entry.split('=')[0].strip() for entry in captured['entry_points']['console_scripts']}
-    assert names == {'exploration_coordinator', 'autonomy_control', 'exploration_preview', 'locomotion_controller'}
+    assert names == {'exploration_coordinator', 'autonomy_control', 'exploration_preview',
+                     'locomotion_controller', 'terrain_monitor'}
     installed = [path for _, paths in captured['data_files'] for path in paths]
     assert [p for p in installed if p.startswith('launch/')] == ['launch/autonomy.launch.py']
     assert not any(p.startswith(('legacy/', 'config/')) for p in installed)
