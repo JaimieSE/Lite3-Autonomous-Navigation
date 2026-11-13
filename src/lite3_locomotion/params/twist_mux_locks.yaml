@@ -1,0 +1,11 @@
+# Added to the university twist_mux_topics.yaml (loaded together; that file is unchanged).
+# terrain_stop blocks inputs with priority < 50 (navigation = 10) while
+# /lite3_terrain/stop is true OR has not been received for 0.5 s (fail-safe if
+# terrain_monitor dies). The handheld joystick (priority 100) is never blocked.
+twist_mux:
+  ros__parameters:
+    locks:
+      terrain_stop:
+        topic: /lite3_terrain/stop
+        timeout: 0.5
+        priority: 50

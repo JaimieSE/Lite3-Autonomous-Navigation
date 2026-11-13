@@ -25,7 +25,11 @@ def test_active_install_has_no_duplicate_stack_or_motion_entry_points(monkeypatc
     assert names == {'exploration_coordinator', 'autonomy_control', 'exploration_preview',
                      'locomotion_controller', 'terrain_monitor'}
     installed = [path for _, paths in captured['data_files'] for path in paths]
-    assert [p for p in installed if p.startswith('launch/')] == ['launch/autonomy.launch.py']
+    assert sorted(p for p in installed if p.startswith('launch/')) == [
+        'launch/autonomy.launch.py', 'launch/navigation.launch.py']
+    assert sorted(p for p in installed if p.startswith('params/')) == [
+        'params/nav2_lite3.yaml', 'params/navigate_through_poses_no_backup.xml',
+        'params/navigate_to_pose_no_backup.xml', 'params/twist_mux_locks.yaml']
     assert not any(p.startswith(('legacy/', 'config/')) for p in installed)
 
 

@@ -20,6 +20,9 @@
   <exec_depend>launch</exec_depend>
   <exec_depend>ament_index_python</exec_depend>
   <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>twist_mux</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
   <test_depend>python3-pytest</test_depend>
   <test_depend>python3-catkin-pkg-modules</test_depend>
   <test_depend>nav2_planner</test_depend>

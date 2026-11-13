@@ -150,3 +150,17 @@ def test_terrain_monitor_has_no_command_interfaces():
     src = (Path(__file__).resolve().parents[1] / 'lite3_locomotion' / 'terrain_monitor.py').read_text()
     for forbidden in ('cmd_vel', 'simple_cmd', 'Twist', 'create_service', 'create_client', 'transfer_interfaces'):
         assert forbidden not in src
+
+
+def test_proximity_stop_ahead_and_around_but_not_far():
+    near_wall = np.vstack([floor(x1=0.5), wall(0.5, -1, 1, FLOOR, FLOOR + 1.0)])
+    stop, reason = T.proximity_stop(grid_of(near_wall))
+    assert stop and 'ahead' in reason
+    far_wall = np.vstack([floor(x1=1.5), wall(1.5, -1, 1, FLOOR, FLOOR + 1.0)])
+    assert T.proximity_stop(grid_of(far_wall)) == (False, None)
+    side = np.vstack([floor(), wall(0.0, 0.33, 0.40, FLOOR, FLOOR + 1.0)])
+    side = np.vstack([side, np.array([[0.05, 0.36, FLOOR + 0.5]] * 5)])
+    stop, reason = T.proximity_stop(grid_of(side))
+    assert stop and 'within' in reason
+    drop = np.vstack([floor(x1=0.45), plane(0.5, 2.9, -1, 1, FLOOR - 0.4)])
+    assert T.proximity_stop(grid_of(drop))[0]

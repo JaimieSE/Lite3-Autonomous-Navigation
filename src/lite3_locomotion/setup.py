@@ -10,6 +10,7 @@ setup(
         ('share/lite3_locomotion', ['package.xml', 'README.md']),
         ('share/lite3_locomotion/launch', glob('launch/*.launch.py')),
         ('share/lite3_locomotion/docs', glob('docs/*.md') + glob('docs/*.sha256')),
+        ('share/lite3_locomotion/params', glob('params/*.yaml') + glob('params/*.xml')),
     ],
     install_requires=['setuptools'],
     tests_require=['pytest'],

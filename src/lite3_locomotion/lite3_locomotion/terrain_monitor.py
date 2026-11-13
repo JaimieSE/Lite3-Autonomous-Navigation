@@ -7,7 +7,10 @@ odom_relay) for accumulation of recent scans.
 
 Outputs (new, read-only consumers): /lite3_terrain/grid (OccupancyGrid),
 /lite3_terrain/hazards (PointCloud2 of obstacle/drop cells in base_link, suitable
-as an extra Nav2 costmap observation source), /lite3_terrain/status (JSON).
+as an extra Nav2 costmap observation source), /lite3_terrain/status (JSON), /lite3_terrain/stop (Bool) for a twist_mux lock:
+true when an obstacle/drop is within the proximity zone or inputs are invalid;
+held true for 1 s after clearing. If this node stops, the lock's timeout engages.
+The stop signal is a perception output; blocking motion is the mux's job.
 It has no velocity, posture, mode or service interfaces.
 """
 
@@ -60,7 +63,7 @@ def main(args=None):
     from rclpy.time import Time
     from nav_msgs.msg import OccupancyGrid
     from sensor_msgs.msg import Imu, JointState, PointCloud2, PointField
-    from std_msgs.msg import String
+    from std_msgs.msg import Bool, String
     from tf2_ros import Buffer, TransformListener
 
     rclpy.init(args=args)
@@ -72,6 +75,9 @@ def main(args=None):
     grid_pub = node.create_publisher(OccupancyGrid, '/lite3_terrain/grid', 1)
     hazard_pub = node.create_publisher(PointCloud2, '/lite3_terrain/hazards', 1)
     status_pub = node.create_publisher(String, '/lite3_terrain/status', 1)
+    stop_pub = node.create_publisher(Bool, '/lite3_terrain/stop', 1)
+    stop_params = T.StopParams()
+    state['last_hazard'] = -math.inf
 
     def on_imu(msg):
         q = msg.orientation
@@ -94,6 +100,7 @@ def main(args=None):
         started = time.monotonic()
         status = {'stamp': f'{msg.header.stamp.sec}.{msg.header.stamp.nanosec:09d}',
                   'perception_only': True, 'problems': []}
+        hazard = (True, 'not evaluated')
         try:
             now = time.monotonic()
             if state['extrinsic'] is None:
@@ -127,6 +134,7 @@ def main(args=None):
             level = base @ level_r.T
             floor_z, source = T.estimate_floor(level, legs[0], params)
             grid = T.build_grid(level, floor_z, params, source)
+            hazard = T.proximity_stop(grid, stop_params)
             status.update({
                 'floor_z_m': round(floor_z, 3), 'floor_source': source,
                 'leg_floor_reference_m': round(legs[0], 3),
@@ -159,6 +167,15 @@ def main(args=None):
         except Exception as error:  # noqa: BLE001 - report, never crash the monitor
             status['problems'].append(f'{type(error).__name__}: {error}')
         finally:
+            if status['problems']:
+                hazard = (True, 'inputs invalid: ' + '; '.join(status['problems']))
+            now = time.monotonic()
+            if hazard[0]:
+                state['last_hazard'] = now
+            stop = now - state['last_hazard'] < stop_params.release_hold_s
+            status['stop'] = {'active': stop, 'reason': hazard[1] if hazard[0] else
+                              ('release hold' if stop else None)}
+            stop_pub.publish(Bool(data=stop))
             status['processing_s'] = round(time.monotonic() - started, 3)
             status_pub.publish(String(data=json.dumps(status)))
             state['busy'] = False

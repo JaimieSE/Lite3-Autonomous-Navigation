@@ -267,3 +267,33 @@ class Accumulator:
         world = np.concatenate([p for _, p in self.frames])
         r = np.asarray(odom_r)
         return (world - np.asarray(odom_t)) @ r   # inverse rigid transform: R^T (p - t)
+
+
+@dataclass(frozen=True)
+class StopParams:
+    """Proximity stop for the twist_mux lock. Forward-only driving (Nav2 vx_min = 0).
+
+    stop_ahead_m: footprint front 0.305 m + measured coast after commands stop
+    (~0.034 m at 0.05 m/s, scaled to 0.10 m/s ~0.07 m) + margin.
+    stop_radius_m: footprint corner radius 0.357 m (in-place turns) + margin.
+    """
+    stop_ahead_m: float = 0.60
+    stop_radius_m: float = 0.45
+    half_width_m: float = 0.30
+    release_hold_s: float = 1.0
+
+
+def proximity_stop(grid, params=StopParams()):
+    """Return (stop, reason) from obstacle/drop cells near the robot (level frame)."""
+    xs, ys = grid.cell_centres()
+    rows, cols = np.where(np.isin(grid.labels, (OBSTACLE, DROP)))
+    if not len(rows):
+        return False, None
+    x, y = xs[cols], ys[rows]
+    ahead = (x > 0) & (x <= params.stop_ahead_m) & (np.abs(y) <= params.half_width_m)
+    around = np.hypot(x, y) <= params.stop_radius_m
+    if ahead.any():
+        return True, f'hazard {float(x[ahead].min()):.2f} m ahead'
+    if around.any():
+        return True, f'hazard within {params.stop_radius_m} m'
+    return False, None
