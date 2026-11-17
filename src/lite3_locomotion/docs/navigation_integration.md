@@ -79,3 +79,32 @@ Tried and rejected as a workaround:
    the runner's geofence, tilt, staleness and takeover monitoring wrap Nav2-driven
    motion. The runner's command-path health check currently (correctly) rejects
    the extra `twist_mux` publisher on `/cmd_vel`.
+
+## Physical mode (added 2026-11-16, not yet run on the robot)
+
+`navigation.launch.py mux_output:=/cmd_vel allow_robot_motion:=true` (started only by
+`operator/start_navigation.sh --physical`, typed ARM) also loads
+`params/twist_mux_physical.yaml`:
+
+- **`operator_hold` lock (dead-man).** Topic `/lite3_ops/hold`, timeout 0.5 s,
+  priority 50. Nothing below priority 50 passes unless a supervising
+  `lite3_movement_tests` runner publishes `false`. The runner does this only from
+  its safety-check loop. A fresh mux that has never received the topic is locked.
+- **`test_cmd` input.** Topic `/lite3_ops/test_cmd_vel`, priority 20. Bounded test
+  moves; blocked by both locks.
+- **`safety_stop` input.** Topic `/lite3_ops/stop_cmd_vel`, priority 255. Zero
+  velocity only, so a commanded stop passes every lock instead of relying on
+  silence.
+
+`check_mux_lock.py --physical` verifies all of this on the real twist_mux binary in
+an isolated domain (PASS). `terrain_monitor` gained `stop_ahead_m` / `stop_radius_m`
+ROS parameters. They can be raised for a test but are refused below the validated
+defaults (0.60 m / 0.45 m from the centre). The physical tests (M0–M9),
+their PASS criteria and the readiness checklist are in
+[operator/PHYSICAL_TESTS.md](../../../operator/PHYSICAL_TESTS.md). They are
+implemented as navigation step types in `lite3_movement_tests` (`nav_steps.py`),
+which closes next step 3 above.
+
+## Operating it
+
+The day-to-day start, check, Test 4 and stop procedure, with no Claude Code needed, is in [operator/README.md](../../../operator/README.md) and its one-page [cheat sheet](../../../operator/CHEATSHEET.md).

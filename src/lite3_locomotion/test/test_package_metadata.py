@@ -29,7 +29,7 @@ def test_active_install_has_no_duplicate_stack_or_motion_entry_points(monkeypatc
         'launch/autonomy.launch.py', 'launch/navigation.launch.py']
     assert sorted(p for p in installed if p.startswith('params/')) == [
         'params/nav2_lite3.yaml', 'params/navigate_through_poses_no_backup.xml',
-        'params/navigate_to_pose_no_backup.xml', 'params/twist_mux_locks.yaml']
+        'params/navigate_to_pose_no_backup.xml', 'params/twist_mux_locks.yaml', 'params/twist_mux_physical.yaml']
     assert not any(p.startswith(('legacy/', 'config/')) for p in installed)
 
 

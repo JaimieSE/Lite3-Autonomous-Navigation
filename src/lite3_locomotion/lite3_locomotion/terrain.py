@@ -283,6 +283,25 @@ class StopParams:
     release_hold_s: float = 1.0
 
 
+# Runtime-adjustable range of the proximity stop (ROS parameters on terrain_monitor). The lower
+# bounds are the validated defaults: a test may make the stop MORE conservative, never less.
+NOSE_OFFSET_M = 0.305          # footprint front edge ahead of base_link
+STOP_LIMITS = {'stop_ahead_m': (StopParams.stop_ahead_m, 1.80),
+               'stop_radius_m': (StopParams.stop_radius_m, 1.00)}
+
+
+def updated_stop_params(params, name, value):
+    """New StopParams with one field changed, or ValueError if outside STOP_LIMITS."""
+    if name not in STOP_LIMITS:
+        raise ValueError(f'{name} is not adjustable')
+    low, high = STOP_LIMITS[name]
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) \
+            or not low <= value <= high:
+        raise ValueError(f'{name}={value} outside [{low}, {high}]; the minimum is the validated '
+                         'default and cannot be lowered')
+    return StopParams(**{**params.__dict__, name: float(value)})
+
+
 def proximity_stop(grid, params=StopParams()):
     """Return (stop, reason) from obstacle/drop cells near the robot (level frame)."""
     xs, ys = grid.cell_centres()

@@ -28,10 +28,12 @@ def test_generated_file_matches_university_source():
 
 def test_velocity_caps_match_validated_envelope_and_no_reverse():
     mppi = get('controller_server', 'ros__parameters', 'FollowPath')
-    assert mppi['vx_max'] <= 0.10 and mppi['vx_min'] == 0.0 and mppi['wz_max'] <= 0.20
+    from lite3_locomotion import collision_profile as CP
+    # Static ceiling = the hard speed ceiling (2026-11-17: 0.5); every session caps it lower and verifies it.
+    assert mppi['vx_max'] <= CP.MAX_SPEED_M_S and mppi['vx_min'] == 0.0 and mppi['wz_max'] <= 0.20
     assert mppi['vy_max'] == 0.0
     smoother = get('velocity_smoother', 'ros__parameters')
-    assert smoother['max_velocity'][0] <= 0.10 and smoother['min_velocity'][0] == 0.0
+    assert smoother['max_velocity'][0] <= CP.MAX_SPEED_M_S and smoother['min_velocity'][0] == 0.0
     assert smoother['max_velocity'][2] <= 0.20 and smoother['min_velocity'][2] >= -0.20
     behaviors = get('behavior_server', 'ros__parameters')
     assert behaviors['behavior_plugins'] == ['spin', 'wait']
@@ -74,3 +76,22 @@ def test_launch_defaults_to_non_actuating_output():
     assert "DeclareLaunchArgument('mux_output', default_value=DRY_OUTPUT)" in src
     assert "DeclareLaunchArgument('allow_robot_motion', default_value='false')" in src
     assert 'requires allow_robot_motion:=true' in src
+
+
+def test_physical_mux_config_dead_man_and_stop_priorities():
+    cfg = yaml.safe_load((ROOT / 'params' / 'twist_mux_physical.yaml').read_text())
+    cfg = cfg['twist_mux']['ros__parameters']
+    hold = cfg['locks']['operator_hold']
+    terrain = yaml.safe_load((ROOT / 'params' / 'twist_mux_locks.yaml').read_text())[
+        'twist_mux']['ros__parameters']['locks']['terrain_stop']
+    assert hold['topic'] == '/lite3_ops/hold' and 0 < hold['timeout'] <= 0.5
+    # Nav2 (10) and test moves (20) are blocked by BOTH locks; the zeros-only stop input is above.
+    assert cfg['topics']['test_cmd']['priority'] < min(hold['priority'], terrain['priority'])
+    assert cfg['topics']['safety_stop']['priority'] > max(hold['priority'], terrain['priority'], 100)
+    assert cfg['topics']['safety_stop']['timeout'] <= 0.25
+
+
+def test_physical_mux_config_loaded_only_when_motion_allowed():
+    src = (ROOT / 'launch' / 'navigation.launch.py').read_text()
+    assert "    if allow:   # dead-man lock" in src
+    assert "mux_params.append(os.path.join(share, 'params', 'twist_mux_physical.yaml'))" in src

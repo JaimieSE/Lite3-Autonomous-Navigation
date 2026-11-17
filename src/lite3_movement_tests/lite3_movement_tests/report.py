@@ -37,6 +37,27 @@ def markdown(report):
                     'system_domain_observed', 'problems', 'reasons', 'delivery'):
             if key in m:
                 lines.append(f'  - {key}: `{_fmt(m[key])}`')
+    for s in report['steps']:
+        diag = (s.get('measurements') or {}).get('diagnostics')
+        if not diag:
+            continue
+        lines += ['', f'## Stop diagnostics: {s["id"]} (seconds after dead-man release)', '',
+                  f'- Phases: `{_fmt(diag["phases_after_release_s"])}`',
+                  f'- Robot-side commands: `{_fmt(diag["robot_commands_s"])}`; last dead-man feed '
+                  f'{diag["last_dead_man_feed_s"]} s',
+                  f'- Forward displacement m: `{_fmt(diag["forward_m"])}`',
+                  f'- Observation: `{_fmt(diag.get("observation", {}))}`', '',
+                  '| Criterion | Limit | Peak | Last exceeded (s) |', '| --- | --- | --- | --- |']
+        for name, v in diag['settle'].items():
+            if isinstance(v, dict):
+                lines.append(f'| {name} | {v["limit"]} | {v["peak"]} | {v["last_exceeded_s"]} |')
+        lines += ['', '| t (s) | speed | yaw rate | joint range | gyro | 1.5 s window at rest | failing |',
+                  '| --- | --- | --- | --- | --- | --- | --- |']
+        for r in diag['timeline']:
+            if abs(r['t'] * 2 - round(r['t'] * 2)) < 1e-6:      # every 0.5 s
+                lines.append(f'| {r["t"]} | {r["max_planar_speed_m_s"]} | {r["max_yaw_rate_rad_s"]} | '
+                             f'{r["joint_range_rad"]} | {r["max_gyro_rad_s"]} | {r["window_rest"]} | '
+                             f'{", ".join(r["window_reasons"])} |')
     if report['verdict'] == 'INTERVENTION_REQUIRED':
         lines.append('- **Operator intervention required**: robot state was not verified safe after a '
                      'command. No further posture command was sent. Check the robot physically, use '

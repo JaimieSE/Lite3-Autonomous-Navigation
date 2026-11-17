@@ -5,7 +5,8 @@ is reviewable and tested. Re-run after the university file changes:
 
     python3 tools/make_nav2_params.py [--check]
 
-Validated envelope (physical trial 2026-11-13): 0.05-0.10 m/s forward/back,
+Validated envelope (physical trial 2026-11-13): 0.05-0.10 m/s forward/back (ceiling raised to 0.5 m/s
+on 2026-11-17: speeds above 0.10 are not validated, each session caps them),
 +-0.2 rad/s turns, verified stops; the robot coasts ~1.6 s when commands stop.
 Reversing is disabled because the Mid-360 sees almost nothing behind the robot.
 """
@@ -21,7 +22,7 @@ UNIVERSITY = Path('/home/user/ros2_ws/src/lite3_launcher/config/nav2_params.yaml
 OUTPUT = Path(__file__).resolve().parents[1] / 'params' / 'nav2_lite3.yaml'
 SHARE_PLACEHOLDER = '__LITE3_LOCOMOTION_SHARE__'
 
-MAX_VX = 0.10
+MAX_VX = 0.50     # hard ceiling (2026-11-17); every runner caps the session speed below it, verified
 MAX_WZ = 0.20
 
 HAZARD_SOURCE = {

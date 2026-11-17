@@ -164,3 +164,15 @@ def test_proximity_stop_ahead_and_around_but_not_far():
     assert stop and 'within' in reason
     drop = np.vstack([floor(x1=0.45), plane(0.5, 2.9, -1, 1, FLOOR - 0.4)])
     assert T.proximity_stop(grid_of(drop))[0]
+
+
+def test_stop_distance_can_be_raised_but_never_reduced():
+    from lite3_locomotion.terrain import STOP_LIMITS, StopParams, updated_stop_params
+    base = StopParams()
+    assert updated_stop_params(base, 'stop_ahead_m', 0.705).stop_ahead_m == 0.705
+    for bad in (0.59, -1.0, float('nan'), 5.0, True):
+        with pytest.raises(ValueError):
+            updated_stop_params(base, 'stop_ahead_m', bad)
+    with pytest.raises(ValueError):
+        updated_stop_params(base, 'release_hold_s', 0.0)
+    assert STOP_LIMITS['stop_ahead_m'][0] == base.stop_ahead_m

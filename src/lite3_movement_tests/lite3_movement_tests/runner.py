@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 import datetime as dt
 import math
 
-from .config import HARD_MAX_SESSION_S
+from .config import HARD_MAX_SESSION_S, HARD_MAX_SPEED_M_S, HARD_MAX_YAW_RATE_RAD_S
 from .geometry import LYING, STANDING, assess_posture, validate_joint_sample
 from .telemetry import assess_stationary, displacement, joint_activity
 
@@ -29,7 +29,9 @@ MODE_PHYSICAL = 'physical'
 
 
 class SafetyAbort(Exception):
-    pass
+    def __init__(self, reason, detail=None):
+        super().__init__(reason)
+        self.detail = detail      # the step's own measurements, kept in the report
 
 
 @dataclass
@@ -52,7 +54,10 @@ def _r(value, digits=4):
     return None if value is None or not math.isfinite(value) else round(value, digits)
 
 
-class SequenceRunner:
+from .nav_steps import NavSteps  # noqa: E402
+
+
+class SequenceRunner(NavSteps):
     def __init__(self, sequence, robot, mode, log=print, authorization=None):
         self.seq = sequence
         self.robot = robot
@@ -67,6 +72,10 @@ class SequenceRunner:
         self.origin = None
         self.start = None
         self._last_health = (-math.inf, True, {})
+        self.nav_active_until = -math.inf      # Nav2 may command the mux only inside nav_goal
+        self.nav_anchor = None
+        self.geofence = None                   # (map x, y, radius) during nav_goal
+        self.last_deadman_feed = None
         if mode == MODE_PHYSICAL and authorization is None:
             raise ValueError('physical mode requires a checked authorization')
         if mode == MODE_READONLY and robot.can_actuate:
@@ -99,7 +108,7 @@ class SequenceRunner:
         now = self.robot.now()
         if self.robot.cancelled():
             return 'operator cancelled (signal)'
-        if now - self.start > HARD_MAX_SESSION_S:
+        if now - self.start > getattr(self, 'session_limit_s', HARD_MAX_SESSION_S):
             return 'session time limit exceeded'
         for name in ('joints', 'odom', 'imu'):
             if getattr(t, name).age(now) > req.max_age_s:
@@ -118,20 +127,40 @@ class SequenceRunner:
         ok, detail = self._health()
         if not ok:
             return f'command path unhealthy: {detail.get("problems")}'
-        return None
+        # Independent check of what actually reaches the motion_sender (domain 64).
+        v_cap = self.auth.max_speed_m_s if self.auth else HARD_MAX_SPEED_M_S
+        w_cap = self.auth.max_yaw_rate_rad_s if self.auth else HARD_MAX_YAW_RATE_RAD_S
+        for _, c in t.system_cmd.window(now, 0.5):
+            if abs(c.vx) > v_cap + 0.005 or abs(c.vy) > 0.005 or abs(c.wz) > w_cap + 0.005:
+                return (f'robot-side command beyond authorized limits (vx {c.vx:+.3f}, vy {c.vy:+.3f}, '
+                        f'wz {c.wz:+.3f}; caps {v_cap}, {w_cap})')
+        if now > self.nav_active_until and any(not c.is_zero for _, c in t.nav_cmd.window(now, 0.5)):
+            return 'Nav2 is commanding motion outside a nav_goal step (another goal source?)'
+        return self._nav_violation(now)
 
-    def _check(self):
+    def _check(self, feed=True):
+        """Abort on any violation; otherwise (if ``feed``) hold the dead-man released."""
         reason = self._safety_violation()
         if reason:
             raise SafetyAbort(reason)
+        if feed and hasattr(self.robot, 'feed_deadman'):
+            self.robot.feed_deadman()
+            self.last_deadman_feed = self.robot.now()
 
-    def _wait_until(self, step, predicate, poll=0.05, actuating=False, keepalive=None):
+    def _stop_command(self):
+        """One zero command on the stop path (mux safety_stop input above the locks if present)."""
+        if hasattr(self.robot, 'send_stop'):
+            self.robot.send_stop()
+        else:
+            self.robot.send_velocity(0.0, 0.0)
+
+    def _wait_until(self, step, predicate, poll=0.05, actuating=False, keepalive=None, feed=True):
         """Poll ``predicate`` until it returns (True, detail) or the step times out."""
         deadline = self.robot.now() + step.timeout_s
         detail = {}
         while self.robot.now() < deadline:
             if actuating:
-                self._check()
+                self._check(feed=feed)
             elif self.robot.cancelled():
                 raise SafetyAbort('operator cancelled (signal)')
             if keepalive:
@@ -152,7 +181,7 @@ class SequenceRunner:
         errors = 0
         while True:
             try:
-                self.robot.send_velocity(0.0, 0.0)
+                self._stop_command()
             except Exception:  # noqa: BLE001 - keep trying zeros during a stop
                 errors += 1
             if self.robot.now() >= end:
@@ -169,14 +198,22 @@ class SequenceRunner:
         t = self.robot.telemetry
         rows, last = [], -math.inf
         joints = t.joints.since(since)
+        imus = t.imu.since(since)
+        prev_joints = None
         for stamp, o in t.odom.since(since):
             if stamp - last < 0.05:
                 continue
             last = stamp
             row = {'t': _r(stamp - self.start, 3), 'x': _r(o.x), 'y': _r(o.y), 'yaw': _r(o.yaw),
                    'vx': _r(o.vx), 'vy': _r(o.vy), 'wz': _r(o.wz)}
+            imu = [v for ts, v in imus if abs(ts - stamp) < 0.01]
+            if imu:
+                row['gyro'] = _r(max(abs(g) for g in imu[-1].gyro), 3)
             near = [v for ts, v in joints if abs(ts - stamp) < 0.01]
+            if near and prev_joints is not None:
+                row['jd'] = _r(max(abs(a - b) for a, b in zip(near[-1].positions, prev_joints)), 4)
             if near:
+                prev_joints = near[-1].positions
                 assessment = assess_posture([near[-1].positions], (0.0, 0.0), self.seq.posture)
                 row['ext'] = [_r(e, 3) for e in assessment.extensions_m.values()]
             rows.append(row)
@@ -213,7 +250,7 @@ class SequenceRunner:
             ok, health = self._health(force=True)
             detail['command_path'] = health
             if not ok:
-                problems.append('command path unhealthy')
+                problems.append('command path unhealthy: ' + '; '.join(health.get('problems', [])))
             tilt = t.current_tilt()
             if tilt is None or max(map(abs, tilt)) > self.seq.safety.max_tilt_rad:
                 problems.append('IMU tilt invalid or beyond limit')
@@ -321,7 +358,7 @@ class SequenceRunner:
                     {'after': p.as_dict(), 'stationary': rest, 'left_source': left_source[0]})
 
         try:
-            ok, detail = self._wait_until(step, reached, actuating=True)
+            ok, detail = self._wait_until(step, reached, actuating=True, feed=False)
         except SafetyAbort:
             self.uncertain = True
             raise
@@ -343,6 +380,12 @@ class SequenceRunner:
         pre = {'posture': posture.as_dict(), 'stationary': rest}
         if not (posture.confident and posture.posture == STANDING and still):
             return FAILED, f'precondition: verified standing at rest required, got {posture.posture}', pre
+        if self._nav_capable():
+            sample = self._terrain()
+            pre['proximity_stop'] = None if sample is None else sample.stop
+            if sample is None or sample.stop:
+                return FAILED, ('precondition: proximity stop active or terrain status stale; clear '
+                                'the area (nothing within 0.45 m around or in the stop zone ahead)'), pre
         if not self.robot.can_actuate:
             return PREVIEW, f'would command vx={p["vx"]} wz={p["wz"]} for {p["duration_s"]}s', pre
         start_odom = self._odom()
@@ -452,7 +495,8 @@ class SequenceRunner:
 
         def keepalive():
             if self.robot.now() - state['last_send'] >= self.seq.safety.command_period_s:
-                self._send(0.0, 0.0)
+                self.commands_sent = True
+                self._stop_command()
                 state['last_send'] = self.robot.now()
 
         def at_rest():
@@ -461,7 +505,7 @@ class SequenceRunner:
 
         try:
             ok, detail = self._wait_until(step, at_rest, poll=self.seq.safety.command_period_s,
-                                          actuating=True, keepalive=keepalive)
+                                          actuating=True, keepalive=keepalive, feed=False)
         finally:
             self._zero_burst(0.2)
         detail['verified_after_s'] = _r(self.robot.now() - t0, 2)
@@ -476,15 +520,20 @@ class SequenceRunner:
         handler = getattr(self, 'step_' + step.type)
         started = self.robot.now()
         self.log(f'--> {step.id} ({step.type})')
+        self.partial = {}       # steps put their preconditions here so an abort keeps them
         try:
             out = handler(step)
         except SafetyAbort as error:
             if self.commands_sent:
                 self.uncertain = self.uncertain or step.actuating
-            out = (ABORTED, f'safety stop: {error}', {})
+            context = self._abort_context(started, str(error))
+            if error.detail:
+                context = {**error.detail, **context}
+            out = (ABORTED, f'safety stop: {error}', context, self._trace(started))
         except Exception as error:  # noqa: BLE001 - convert to a recorded failure, then stop safely
             self.uncertain = self.uncertain or self.commands_sent
-            out = (FAILED, f'internal error: {type(error).__name__}: {error}', {})
+            out = (FAILED, f'internal error: {type(error).__name__}: {error}',
+                   self._abort_context(started, repr(error)), self._trace(started))
         status, summary, detail = out[:3]
         result = StepResult(step.id, step.type, status, summary, step.actuating,
                             _r(started - self.start, 3), _r(self.robot.now() - started, 3),
@@ -492,9 +541,28 @@ class SequenceRunner:
         self.log(f'<-- {step.id}: {status} - {summary}')
         return result
 
+    def _abort_context(self, started, reason):
+        """Everything the buffers hold for the aborted step: what the lock saw, what reached the
+        robot and when (seconds after step start), plus the step's recorded preconditions."""
+        t = self.robot.telemetry
+        rel = lambda ts: _r(ts - started, 3)  # noqa: E731
+        context = {'abort_reason': reason, 'abort_at_s': rel(self.robot.now()),
+                   'preconditions': self.partial,
+                   'robot_commands': [[rel(ts), _r(c.vx), _r(c.vy), _r(c.wz)]
+                                      for ts, c in t.system_cmd.since(started - 1.0)],
+                   'nav2_commands': [[rel(ts), _r(c.vx), _r(c.wz)] for ts, c in t.nav_cmd.since(started - 1.0)],
+                   'terrain_status': [[rel(ts), v.stop, v.reason, _r(v.obstacle_ahead_m), v.stop_ahead_m,
+                                       list(v.problems)] for ts, v in t.terrain.since(started - 3.0)],
+                   'terrain_stop_topic': [[rel(ts), v] for ts, v in t.terrain_stop.since(started - 3.0)],
+                   'clearance_m': [[rel(ts), _r(v)] for ts, v in t.clearance.since(started - 1.0)],
+                   'last_dead_man_feed_s': None if self.last_deadman_feed is None
+                   else rel(self.last_deadman_feed)}
+        return context
+
     def safe_stop(self):
         """Zeros, then verify rest. Never sends posture commands."""
         self._event('safe_stop_begin')
+        self._cancel_navigation()
         errors = self._zero_burst(self.seq.safety.zero_seconds)
         deadline = self.robot.now() + self.seq.safety.stop_timeout_s
         verified, detail = False, {}
@@ -519,12 +587,17 @@ class SequenceRunner:
                 first = self._run_step(step)
                 results.append(first)
                 if first.status not in (PREVIEW, SKIPPED):
-                    failed = first
+                    failed = failed or first
                 results += [StepResult(s.id, s.type, PREVIEW, 'read-only: not executed', s.actuating)
                             for s in self.seq.steps[index + 1:]]
                 break
             result = self._run_step(step)
             results.append(result)
+            if self.mode == MODE_READONLY and result.status == FAILED:
+                # Read-only readiness report: keep evaluating the non-moving checks so every
+                # blocker is listed at once (nothing is published in this mode).
+                failed = failed or result
+                continue
             if (result.status == FAILED and step.type == 'velocity_move'
                     and step.params.get('continue_on_range_failure')
                     and result.measurements.get('range_failure_only')):

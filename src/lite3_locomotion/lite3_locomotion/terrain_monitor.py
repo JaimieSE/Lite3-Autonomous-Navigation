@@ -10,6 +10,9 @@ Outputs (new, read-only consumers): /lite3_terrain/grid (OccupancyGrid),
 as an extra Nav2 costmap observation source), /lite3_terrain/status (JSON), /lite3_terrain/stop (Bool) for a twist_mux lock:
 true when an obstacle/drop is within the proximity zone or inputs are invalid;
 held true for 1 s after clearing. If this node stops, the lock's timeout engages.
+ROS parameters stop_ahead_m / stop_radius_m (from base_link centre) may be raised at
+runtime for a test, never below the validated defaults (terrain.STOP_LIMITS); the
+active values are reported in status.stop.
 The stop signal is a perception output; blocking motion is the mux's job.
 It has no velocity, posture, mode or service interfaces.
 """
@@ -76,8 +79,26 @@ def main(args=None):
     hazard_pub = node.create_publisher(PointCloud2, '/lite3_terrain/hazards', 1)
     status_pub = node.create_publisher(String, '/lite3_terrain/status', 1)
     stop_pub = node.create_publisher(Bool, '/lite3_terrain/stop', 1)
-    stop_params = T.StopParams()
+    from rcl_interfaces.msg import SetParametersResult
+    state['stop_params'] = T.StopParams()
     state['last_hazard'] = -math.inf
+    for name in T.STOP_LIMITS:
+        node.declare_parameter(name, getattr(state['stop_params'], name))
+
+    def on_parameters(parameters):
+        """Proximity-stop distances: may be raised for a test, never below the validated default."""
+        params = state['stop_params']
+        try:
+            for p in parameters:
+                if p.name in T.STOP_LIMITS:
+                    params = T.updated_stop_params(params, p.name, p.value)
+        except ValueError as error:
+            return SetParametersResult(successful=False, reason=str(error))
+        state['stop_params'] = params
+        node.get_logger().info(f'proximity stop now ahead {params.stop_ahead_m} m, '
+                               f'radius {params.stop_radius_m} m')
+        return SetParametersResult(successful=True)
+    node.add_on_set_parameters_callback(on_parameters)
 
     def on_imu(msg):
         q = msg.orientation
@@ -134,7 +155,7 @@ def main(args=None):
             level = base @ level_r.T
             floor_z, source = T.estimate_floor(level, legs[0], params)
             grid = T.build_grid(level, floor_z, params, source)
-            hazard = T.proximity_stop(grid, stop_params)
+            hazard = T.proximity_stop(grid, state['stop_params'])
             status.update({
                 'floor_z_m': round(floor_z, 3), 'floor_source': source,
                 'leg_floor_reference_m': round(legs[0], 3),
@@ -167,14 +188,20 @@ def main(args=None):
         except Exception as error:  # noqa: BLE001 - report, never crash the monitor
             status['problems'].append(f'{type(error).__name__}: {error}')
         finally:
+            if not node.context.ok():   # shutting down: nothing may be published any more
+                state['busy'] = False
+                return
             if status['problems']:
                 hazard = (True, 'inputs invalid: ' + '; '.join(status['problems']))
             now = time.monotonic()
             if hazard[0]:
                 state['last_hazard'] = now
+            stop_params = state['stop_params']
             stop = now - state['last_hazard'] < stop_params.release_hold_s
             status['stop'] = {'active': stop, 'reason': hazard[1] if hazard[0] else
-                              ('release hold' if stop else None)}
+                              ('release hold' if stop else None),
+                              'ahead_m': stop_params.stop_ahead_m,
+                              'radius_m': stop_params.stop_radius_m}
             stop_pub.publish(Bool(data=stop))
             status['processing_s'] = round(time.monotonic() - started, 3)
             status_pub.publish(String(data=json.dumps(status)))
@@ -188,6 +215,9 @@ def main(args=None):
         rclpy.spin(node)
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
+    except Exception:   # noqa: BLE001 - rclpy raises RCLError if shutdown races the executor
+        if rclpy.ok():
+            raise
     finally:
         node.destroy_node()
         rclpy.try_shutdown()
