@@ -235,7 +235,8 @@ class FakeRobot:
 NAV_FAULTS = ('none', 'mux_leak', 'deadman_ignored', 'nav_reverse', 'nav_overspeed', 'rogue_goal',
               'lock_late', 'hazard_stale', 'detection_dropout', 'blind_after_start', 'cm_disabled',
               'cm_missing', 'cap_unverified', 'terrain_stale_walk', 'lidar_slow_walk',
-              'imu_invalid_walk', 'cm_slow', 'deadman_lapse_walk', 'cm_edge_chatter')
+              'imu_invalid_walk', 'cm_slow', 'deadman_lapse_walk', 'cm_edge_chatter',
+              'stop_unmatched', 'odom_lag')
 # Humble MPPI is modelled as it behaves on the robot: a goal resets the optimizer, so a
 # /speed_limit published BEFORE the goal is lost (M5 overspeed 2026-11-16); the velocity_smoother
 # max_velocity (set_nav_velocity_cap) clamps Nav2's output regardless.
@@ -260,17 +261,20 @@ def box_points(x, y, size=0.3, step=0.05):
 
 
 class FakeNavRobot(FakeRobot):
-    def __init__(self, telemetry, model, nav_fault='none', obstacles=(), cm_boundary=0.37, **kwargs):
+    def __init__(self, telemetry, model, nav_fault='none', obstacles=(), cm_boundary=0.37,
+                 cm_slow_boundary=None, cm_slowdown_ratio=None, **kwargs):
         self.faults = set(nav_fault.split('+'))
         if self.faults - set(NAV_FAULTS):
             raise ValueError(f'unknown nav fault {nav_fault}')
         self.nav_fault = nav_fault
         self.cm_boundary = cm_boundary            # collision_monitor stop polygon, nose distance
+        self.cm_slow_boundary = cm_slow_boundary  # optional slowdown polygon (stacks above 0.10 m/s)
+        self.cm_slowdown_ratio = cm_slowdown_ratio
         self.cm_stopping = False
         self.obstacles = list(obstacles)
         self.inputs = {}
         self.last_feed = -math.inf
-        self.stop_ahead = 0.60
+        self.stop_ahead = 0.505
         self.stop_radius = 0.45
         self.last_hazard = -math.inf
         self.terrain_stop = False
@@ -320,6 +324,10 @@ class FakeNavRobot(FakeRobot):
                                              if inside else ('continue', 'Robot to continue normal operation'))
             if inside:
                 vx, wz = 0.0, 0.0
+            elif self.cm_slow_boundary:
+                slow_front = 0.305 + self.cm_slow_boundary
+                if any(-0.355 <= x <= slow_front and abs(y) <= 0.30 for x, y in self._base_points()):
+                    vx, wz = vx * self.cm_slowdown_ratio, wz * self.cm_slowdown_ratio
         self.mux_log.append((self.t, source, vx, wz))
         self.model.command_velocity(self.t, vx, wz)
         self.telemetry.on_system_cmd(self.t, vx, 0.0, wz)
@@ -379,13 +387,37 @@ class FakeNavRobot(FakeRobot):
             if not ('hazard_stale' in self.faults and self.goal_sent):
                 from .nav_steps import footprint_clearance
                 self.telemetry.on_clearance(t, footprint_clearance(pts))
-            self.telemetry.lidar_odom.add(t, None)
-            self.telemetry.hazard_age.add(t, 0.3)
+            self.telemetry.lidar_odom.add(t, 1.5 if 'odom_lag' in self.faults else 0.15)
+            self.telemetry.hazard_age.add(t, getattr(self, 'hazard_age_s', 0.3))   # tests may raise it
         if t >= self.next_nav:
             self.next_nav = t + 0.05
             self._nav_tick()
 
+    def _spin_tick(self):
+        """behavior_server Spin: constant 0.2 rad/s in place; progress is the yaw the body really
+        turned (a lock or the collision_monitor zeroing the output stalls it, as on the robot)."""
+        sp, m = self.spin, self.model
+        turned = math.atan2(math.sin(m.yaw - sp['last_yaw']), math.cos(m.yaw - sp['last_yaw']))
+        sp['last_yaw'] = m.yaw
+        sp['done'] += abs(turned)
+        self.goal_state['spun_rad'] = sp['done']
+        if sp['done'] >= abs(sp['target']) - 0.02:
+            self.goal_state['result'] = 'SUCCEEDED'
+            self.spin = None
+            self._mux('nav', 0.0, 0.0)
+            return
+        if self.t - sp['start'] > sp['allowance']:
+            self.goal_state['result'] = 'ABORTED'
+            self.spin = None
+            return
+        wz = math.copysign(0.2, sp['target'])
+        self.telemetry.on_nav_cmd(self.t, 0.0, 0.0, wz)
+        self._mux('nav', 0.0, wz)
+
     def _nav_tick(self):
+        if getattr(self, 'spin', None):
+            self._spin_tick()
+            return
         if 'rogue_goal' in self.faults and self.model.blend >= 1.0 and self.goal is None \
                 and self.t > 110:
             self.telemetry.on_nav_cmd(self.t, 0.05, 0.0, 0.0)
@@ -435,6 +467,14 @@ class FakeNavRobot(FakeRobot):
         self.sent.append((self.t, 'stop'))
         self._mux('stop', 0.0, 0.0)
 
+    def stop_path_status(self):
+        if 'stop_unmatched' in self.faults:
+            return {'stop_input_subscribers': 0, 'hold_subscribers': 1,
+                    'robot_cmd_publishers': ['/lite3_domain_bridge_64'],
+                    'problems': ['twist_mux not matched on /lite3_ops/stop_cmd_vel']}
+        return {'stop_input_subscribers': 1, 'hold_subscribers': 1,
+                'robot_cmd_publishers': ['/lite3_domain_bridge_64'], 'problems': []}
+
     def feed_deadman(self):
         self.last_feed = self.t
 
@@ -450,7 +490,7 @@ class FakeNavRobot(FakeRobot):
         return {'ok': True, 'requested': [vx, 0.0, wz], 'max_velocity': [vx, 0.0, wz]}
 
     def set_stop_distance(self, ahead_m):
-        if ahead_m < 0.60:
+        if ahead_m < 0.505:
             return {'ok': False, 'reason': 'below floor'}
         self.stop_ahead = ahead_m
         return {'ok': True}
@@ -462,13 +502,23 @@ class FakeNavRobot(FakeRobot):
         self.goal_state = {'result': None, 'recoveries': 0, 'blocked_since': None}
         return True
 
+    def nav_spin(self, angle_rad, time_allowance_s):
+        self.goal = None
+        self.spin = {'target': float(angle_rad), 'done': 0.0, 'last_yaw': self.model.yaw, 'start': self.t,
+                     'allowance': float(time_allowance_s)}
+        self.spins_sent = getattr(self, 'spins_sent', 0) + 1
+        self.goal_state = {'result': None, 'recoveries': 0, 'blocked_since': None, 'spun_rad': 0.0}
+        return True
+
     def nav_status(self):
-        return {'active': self.goal is not None, 'result': self.goal_state['result'],
-                'recoveries': self.goal_state['recoveries']}
+        return {'active': self.goal is not None or bool(getattr(self, 'spin', None)),
+                'result': self.goal_state['result'], 'recoveries': self.goal_state['recoveries'],
+                'spun_rad': self.goal_state.get('spun_rad')}
 
     def nav_cancel(self):
-        if self.goal is not None:
+        if self.goal is not None or getattr(self, 'spin', None):
             self.goal = None
+            self.spin = None
             self.goal_state['result'] = 'CANCELED'
         return True
 
@@ -478,5 +528,7 @@ class FakeNavRobot(FakeRobot):
     def nav_ready(self):
         return {'problems': []}
 
-    def collision_boundary(self):
-        return None if 'cm_missing' in self.faults else self.cm_boundary
+    def collision_boundary(self, polygon='PolygonStop'):
+        if 'cm_missing' in self.faults:
+            return None
+        return self.cm_boundary if polygon == 'PolygonStop' else self.cm_slow_boundary

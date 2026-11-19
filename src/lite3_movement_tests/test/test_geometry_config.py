@@ -95,7 +95,7 @@ def test_default_sequence_loads_within_hard_limits():
 
 
 @pytest.mark.parametrize('mutate, message', [
-    (lambda d: d['steps'][5].update(vx=0.6), 'vx'),
+    (lambda d: d['steps'][5].update(vx=1.1), 'vx'),
     (lambda d: d['steps'][5].update(duration_s=10), 'duration_s'),
     (lambda d: d['steps'][5].pop('expect'), 'expect'),
     (lambda d: d['steps'].pop(6), 'stop_verify'),

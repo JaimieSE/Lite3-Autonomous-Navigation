@@ -208,6 +208,17 @@ def test_watchdog_quiet_when_healthy_and_flags_lost_heartbeat_and_stale_telemetr
     assert any('stale' in r for r in logic.evaluate(t, 102.0))
 
 
+def test_watchdog_tolerates_observed_link_gaps_but_not_longer_ones():
+    """Robot<->onboard-PC gaps up to 0.78 s (telemetry) / 0.83 s (LiDAR) were measured in preflights;
+    they must not trip the watchdog. Longer outages still must."""
+    logic = R.WatchdogLogic(0.10, 3.0)
+    t = watched()                                   # last sample at 100.95
+    assert not any('stale' in r for r in logic.evaluate(t, 100.95 + 0.85))
+    late = logic.evaluate(t, 100.95 + 1.3)
+    assert any('joints telemetry stale' in r for r in late), late
+    assert any('raw LiDAR' in r and 'stale' in r for r in late), late
+
+
 def test_actual_speed_limit_is_tied_to_the_selected_mode(tmp_path):
     """Slow mode (0.05): sustained odometry speed above max(2 x 0.05, 0.05 + 0.05) = 0.10 m/s stops
     roaming even though 0.10 is within the session limit."""
@@ -254,10 +265,10 @@ def test_distance_ignores_pose_jitter(tmp_path):
     assert summary['stats']['distance_m'] < 0.1     # was ~0.06 m/s of pure jitter before
 
 
-# ---- hard speed ceiling raised to 0.5 m/s (operator decision 2026-11-17) -------------------------
-def test_ceiling_is_half_a_metre_per_second_and_defaults_stay_low():
+# ---- hard speed ceiling raised to 1.0 m/s (operator decisions 2026-11-17: 0.5, 2026-11-18: 1.0) --
+def test_ceiling_is_one_metre_per_second_and_defaults_stay_low():
     from lite3_movement_tests.config import HARD_MAX_SPEED_M_S
-    assert HARD_MAX_SPEED_M_S == 0.5
+    assert HARD_MAX_SPEED_M_S == 1.0
     cfg = R.RoamConfig()
     assert cfg.speed_limit == 0.10 and cfg.mode_speed(cfg.start_mode)[0] == 0.05     # nothing got faster
     assert R.DEFAULT_MODES['fast'][0] == 0.10
@@ -269,15 +280,19 @@ def test_higher_speed_needs_the_stack_started_for_it():
     cfg = R.RoamConfig(speed_limit=0.3, stack_max_speed=0.5, modes={'fast': (0.3, 0.2)})
     assert cfg.mode_speed('fast')[0] == 0.3
     with pytest.raises(ConfigError):
-        R.RoamConfig(speed_limit=0.6, stack_max_speed=0.6)              # above the hard ceiling
+        R.RoamConfig(speed_limit=1.1, stack_max_speed=1.1)              # above the hard ceiling
+    assert R.RoamConfig(speed_limit=1.0, stack_max_speed=1.0).speed_limit == 1.0
+    from lite3_movement_tests.runner import MODE_PHYSICAL
+    fast = R.RoamConfig(speed_limit=1.0, stack_max_speed=1.0)
+    assert R.backup_distance(fast, 2.83, MODE_PHYSICAL) == 2.78        # follows the 1.0 m/s boundary
 
 
 def test_backup_lock_moves_out_only_above_the_validated_speed():
     low, high = R.RoamConfig(), R.RoamConfig(speed_limit=0.3, stack_max_speed=0.5)
-    assert R.backup_distance(low, 0.47, MODE_SIM) == 0.30
-    assert R.backup_distance(high, 0.98, MODE_SIM) == 0.30              # sim/dry: not settable, unchanged
+    assert R.backup_distance(low, 0.47, MODE_SIM) == 0.20
+    assert R.backup_distance(high, 0.98, MODE_SIM) == 0.20              # sim/dry: not settable, unchanged
     from lite3_movement_tests.runner import MODE_PHYSICAL
-    assert R.backup_distance(low, 0.47, MODE_PHYSICAL) == 0.30
+    assert R.backup_distance(low, 0.47, MODE_PHYSICAL) == 0.20
     assert R.backup_distance(high, 0.98, MODE_PHYSICAL) == 0.93         # 5 cm inside the boundary
     assert R.backup_distance(high, 1.50, MODE_PHYSICAL) == 1.45
 
@@ -290,3 +305,182 @@ def test_roaming_at_a_higher_session_limit_still_enforces_the_selected_mode(tmp_
     t0 = session.t_roam
     speeds = [c.vx for t, c in robot.telemetry.system_cmd.since(0) if t >= t0 + 25]
     assert max(speeds) <= 0.2001 and max(speeds) > 0.1
+
+
+# ---- spin-and-walk strategy (2026-11-18: robot stood still on a sparse 1-scan map) ----------------
+def _grid(width_m=8.0, height_m=6.0, res=0.05, free=(), occupied=()):
+    """Unknown grid with free / occupied axis-aligned boxes (x0, x1, y0, y1) in metres; origin (-4, -3)."""
+    from lite3_locomotion.frontiers import Grid
+    w, h = int(width_m / res), int(height_m / res)
+    data = [-1] * (w * h)
+    for value, boxes in ((0, free), (100, occupied)):
+        for x0, x1, y0, y1 in boxes:
+            for j in range(h):
+                for i in range(w):
+                    x, y = -4 + (i + 0.5) * res, -3 + (j + 0.5) * res
+                    if x0 <= x <= x1 and y0 <= y <= y1:
+                        data[j * w + i] = value
+    return Grid(w, h, res, data, -4.0, -3.0)
+
+
+def _walker(geofence=3.0):
+    return R.ScanWalk(R.RoamConfig(geofence_m=geofence, strategy='scan_walk'), (0.0, 0.0))
+
+
+def test_scan_walk_walks_toward_the_open_side_and_stops_short_of_the_wall():
+    grid = _grid(free=[(-0.5, 2.0, -0.5, 0.5)], occupied=[(2.0, 2.1, -1.0, 1.0)])
+    w = _walker()
+    goal = w.choose(grid, (0.0, 0.0, 0.0), 0.0)
+    assert goal['kind'] == 'walk' and goal['ends_at'] == 'obstacle'
+    assert abs(goal['yaw']) < 0.01                                  # straight at the open side
+    assert 1.0 < goal['x'] <= 2.0 - R.ScanWalk.STANDOFF_M + 0.06    # nose ~0.35 m before the wall
+    assert abs(goal['y']) < 0.01
+
+
+def test_scan_walk_does_not_walk_into_unseen_space_or_through_a_narrow_gap():
+    # Seen-free strip 0.2 m wide beside obstacles: narrower than the corridor -> blocked.
+    grid = _grid(free=[(-0.5, 2.5, -0.1, 0.1)], occupied=[(0.6, 2.5, 0.2, 0.25), (0.6, 2.5, -0.25, -0.2)])
+    assert _walker().choose(grid, (0.0, 0.0, 0.0), 0.0) is None
+    grid = _grid(free=[(-0.4, 0.4, -0.4, 0.4)])                    # nothing seen beyond 0.4 m
+    assert _walker().choose(grid, (0.0, 0.0, 0.0), 0.0) is None
+
+
+def test_scan_walk_prefers_not_to_go_back_where_it_came_from():
+    grid = _grid(free=[(-2.5, 2.5, -0.5, 0.5)])                    # open both ways, equal length
+    w = _walker()
+    w.came_from = 0.0                                               # just walked toward +x ...
+    goal = w.choose(grid, (0.0, 0.0, 0.0), 0.0)
+    assert abs(goal['yaw']) < 0.01                                  # ... so keep going, not back
+
+
+def test_scan_walk_respects_the_geofence_and_costmap_hazards():
+    grid = _grid(free=[(-0.5, 3.9, -0.5, 0.5)])
+    goal = _walker(geofence=1.5).choose(grid, (0.0, 0.0, 0.0), 0.0)
+    assert math.hypot(goal['x'], goal['y']) <= 1.5 - 0.4
+    cost = _grid(free=[(-4, 4, -3, 3)], occupied=[(1.2, 1.3, -3, 3)])   # point-cloud-only wall
+    goal = _walker().choose(grid, (0.0, 0.0, 0.0), 0.0, cost)
+    assert goal['ends_at'] == 'obstacle'
+    ahead = (1.2 - goal['x']) / math.cos(goal['yaw'])               # to the hazard along the heading
+    assert ahead >= R.ScanWalk.STANDOFF_M - 0.06
+
+
+def test_scan_walk_stops_short_of_the_live_proximity_stop_zone():
+    """A walk must end outside the terrain stop's ahead zone, or the lock holds even in-place turns."""
+    grid = _grid(free=[(-0.5, 3.0, -0.6, 0.6)], occupied=[(3.0, 3.1, -1.0, 1.0)])
+    w = _walker()
+    w.stop_ahead_m = 1.45                     # backup lock at 0.5 m/s (1.14 m nose + 0.305)
+    goal = w.choose(grid, (0.0, 0.0, 0.0), 0.0)
+    assert goal['x'] <= 3.0 - (1.45 + R.ScanWalk.STOP_AHEAD_MARGIN_M) + 0.06
+    room = _grid(free=[(-0.5, 3.0, -0.6, 0.6)],
+                 occupied=[(3.0, 3.1, -1, 1), (-0.7, -0.6, -1, 1), (-0.7, 3.1, 0.7, 0.8), (-0.7, 3.1, -0.8, -0.7)])
+    w.stop_ahead_m = 2.6                      # zone reaches past every walk in a 3.6 m room: none allowed
+    assert w.choose(room, (0.0, 0.0, 0.0), 0.0) is None
+
+
+def test_scan_walk_starts_walking_on_an_open_map(tmp_path):
+    outcome, summary, robot, _ = roam(tmp_path, stop_after=90, cfg=R.RoamConfig(strategy='scan_walk'))
+    names = [e['event'] for e in summary['events']]
+    assert names[:3] == ['scan_walk', 'roaming', 'walk']
+    assert summary['stats']['goals_succeeded'] >= 1
+    assert outcome == 'STOPPED' and summary['rest_verified']
+    assert max(c.vx for _, c in robot.telemetry.system_cmd.since(0)) <= 0.0501
+
+
+@pytest.mark.parametrize('side', [-1, 1])
+def test_walk_goals_can_turn_either_way(side):
+    grid = _grid(free=[(-0.25, 0.25, min(0, side * 2), max(0, side * 2))])
+    goal = _walker().choose(grid, (0, 0, 0), 0)
+    assert goal['y'] * side > 0.5
+    assert goal['yaw'] * side > 0
+
+
+def test_no_opening_scans_both_sides_then_pauses(tmp_path, monkeypatch):
+    monkeypatch.setattr(R.ScanWalk, 'choose', lambda *a, **kw: None)
+    outcome, summary, _, _ = roam(tmp_path, cfg=R.RoamConfig(strategy='scan_walk'), stop_after=100)
+    turns = [e['degrees'] for e in summary['events'] if e['event'] == 'spin']
+    assert turns == [30, 30, -30, -30, -30, -30]
+    assert summary['stats']['walk_goals'] == 0
+    assert summary['stats']['pauses'] == 1 and outcome == 'STOPPED'
+
+
+def test_new_opening_cancels_scan_before_walking(tmp_path, monkeypatch):
+    from lite3_movement_tests.roam_sim import SimRoamRobot
+    original = SimRoamRobot.map_grid
+    blind = _grid()
+
+    def map_after_turn(robot):
+        stamp, grid = original(robot)
+        return stamp, blind if abs(robot.model.yaw) < 0.05 else grid
+
+    monkeypatch.setattr(SimRoamRobot, 'map_grid', map_after_turn)
+    _, summary, _, _ = roam(tmp_path, stop_after=35, cfg=R.RoamConfig(strategy='scan_walk'))
+    events = summary['events']
+    opened = next(i for i, e in enumerate(events) if e['event'] == 'spin_opening')
+    assert events[opened]['turned_deg'] < 30
+    assert events[opened + 1]['event'] == 'walk'
+
+
+def test_one_sided_partial_map_starts_search_to_the_right(tmp_path, monkeypatch):
+    from lite3_movement_tests.roam_sim import SimRoamRobot
+    # The right side has more known space but still too little to send a walk goal.
+    grid = _grid(free=[(-0.2, 0.51, -0.36, 0.05)])
+    monkeypatch.setattr(SimRoamRobot, 'map_grid', lambda robot: (robot.now(), grid))
+    _, summary, _, _ = roam(tmp_path, stop_after=3, cfg=R.RoamConfig(strategy='scan_walk'))
+    turns = [event['degrees'] for event in summary['events'] if event['event'] == 'spin']
+    assert turns and turns[0] == -30
+    assert summary['stats']['walk_goals'] == 0
+
+
+def test_stalled_search_pauses(tmp_path, monkeypatch):
+    from lite3_movement_tests.sim_model import FakeNavRobot
+    monkeypatch.setattr(R.ScanWalk, 'choose', lambda *a, **kw: None)
+    monkeypatch.setattr(FakeNavRobot, '_spin_tick', lambda self: None)
+    _, summary, _, _ = roam(tmp_path, stop_after=25, cfg=R.RoamConfig(strategy='scan_walk'))
+    names = [e['event'] for e in summary['events']]
+    assert 'spin_stalled' in names and 'paused' in names and 'walk' not in names
+
+
+def test_cli_defaults_to_scan_walk_and_frontier_stays_available():
+    a = R.parse(['run', '--sim'])
+    assert R.build_config(a, {}).strategy == 'scan_walk'
+    assert R.build_config(R.parse(['run', '--sim', '--strategy', 'frontier']), {}).strategy == 'frontier'
+    with pytest.raises(ConfigError):
+        R.RoamConfig(strategy='wander')
+
+
+# ---- speed plan: one source for the limit chain, stop zones and turning clearance ----------------
+def test_fast_mode_follows_a_raised_limit_but_sessions_still_start_slow():
+    assert R.session_modes('', 0.10)['fast'] == R.DEFAULT_MODES['fast']        # validated: unchanged
+    assert R.session_modes('', 0.50)['fast'][0] == 0.50
+    assert R.session_modes('fast=0.3', 0.50)['fast'][0] == 0.3                # explicit --modes wins
+    a = R.parse(['run', '--speed-limit', '0.5'])
+    cfg = R.build_config(a, {'MAX_SPEED': '0.5'})
+    assert cfg.start_mode == 'slow' and cfg.mode_speed('fast')[0] == 0.5
+    with pytest.raises(ConfigError):                                          # above the stack boundary
+        R.build_config(R.parse(['run', '--speed-limit', '0.5']), {'MAX_SPEED': '0.10'})
+
+
+def test_effective_settings_scale_with_speed():
+    from lite3_locomotion import collision_profile as CP
+    cal = CP.Calibration(sensing_age_s=0.158, path_latency_s=0.195, coast_m=0.035, coast_speed_m_s=0.05)
+    slow, fast = R.effective_settings(0.10, 0.05, cal), R.effective_settings(0.50, 0.05, cal)
+    assert slow['validated'] and not fast['validated'] and 'ASSUMED' in fast['coast_basis']
+    assert slow['terrain_stop_from_nose_m'] == 0.20                              # floor up to 0.10 m/s
+    assert fast['terrain_stop_from_nose_m'] == 0.20                      # stop polygon is the 0.10 one
+    # Above 0.10 the STOP polygon stays sized for 0.10 m/s and a slowdown polygon carries the full-speed
+    # stop, so the turning clearance scan-walk needs does NOT grow with speed (no turn lock).
+    assert fast['slowdown_boundary_from_nose_m'] > 1.0 and slow['slowdown_boundary_from_nose_m'] is None
+    assert fast['boundary_parts']['required_m'] > slow['boundary_parts']['required_m']
+    assert fast['turn_clearance_radius_m'] == slow['turn_clearance_radius_m'] < 0.7
+    assert fast['turn_clearance_radius_m'] >= math.hypot(fast['stop_zone_from_centre_m'], 0.30)
+    assert fast['modes']['fast']['smoother_cap'][0] == 0.50 and fast['watchdog_cmd_abort_above_m_s'] == 0.52
+    with pytest.raises(ValueError):                                             # boundary cap 3.0 m
+        R.effective_settings(1.0, 0.5, CP.Calibration(sensing_age_s=1.5))
+
+
+def test_plan_command_prints_without_a_stack(capsys, tmp_path, monkeypatch):
+    monkeypatch.setenv('LITE3_STATE_FILE', str(tmp_path / 'state.env'))
+    assert R.main(['plan', '--max-speed', '0.3']) == 0
+    out = capsys.readouterr().out
+    assert 'NOT VALIDATED' in out and 'fast    0.30 m/s' in out and 'open floor' in out
+    assert R.main(['plan', '--max-speed', '0.1', '--speed-limit', '0.2']) == 2

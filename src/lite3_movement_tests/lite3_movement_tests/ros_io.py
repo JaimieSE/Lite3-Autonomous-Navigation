@@ -320,12 +320,18 @@ class NavRobot(RosRobot):
         node.create_subscription(Log, '/rosout', lambda m: on_log(m), 50)
         node.create_subscription(Twist, '/nav_cmd_vel', lambda m: t.on_nav_cmd(
             now(), m.linear.x, m.linear.y, m.angular.z), 50)
-        node.create_subscription(Odometry, '/odom', lambda m: t.lidar_odom.add(now(), None),
-                                 qos_profile_sensor_data)
+        # value = stamp age on arrival (wall clock; robot computer and this PC are NTP-synced, the
+        # Livox IMU measured 5 ms old in domain 64): how far SLAM odometry / odom TF trails reality
+        node.create_subscription(Odometry, '/odom', lambda m: t.lidar_odom.add(
+            now(), time.time() - (m.header.stamp.sec + m.header.stamp.nanosec * 1e-9)),
+            qos_profile_sensor_data)
         self._tf = Buffer()
         self._tf_listener = TransformListener(self._tf, node)
         self._NavigateToPose = NavigateToPose
         self._action = ActionClient(node, NavigateToPose, '/navigate_to_pose')
+        from nav2_msgs.action import Spin
+        self._Spin = Spin
+        self._spin_action = ActionClient(node, Spin, '/spin')       # behavior_server (in place, <= 0.2 rad/s)
         if self.can_actuate:
             from nav2_msgs.msg import SpeedLimit
             from rcl_interfaces.srv import SetParameters
@@ -335,6 +341,30 @@ class NavRobot(RosRobot):
             self._speed_pub = node.create_publisher(SpeedLimit, '/speed_limit', 10)
             self._param_client = node.create_client(SetParameters,
                                                     f'/{TERRAIN_NODE}/set_parameters')
+
+    def stop_path_status(self):
+        """Is the commanded-stop path discovered end to end? Publishers created moments ago drop
+        everything sent before DDS matches them (M10 zero_delivery 2026-11-18: started 0.35 s after
+        launch, first zero at 0.53 s, 2 of 20 delivered). Read-only graph queries."""
+        status = {'stop_input_subscribers': 0, 'hold_subscribers': 0, 'robot_cmd_publishers': [],
+                  'problems': []}
+        if not self.can_actuate:
+            status['problems'].append('read-only interface has no publishers')
+            return status
+        status['stop_input_subscribers'] = self._stop_pub.get_subscription_count()
+        status['hold_subscribers'] = self._hold_pub.get_subscription_count()
+        system = self._nodes[self.wiring.system_domain]
+        status['robot_cmd_publishers'] = sorted(
+            '/' + i.node_name for i in system.get_publishers_info_by_topic(self.wiring.robot_topic))
+        if status['stop_input_subscribers'] < 1:
+            status['problems'].append(f'twist_mux not matched on {OPS_STOP_TOPIC}')
+        if status['hold_subscribers'] < 1:
+            status['problems'].append(f'twist_mux not matched on {OPS_HOLD_TOPIC}')
+        want = '/' + self.wiring.system_cmd_publisher
+        if want not in status['robot_cmd_publishers']:
+            status['problems'].append(f'{want} not yet discovered on {self.wiring.robot_topic} '
+                                      f'(domain {self.wiring.system_domain})')
+        return status
 
     # ---- commands (all through the mux) -----------------------------------------------------
     def send_stop(self):
@@ -452,10 +482,39 @@ class NavRobot(RosRobot):
             lambda f: self._goal.update(result=names.get(f.result().status, f'STATUS_{f.result().status}')))
         return True
 
+    def nav_spin(self, angle_rad, time_allowance_s):
+        """Nav2 behavior_server Spin: turn in place by angle_rad (relative). Shares the goal slot, so
+        nav_status / nav_cancel cover it; feedback 'spun_rad' is the angle turned so far. Its output
+        goes nav_cmd_vel -> twist_mux (dead-man + terrain locks) -> collision_monitor like any goal."""
+        if not self.can_actuate:
+            raise RuntimeError('read-only interface sends no goals')
+        if not self._spin_action.wait_for_server(timeout_sec=5.0):
+            return False
+        goal = self._Spin.Goal()
+        goal.target_yaw = float(angle_rad)
+        goal.time_allowance.sec = int(time_allowance_s)
+        self._goal = {'handle': None, 'result': None, 'recoveries': 0, 'spun_rad': 0.0}
+
+        def feedback(msg):
+            self._goal['spun_rad'] = abs(msg.feedback.angular_distance_traveled)
+
+        future = self._spin_action.send_goal_async(goal, feedback_callback=feedback)
+        deadline = time.monotonic() + 5.0
+        while not future.done() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        handle = future.result() if future.done() else None
+        if handle is None or not handle.accepted:
+            return False
+        self._goal['handle'] = handle
+        names = {4: 'SUCCEEDED', 5: 'CANCELED', 6: 'ABORTED'}
+        handle.get_result_async().add_done_callback(
+            lambda f: self._goal.update(result=names.get(f.result().status, f'STATUS_{f.result().status}')))
+        return True
+
     def nav_status(self):
         g = self._goal
         return {'active': g['handle'] is not None and g['result'] is None, 'result': g['result'],
-                'recoveries': g['recoveries']}
+                'recoveries': g['recoveries'], 'spun_rad': g.get('spun_rad')}
 
     def nav_cancel(self):
         handle = self._goal.get('handle')
@@ -478,15 +537,15 @@ class NavRobot(RosRobot):
         yaw = math.atan2(2 * (q.w * q.z + q.x * q.y), 1 - 2 * (q.y * q.y + q.z * q.z))
         return tf.transform.translation.x, tf.transform.translation.y, yaw
 
-    def collision_boundary(self):
-        """Nose distance of the running collision_monitor stop polygon (None if unavailable)."""
+    def collision_boundary(self, polygon='PolygonStop'):
+        """Nose distance of a running collision_monitor polygon (None if unavailable)."""
         from rcl_interfaces.srv import GetParameters
         node = self._nodes[self.wiring.velocity_domain]
         client = node.create_client(GetParameters, f'/{CM_NODE}/get_parameters')
         try:
             if not client.wait_for_service(timeout_sec=2.0):
                 return None
-            future = client.call_async(GetParameters.Request(names=['PolygonStop.points']))
+            future = client.call_async(GetParameters.Request(names=[f'{polygon}.points']))
             deadline = time.monotonic() + 2.0
             while not future.done() and time.monotonic() < deadline:
                 time.sleep(0.02)

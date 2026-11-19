@@ -120,7 +120,9 @@ def main(args=None):
         state['busy'] = True
         started = time.monotonic()
         status = {'stamp': f'{msg.header.stamp.sec}.{msg.header.stamp.nanosec:09d}',
-                  'perception_only': True, 'problems': []}
+                  'perception_only': True, 'problems': [],
+                  # cloud age when this callback starts (wall clock - stamp): delay before processing
+                  'input_age_s': round(time.time() - (msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9), 3)}
         hazard = (True, 'not evaluated')
         try:
             now = time.monotonic()

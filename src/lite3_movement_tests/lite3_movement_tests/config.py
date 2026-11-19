@@ -12,7 +12,7 @@ from .geometry import LYING, STANDING, PostureCriteria
 from .telemetry import LocomotionStopCriteria, StationaryCriteria
 
 # Ceilings no configuration or authorization can raise.
-HARD_MAX_SPEED_M_S = 0.5             # raised from 0.10 on 2026-11-17 by the operator's decision. Validated
+HARD_MAX_SPEED_M_S = 1.0             # 0.10 -> 0.5 (2026-11-17) -> 1.0 (2026-11-18), operator's decision. Validated
 #   (coast, latency, backup lock, Nav2 tuning) only up to 0.10 m/s: everything above is opt-in per
 #   session (start_navigation.sh --max-speed) and needs the backup lock moved out (see roam.py,
 #   physical_suite.py) and a coast re-measured at that speed.
@@ -39,7 +39,7 @@ HARD_MAX_RESPONSE_S = 0.5             # obstacle inside boundary -> no forward c
 MIN_PRIMARY_SEPARATION_M = 0.05       # collision_monitor boundary vs backup lock: one grid cell
 HARD_MAX_M4_STEP_S = 130.0            # step timeout ceiling for approach_stop / proximity_watch
 ODOMETRY_TRUST = 0.8                  # leg odometry under-reads forward travel by up to ~15%
-HARD_MIN_STOP_DISTANCE_M = 0.30       # proximity stop from the nose; validated default
+HARD_MIN_STOP_DISTANCE_M = 0.20       # proximity stop from the nose (2026-11-19, was 0.30 validated)
 HARD_MIN_ABORT_CLEARANCE_M = 0.05     # footprint clearance abort floor during navigation
 NAV2_MAX_YAW_RATE_RAD_S = 0.20       # params/nav2_lite3.yaml MPPI + smoother cap
 NOSE_OFFSET_M = 0.305                 # footprint front edge ahead of base_link (Nav2 footprint)
@@ -230,13 +230,20 @@ def _parse_step(raw, index):
         p['coast_speed_m_s'] = _finite(take('coast_speed_m_s', 0.05), f'{step_id}.coast_speed_m_s',
                                        0.02, HARD_MAX_SPEED_M_S)
         p['min_lidar_hz'] = _finite(take('min_lidar_hz', 8.0), f'{step_id}.min_lidar_hz', 5.0, 20.0)
+        # Fast-LIO /odom (= odom->base_link TF) stamp age, p95. Healthy ~0.2 s; 1.4 s seen 2026-11-18 when
+        # the robot->PC bridge link was congested (Livox IMU relayed at 8 Hz instead of ~200 Hz).
+        p['max_odom_lag_s'] = _finite(take('max_odom_lag_s', 0.5), f'{step_id}.max_odom_lag_s', 0.2, 2.0)
         p['stop_distance_m'] = _finite(take('stop_distance_m', HARD_MIN_STOP_DISTANCE_M),
                                        f'{step_id}.stop_distance_m', HARD_MIN_STOP_DISTANCE_M, 1.5)
     if kind == 'zero_delivery':
         p['duration_s'] = _finite(take('duration_s', 1.0), f'{step_id}.duration_s', 0.5, 3.0)
         p['deadline_s'] = _finite(take('deadline_s', 0.5), f'{step_id}.deadline_s', 0.1, 1.0)
         p['idle_s'] = _finite(take('idle_s', 1.0), f'{step_id}.idle_s', 0.5, 3.0)
-        timeout = p['duration_s'] + p['idle_s'] + 1.0
+        # DDS discovery of the freshly created stop publisher (twist_mux) and of the bridge in domain 64
+        p['match_timeout_s'] = _finite(take('match_timeout_s', 3.0), f'{step_id}.match_timeout_s', 0.5, 10.0)
+        # a zero arriving this long after the burst ended is not a straggler: something else publishes
+        p['late_zero_s'] = _finite(take('late_zero_s', 0.8), f'{step_id}.late_zero_s', 0.3, 2.0)
+        timeout = 2 * p['match_timeout_s'] + p['duration_s'] + p['idle_s'] + 1.0   # match wait + warm-up
     if kind in ('deadman_stop', 'blocked_move', 'approach_stop'):
         cap = HARD_MAX_APPROACH_SPEED_M_S if kind != 'deadman_stop' else HARD_MAX_SPEED_M_S
         p['vx'] = _finite(take('vx', 0.05), f'{step_id}.vx', 0.0, cap, low_inclusive=False)

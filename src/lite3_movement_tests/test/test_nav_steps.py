@@ -52,6 +52,29 @@ def test_m0_sends_only_zeros_and_idle_mux_is_silent(tmp_path):
     report, steps, robot = run('M0', tmp_path)
     assert all(e[1] == 'stop' for e in robot.sent)
     assert steps['zero_delivery']['measurements']['messages_while_idle_locked'] == 0
+    assert steps['zero_delivery']['measurements']['stop_path']['problems'] == []
+    assert steps['zero_delivery']['measurements']['stop_path']['warmup_s'] is not None
+    assert steps['zero_delivery']['measurements']['observed_at_motion_sender'] >= 18
+
+
+def test_stale_lidar_odometry_fails_nav_readiness(tmp_path):
+    """2026-11-18: Fast-LIO 1.4 s behind (congested bridge) passed readiness and broke the stop path."""
+    report, steps, robot = run('M0', tmp_path, nav_fault='odom_lag')
+    step = steps['nav_readiness']
+    assert step['status'] == 'FAILED'
+    assert 'behind real time' in step['summary']
+    assert report['verdict'] != 'PASSED'
+    assert steps['zero_delivery']['status'] == 'NOT_RUN'
+
+
+def test_zero_delivery_waits_for_stop_path_and_sends_nothing_unmatched(tmp_path):
+    """2026-11-18: zeros sent before DDS matched the new stop publisher were dropped (2 of 20)."""
+    report, steps, robot = run('M0', tmp_path, nav_fault='stop_unmatched')
+    step = steps['zero_delivery']
+    assert step['status'] == 'FAILED'
+    assert 'stop path not connected' in step['summary']
+    assert step['measurements']['stop_path']['waited_s'] >= 3.0
+    assert report['verdict'] != 'PASSED'
 
 
 def test_dead_man_ignored_by_mux_fails_m2(tmp_path):
@@ -110,14 +133,14 @@ def test_speed_limit_parameter_reaches_nav2(tmp_path):
     assert report['verdict'] == 'PASSED' and max(vx) <= 0.0401
 
 
-@pytest.mark.parametrize('argv', [['--max-speed', '0.6'], ['--stop-distance', '0.2'],
+@pytest.mark.parametrize('argv', [['--max-speed', '1.1'],['--stop-distance', '0.15'],
                                   ['--approach-speed', '0.08'], ['--goal-distance', '9'],
                                   ['--max-yaw-rate', '0.5'], ['--timeout', '1000'],
                                   ['--final-clearance', '0.05'], ['--max-travel', '3'],
                                   ['--max-duration', '90'], ['--max-sensor-age', '1.0'],
                                   ['--min-lidar-hz', '5'], ['--detect-scans', '1'],
                                   ['--detect-scans', '2.5'], ['--response-limit', '1'],
-                                  ['--detection-range', '3'], ['--trigger-distance', '0.2']])
+                                  ['--detection-range', '3'], ['--trigger-distance', '0.15']])
 def test_cli_cannot_exceed_hard_limits(argv):
     with pytest.raises(SystemExit):
         S.parse(argv)
@@ -359,7 +382,8 @@ def test_readiness_explains_a_boundary_that_cannot_be_met_instead_of_an_internal
     """2026-11-17 13:34: at 0.5 m/s the live sensing delay pushed the required boundary past its 1.5 m cap;
     this surfaced as 'internal error: ValueError' and hid the cause."""
     seq = S.CATALOG['M5'].build(args())
-    seq['steps'][1].update({'cm_boundary_m': 1.0, 'cm_clearance_m': 1.0, 'cm_max_speed_m_s': 0.5,
+    # Cap now 3.0 m (2026-11-18): 1.0 m/s with 1.0 m clearance needs ~3.7 m, still unmeetable.
+    seq['steps'][1].update({'cm_boundary_m': 1.0, 'cm_clearance_m': 1.0, 'cm_max_speed_m_s': 1.0,
                             'coast_m': 0.034, 'coast_speed_m_s': 0.05})
     path = tmp_path / 's.yaml'
     path.write_text(yaml.safe_dump(seq, sort_keys=False))
@@ -368,4 +392,23 @@ def test_readiness_explains_a_boundary_that_cannot_be_met_instead_of_an_internal
     step = {s['id']: s for s in report['steps']}['nav_readiness']
     assert step['status'] == 'FAILED' and 'internal error' not in step['summary']
     assert 'cannot be met with the LIVE sensing delay' in step['summary'] and '--max-speed' in step['summary']
+    assert not robot.sent
+
+
+def test_readiness_reports_seconds_late_lidar_instead_of_an_internal_error(tmp_path):
+    """2026-11-19 10:22 read-only roam: hazards 2.66 s old -> 'internal error: ValueError: sensing_age_s=2.66
+    invalid'. It must refuse with the cause (LiDAR seconds late), never as an internal error."""
+    seq = S.CATALOG['M5'].build(args())
+    seq['steps'][1].update({'cm_boundary_m': 0.37, 'cm_clearance_m': 0.15, 'cm_max_speed_m_s': 0.10,
+                            'coast_m': 0.034, 'coast_speed_m_s': 0.05})
+    path = tmp_path / 's.yaml'
+    path.write_text(yaml.safe_dump(seq, sort_keys=False))
+    class LateLidar(FakeNavRobot):
+        hazard_age_s = 2.66            # class attribute: the stand-in's warm-up ticks already see it
+
+    robot = LateLidar(Telemetry(), SimLite3(start='lying'))
+    report = SequenceRunner(load_sequence(path), robot, MODE_SIM, log=lambda *_: None).run()
+    step = {s['id']: s for s in report['steps']}['nav_readiness']
+    assert step['status'] == 'FAILED' and 'internal error' not in step['summary']
+    assert 'seconds late' in step['summary']
     assert not robot.sent

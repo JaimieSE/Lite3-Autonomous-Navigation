@@ -59,6 +59,16 @@ def test_terrain_hazards_feed_both_costmaps_and_must_stay_fresh(costmap):
     assert 0 < hazards['expected_update_rate'] <= 1.0
 
 
+@pytest.mark.parametrize('costmap', ['local_costmap', 'global_costmap'])
+def test_scan_is_cleared_by_a_layer_that_can_raytrace(costmap):
+    """The voxel layer (origin_z 0.0) cannot raytrace from the scan origin just below odom z=0, so it
+    would mark without ever clearing; only obstacle_layer handles /scan, with clearing on."""
+    params = get(costmap, costmap, 'ros__parameters')
+    assert params.get('voxel_layer', {}).get('enabled') is False
+    scan = params['obstacle_layer']['scan']
+    assert scan['clearing'] and scan['marking']
+
+
 def test_mux_lock_blocks_navigation_but_not_joystick():
     lock = yaml.safe_load((ROOT / 'params' / 'twist_mux_locks.yaml').read_text())
     lock = lock['twist_mux']['ros__parameters']['locks']['terrain_stop']

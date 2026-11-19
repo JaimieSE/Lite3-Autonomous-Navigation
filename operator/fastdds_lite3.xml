@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!-- Fast-DDS profile for every ROS process the operator scripts start (operator/env.sh exports
+     FASTRTPS_DEFAULT_PROFILES_FILE). Only the UDP socket buffers change; transports (incl. shared
+     memory between local processes), QoS and discovery stay the Humble defaults.
+
+     Why: a LiDAR cloud is ~400 KB but this container's default socket receive buffer is
+     net.core.rmem_default = 212992 B, so a cloud overflows it whenever the reader thread is a moment
+     late and one lost fragment loses the whole cloud. Measured 2026-11-19 (read-only, best-effort
+     cloud subscriptions in domain 64, 3 x 12 s per setting, twice):
+       default buffers: 20 / 33 UDP receive buffer errors per round, cloud max gaps 0.66-1.74 s
+       4 MB buffers:    0 / 0 errors, cloud max gaps 0.18-0.80 s (remaining gaps = the robot link)
+     4194304 = net.core.rmem_max here, the most an unprivileged process can get (no sudo needed). -->
+<profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+  <participant profile_name="lite3_big_socket_buffers" is_default_profile="true">
+    <rtps>
+      <listenSocketBufferSize>4194304</listenSocketBufferSize>
+      <sendSocketBufferSize>4194304</sendSocketBufferSize>
+    </rtps>
+  </participant>
+</profiles>

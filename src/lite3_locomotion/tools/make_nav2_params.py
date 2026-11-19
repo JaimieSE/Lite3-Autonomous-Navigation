@@ -6,7 +6,7 @@ is reviewable and tested. Re-run after the university file changes:
     python3 tools/make_nav2_params.py [--check]
 
 Validated envelope (physical trial 2026-11-13): 0.05-0.10 m/s forward/back (ceiling raised to 0.5 m/s
-on 2026-11-17: speeds above 0.10 are not validated, each session caps them),
+on 2026-11-17 and to 1.0 m/s on 2026-11-18: speeds above 0.10 are not validated, each session caps them),
 +-0.2 rad/s turns, verified stops; the robot coasts ~1.6 s when commands stop.
 Reversing is disabled because the Mid-360 sees almost nothing behind the robot.
 """
@@ -22,8 +22,13 @@ UNIVERSITY = Path('/home/user/ros2_ws/src/lite3_launcher/config/nav2_params.yaml
 OUTPUT = Path(__file__).resolve().parents[1] / 'params' / 'nav2_lite3.yaml'
 SHARE_PLACEHOLDER = '__LITE3_LOCOMOTION_SHARE__'
 
-MAX_VX = 0.50     # hard ceiling (2026-11-17); every runner caps the session speed below it, verified
+MAX_VX = 1.00     # hard ceiling (2026-11-18, was 0.50); every runner caps the session speed below it, verified
 MAX_WZ = 0.20
+# Perception reach for up to 1.0 m/s: the collision boundary can reach 3.0 m from the nose (3.3 m from
+# base_link), so costmaps must see beyond it.
+LOCAL_COSTMAP_SIZE_M = 8
+SCAN_OBSTACLE_RANGE_M = 3.5
+SCAN_RAYTRACE_RANGE_M = 4.0
 
 HAZARD_SOURCE = {
     'topic': '/lite3_terrain/hazards',
@@ -32,7 +37,7 @@ HAZARD_SOURCE = {
     'clearing': False,
     'min_obstacle_height': -2.0,   # drop-off cells sit at floor level, below odom z=0
     'max_obstacle_height': 2.0,
-    'obstacle_max_range': 3.0,
+    'obstacle_max_range': 4.0,     # was 3.0; terrain grid now reaches 4.0 m ahead
     'obstacle_min_range': 0.0,
     'expected_update_rate': 0.5,   # costmap goes stale (controller stops) if terrain_monitor dies
 }
@@ -65,6 +70,9 @@ def patches():
         (mppi + 'ax_max', 0.5),
         (mppi + 'ax_min', -0.5),
         (mppi + 'az_max', 0.5),
+        (mppi + 'prune_distance', 3.0),     # >= MPPI horizon at 1.0 m/s (56 x 0.05 s = 2.8 m)
+        ('local_costmap.local_costmap.ros__parameters.width', LOCAL_COSTMAP_SIZE_M),
+        ('local_costmap.local_costmap.ros__parameters.height', LOCAL_COSTMAP_SIZE_M),
         ('velocity_smoother.ros__parameters.smoothing_frequency', 20.0),
         ('velocity_smoother.ros__parameters.feedback', 'OPEN_LOOP'),
         ('velocity_smoother.ros__parameters.max_velocity', [MAX_VX, 0.0, MAX_WZ]),
@@ -94,6 +102,15 @@ def patches():
         base = costmap + '.ros__parameters.obstacle_layer.'
         out.append((base + 'observation_sources', 'scan hazards'))
         out.append((base + 'hazards', dict(HAZARD_SOURCE)))
+        # The voxel layer only duplicates the planar /scan already in obstacle_layer, and its z range
+        # starts at origin_z 0.0 while the scan origin (base_link in odom) sits at about -0.01 m: it
+        # "cannot raytrace" (thousands of warnings in every launch.log since 2026-11-17), so it marks
+        # but never clears, and stale obstacles (people walking past) stay in both costmaps for good.
+        out.append((costmap + '.ros__parameters.voxel_layer.enabled', False))
+        for layer in ('obstacle_layer', 'voxel_layer'):
+            scan = costmap + '.ros__parameters.' + layer + '.scan.'
+            out.append((scan + 'obstacle_max_range', SCAN_OBSTACLE_RANGE_M))
+            out.append((scan + 'raytrace_max_range', SCAN_RAYTRACE_RANGE_M))
     return out
 
 

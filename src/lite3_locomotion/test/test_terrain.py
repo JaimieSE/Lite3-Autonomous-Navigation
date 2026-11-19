@@ -153,7 +153,7 @@ def test_terrain_monitor_has_no_command_interfaces():
 
 
 def test_proximity_stop_ahead_and_around_but_not_far():
-    near_wall = np.vstack([floor(x1=0.5), wall(0.5, -1, 1, FLOOR, FLOOR + 1.0)])
+    near_wall = np.vstack([floor(x1=0.45), wall(0.45, -1, 1, FLOOR, FLOOR + 1.0)])   # nose + 0.145 m
     stop, reason = T.proximity_stop(grid_of(near_wall))
     assert stop and 'ahead' in reason
     far_wall = np.vstack([floor(x1=1.5), wall(1.5, -1, 1, FLOOR, FLOOR + 1.0)])
@@ -162,7 +162,7 @@ def test_proximity_stop_ahead_and_around_but_not_far():
     side = np.vstack([side, np.array([[0.05, 0.36, FLOOR + 0.5]] * 5)])
     stop, reason = T.proximity_stop(grid_of(side))
     assert stop and 'within' in reason
-    drop = np.vstack([floor(x1=0.45), plane(0.5, 2.9, -1, 1, FLOOR - 0.4)])
+    drop = np.vstack([floor(x1=0.40), plane(0.45, 2.9, -1, 1, FLOOR - 0.4)])
     assert T.proximity_stop(grid_of(drop))[0]
 
 
@@ -170,7 +170,7 @@ def test_stop_distance_can_be_raised_but_never_reduced():
     from lite3_locomotion.terrain import STOP_LIMITS, StopParams, updated_stop_params
     base = StopParams()
     assert updated_stop_params(base, 'stop_ahead_m', 0.705).stop_ahead_m == 0.705
-    for bad in (0.59, -1.0, float('nan'), 5.0, True):
+    for bad in (0.50, -1.0, float('nan'), 5.0, True):
         with pytest.raises(ValueError):
             updated_stop_params(base, 'stop_ahead_m', bad)
     with pytest.raises(ValueError):

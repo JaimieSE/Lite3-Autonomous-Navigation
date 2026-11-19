@@ -242,7 +242,7 @@ def evaluate(rec, t_end, aborted, windows=None, p2_nose=1.2):
 
 
 def set_stop_distance(node, ahead_m):
-    """terrain_monitor parameter stop_ahead_m (from centre); the node refuses values below 0.60."""
+    """terrain_monitor parameter stop_ahead_m (from centre); the node refuses values below 0.505."""
     from rcl_interfaces.msg import Parameter, ParameterType, ParameterValue
     from rcl_interfaces.srv import SetParameters
     client = node.create_client(SetParameters, '/lite3_terrain_monitor/set_parameters')

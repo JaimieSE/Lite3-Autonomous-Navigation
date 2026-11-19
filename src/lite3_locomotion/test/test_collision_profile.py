@@ -23,7 +23,7 @@ def test_coast_scales_up_with_speed_never_down():
     assert CP.boundary(0.15, 0.02, cal)['coast_m'] == pytest.approx(0.04)
 
 
-@pytest.mark.parametrize('clearance, speed', [(0.0, 0.05), (2.0, 0.05), (0.15, 0.6), (0.15, 0.0)])
+@pytest.mark.parametrize('clearance, speed', [(0.0, 0.05), (2.0, 0.05), (0.15, 1.1), (0.15, 0.0)])
 def test_out_of_range_inputs_refused(clearance, speed):
     with pytest.raises(ValueError):
         CP.boundary(clearance, speed)
@@ -48,6 +48,8 @@ def test_collision_monitor_params_use_hazard_cloud_and_long_stop_publication():
     assert p['hazards']['min_height'] <= -0.5                  # drop cells sit at floor level
     assert p['PolygonStop']['action_type'] == 'stop' and p['source_timeout'] <= 1.0
     assert p['stop_pub_timeout'] >= 3600.0      # zeros must keep flowing while the robot idles (Humble default 2 s)
+    # on, every command waits for Fast-LIO TF (throughput 1/latency, blind past transform_tolerance)
+    assert p['base_shift_correction'] is False
 
 
 def test_calibration_file_round_trip(tmp_path):
@@ -66,14 +68,45 @@ def test_launch_has_one_final_command_authority():
     src = (ROOT / 'launch' / 'navigation.launch.py').read_text()
     assert "remappings=[('cmd_vel_out', MUX_OUT)]" in src          # twist_mux no longer final
     assert "executable='collision_monitor'" in src
-    assert "CP.collision_monitor_params(bound['boundary_m'], MUX_OUT, output)" in src
+    assert "bound['boundary_m'], MUX_OUT, output," in src                # collision_monitor -> robot
     assert "'node_names': ['collision_monitor']" in src
 
 
-def test_hard_speed_ceiling_is_half_a_metre_per_second():
-    assert CP.MAX_SPEED_M_S == 0.5
+def test_fast_stacks_get_a_small_stop_and_a_full_speed_slowdown_polygon():
+    cal = CP.Calibration(sensing_age_s=0.158, path_latency_s=0.195, coast_m=0.035, coast_speed_m_s=0.05)
+    slow = CP.tiers(0.05, 0.10, cal)
+    assert slow['slow'] is None and slow['stop'] == CP.boundary(0.05, 0.10, cal)     # unchanged up to 0.10
+    fast = CP.tiers(0.05, 0.50, cal)
+    assert fast['stop'] == CP.boundary(0.05, 0.10, cal)                  # only locks turning near the nose
+    assert fast['slowdown_ratio'] == 0.2                                 # <= 0.10 m/s inside the slow zone
+    full = CP.boundary(0.05, 0.50, cal)
+    assert fast['slow']['boundary_m'] >= full['boundary_m'] + fast['stop']['reaction_travel_m']
+    ros = CP.collision_monitor_params(fast['stop']['boundary_m'], 'in', 'out', fast['slow']['boundary_m'],
+                                      fast['slowdown_ratio'])['collision_monitor']['ros__parameters']
+    assert ros['polygons'] == ['PolygonStop', 'PolygonSlow']
+    assert ros['PolygonSlow']['action_type'] == 'slowdown' and ros['PolygonSlow']['slowdown_ratio'] == 0.2
+    assert CP.polygon_boundary(ros['PolygonSlow']['points']) == fast['slow']['boundary_m']
+    assert CP.polygon_boundary(ros['PolygonStop']['points']) == fast['stop']['boundary_m']
+    with pytest.raises(ValueError):                                      # slow polygon inside stop
+        CP.collision_monitor_params(0.5, 'in', 'out', 0.4, 0.2)
+
+
+def test_hard_speed_ceiling_is_one_metre_per_second():
+    assert CP.MAX_SPEED_M_S == 1.0               # operator decision 2026-11-18 (was 0.5)
     with pytest.raises(ValueError):
-        CP.boundary(0.15, 0.6)
+        CP.boundary(0.15, 1.1)
+
+
+def test_one_metre_per_second_boundary_fits_and_is_inside_perception_reach():
+    from lite3_locomotion.terrain import STOP_LIMITS, TerrainParams
+    with pytest.raises(ValueError):              # default (unmeasured) calibration: 4.02 m, refused
+        CP.boundary(0.15, 1.0)
+    measured = CP.Calibration(sensing_age_s=0.17, path_latency_s=0.195, coast_m=0.035,
+                              coast_speed_m_s=0.05)   # operator/calibration.json, 2026-11-18
+    assert CP.boundary(0.15, 1.0, measured)['boundary_m'] == pytest.approx(2.83)
+    reach = TerrainParams().size_m / 2 - CP.NOSE_M          # terrain grid ahead of the nose
+    assert CP.MAX_BOUNDARY_M < reach
+    assert STOP_LIMITS['stop_ahead_m'][1] >= CP.MAX_BOUNDARY_M - 0.05 + CP.NOSE_M
 
 
 def test_boundary_at_validated_speeds_is_unchanged_and_grows_beyond():

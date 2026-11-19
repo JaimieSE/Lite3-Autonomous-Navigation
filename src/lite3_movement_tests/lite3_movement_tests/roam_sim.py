@@ -126,6 +126,7 @@ class SimRoamRobot(FakeNavRobot):
 
 
 def make_sim_robot(nav_fault='none', roam_fault='none', model_fault='none', **kwargs):
+    kwargs.setdefault('cm_boundary', 0.20)     # what roam.sh starts navigation with (0.05 m at 0.08 m/s)
     return SimRoamRobot(Telemetry(), SimLite3(start='lying', fault=model_fault), nav_fault=nav_fault,
                         roam_fault=roam_fault, **kwargs)
 

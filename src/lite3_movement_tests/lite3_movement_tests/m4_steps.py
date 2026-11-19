@@ -11,7 +11,7 @@ Command path (all existing components; nothing here talks to the robot directly)
 
     runner forward command -> /lite3_ops/test_cmd_vel (prio 20) -> twist_mux
         locks: operator_hold (dead-man, fed only while every runner check passes)
-               terrain_stop  (perception health + BACKUP proximity stop, 0.30 m)
+               terrain_stop  (perception health + BACKUP proximity stop, 0.20 m)
     -> /lite3_ops/mux_out -> nav2_collision_monitor STOP polygon (the validated boundary)
     -> /cmd_vel -> lite3_domain_bridge_8 -> motion_sender
 

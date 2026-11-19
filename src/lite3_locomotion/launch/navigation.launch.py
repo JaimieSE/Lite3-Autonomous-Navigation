@@ -24,13 +24,20 @@ import tempfile
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, OpaqueFunction
+from launch.actions import DeclareLaunchArgument, GroupAction, IncludeLaunchDescription, OpaqueFunction
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
-from launch_ros.actions import Node
+from launch_ros.actions import Node, SetRemap
 
 DRY_OUTPUT = '/lite3_locomotion/dry_cmd_vel'
 MUX_OUT = '/lite3_ops/mux_out'
+# Fast-LIO and terrain_monitor read robot sensors from lite3_locomotion/sensor_relay (domain 64 direct)
+# instead of the robot-side bridge, which throttles them (IMU 12 Hz / 1.3 s late on 2026-11-18,
+# joints 23 Hz on 2026-11-19): see sensor_relay.py.
+IMU_SOURCE = '/livox/imu'
+IMU_DIRECT = '/lite3/livox_imu'
+LIDAR_SOURCE, LIDAR_DIRECT = '/livox/lidar', '/lite3/livox_lidar'      # sensor_relay, domain 64
+POINTS_SOURCE, POINTS_DIRECT = '/livox/points', '/lite3/livox_points'
 
 
 def _setup(context):
@@ -50,9 +57,15 @@ def _setup(context):
     from lite3_locomotion import collision_profile as CP
     import yaml
     cal = CP.load_calibration(LaunchConfiguration('calibration').perform(context))
-    bound = CP.boundary(float(LaunchConfiguration('clearance').perform(context)),
-                        float(LaunchConfiguration('max_speed').perform(context)), cal)
-    cm_params = CP.collision_monitor_params(bound['boundary_m'], MUX_OUT, output)
+    tier = CP.tiers(float(LaunchConfiguration('clearance').perform(context)),
+                    float(LaunchConfiguration('max_speed').perform(context)), cal)
+    bound = tier['stop']
+    cm_params = CP.collision_monitor_params(
+        bound['boundary_m'], MUX_OUT, output,
+        tier['slow']['boundary_m'] if tier['slow'] else None, tier['slowdown_ratio'])
+    if tier['slow']:
+        print(f'[lite3] collision_monitor SLOWDOWN polygon {tier["slow"]["boundary_m"]} m from the nose, '
+              f'ratio {tier["slowdown_ratio"]} (-> <= {CP.SLOW_TIER_SPEED_M_S} m/s near obstacles)', flush=True)
     handle, cm_file = tempfile.mkstemp(prefix='collision_monitor_lite3_', suffix='.yaml')
     with os.fdopen(handle, 'w') as stream:
         yaml.safe_dump(cm_params, stream)
@@ -64,10 +77,15 @@ def _setup(context):
     if allow:   # dead-man lock + supervised test/stop inputs; see params/twist_mux_physical.yaml
         mux_params.append(os.path.join(share, 'params', 'twist_mux_physical.yaml'))
     return [
-        IncludeLaunchDescription(PythonLaunchDescriptionSource(
-            os.path.join(include, 'lite3_bringup.launch.py'))),
+        Node(package='lite3_locomotion', executable='sensor_relay', name='lite3_sensor_relay', output='screen'),
+        GroupAction([SetRemap(src=IMU_SOURCE, dst=IMU_DIRECT),     # scoped: only the bringup (Fast-LIO)
+                     SetRemap(src=LIDAR_SOURCE, dst=LIDAR_DIRECT),
+                     IncludeLaunchDescription(PythonLaunchDescriptionSource(
+                         os.path.join(include, 'lite3_bringup.launch.py')))]),
         Node(package='lite3_locomotion', executable='terrain_monitor', name='lite3_terrain_monitor',
-             output='screen'),
+             output='screen', remappings=[('/joint_states', '/lite3/joint_states'),
+                                          ('/imu/data', '/lite3/imu_data'),
+                                          (POINTS_SOURCE, POINTS_DIRECT)]),
         Node(package='twist_mux', executable='twist_mux', name='twist_mux', output='screen',
              parameters=mux_params, remappings=[('cmd_vel_out', MUX_OUT)]),
         Node(package='nav2_collision_monitor', executable='collision_monitor',

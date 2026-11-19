@@ -26,6 +26,7 @@ setup(
             'exploration_coordinator = lite3_locomotion.exploration_coordinator:main',
             'autonomy_control = lite3_locomotion.autonomy_control:main',
             'terrain_monitor = lite3_locomotion.terrain_monitor:main',
+            'sensor_relay = lite3_locomotion.sensor_relay:main',
         ],
     },
 )

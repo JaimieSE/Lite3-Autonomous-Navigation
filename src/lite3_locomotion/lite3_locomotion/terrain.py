@@ -37,7 +37,8 @@ LABEL_NAMES = {UNKNOWN: 'unknown', FREE: 'free', STEP: 'step', OBSTACLE: 'obstac
 @dataclass(frozen=True)
 class TerrainParams:
     resolution_m: float = 0.05
-    size_m: float = 6.0                 # square grid centred on the robot
+    size_m: float = 8.0                 # square grid centred on the robot (was 6.0: 4.0 m ahead covers
+                                        # the 3.0 m max collision boundary + 0.305 m nose)
     floor_tolerance_m: float = 0.04     # |height| within this = floor
     max_step_m: float = 0.10            # placeholder: traversable rise without stair gait
     max_drop_m: float = 0.10            # placeholder: lower than this below floor = drop-off
@@ -46,7 +47,7 @@ class TerrainParams:
     self_filter_x: tuple = (-0.40, 0.40)   # robot body/legs box in base_link (URDF ~0.61 x 0.37 m)
     self_filter_y: tuple = (-0.25, 0.25)
     corridor_half_width_m: float = 0.30  # footprint half width 0.185 + margin
-    corridor_length_m: float = 3.0
+    corridor_length_m: float = 4.0
     near_field_m: tuple = (0.35, 1.2)
     floor_search_tolerance_m: float = 0.12
 
@@ -273,11 +274,12 @@ class Accumulator:
 class StopParams:
     """Proximity stop for the twist_mux lock. Forward-only driving (Nav2 vx_min = 0).
 
-    stop_ahead_m: footprint front 0.305 m + measured coast after commands stop
-    (~0.034 m at 0.05 m/s, scaled to 0.10 m/s ~0.07 m) + margin.
+    stop_ahead_m: footprint front 0.305 m + 0.20 m nose-to-obstacle stop boundary (operator decision
+    2026-11-19, was 0.295 m). Covers the calibrated stop up to 0.08 m/s (reaction ~0.03 + coast ~0.06
+    + 5 cm grid margin = 0.14 m, leaving >= 5 cm); at 0.10 m/s about 4 cm would remain.
     stop_radius_m: footprint corner radius 0.357 m (in-place turns) + margin.
     """
-    stop_ahead_m: float = 0.60
+    stop_ahead_m: float = 0.505
     stop_radius_m: float = 0.45
     half_width_m: float = 0.30
     release_hold_s: float = 1.0
@@ -286,7 +288,7 @@ class StopParams:
 # Runtime-adjustable range of the proximity stop (ROS parameters on terrain_monitor). The lower
 # bounds are the validated defaults: a test may make the stop MORE conservative, never less.
 NOSE_OFFSET_M = 0.305          # footprint front edge ahead of base_link
-STOP_LIMITS = {'stop_ahead_m': (StopParams.stop_ahead_m, 1.80),
+STOP_LIMITS = {'stop_ahead_m': (StopParams.stop_ahead_m, 3.40),   # was 1.80; 2.95 m nose + 0.305 at 1.0 m/s
                'stop_radius_m': (StopParams.stop_radius_m, 1.00)}
 
 

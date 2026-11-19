@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
 # Start perception + SLAM + Nav2 + terrain monitor + twist_mux.
 # Usage: operator/start_navigation.sh [--accept-degraded]   DRY (default): no robot commands
-#        add --direct-telemetry: tests read robot telemetry in domain 64 (relay degraded)
+#        Tests (M0-M9, roaming + its watchdog) read robot telemetry at its source in domain 64 (default,
+#        --direct-telemetry is accepted and changes nothing). --bridge-telemetry reads the university
+#        domain-8 bridge instead: measured 2026-11-19 (stationary, 300 s) at 89 Hz with 29-31 gaps of
+#        0.25-0.50 s and 1-message seconds, vs 199.5 Hz / max gap 0.12 s at the source - enough to trip
+#        M2's 0.25 s freshness stop and the watchdog's 20 Hz readiness.
 #        --clearance M (default 0.15): obstacle clearance the collision_monitor stop must leave
-#        --max-speed V (default 0.10): fastest speed that boundary must cover (<= 0.5 m/s; only <= 0.10 is
+#        --max-speed V (default 0.10): fastest speed that boundary must cover (<= 1.0 m/s; only <= 0.10 is
 #            validated. Above 0.10 the boundary grows fast: braking distance is taken as quadratic in speed)
 #        operator/start_navigation.sh --physical             ARMED: twist_mux -> /cmd_vel -> robot,
 #            behind the operator dead-man lock (robot stays locked until a supervised
@@ -12,10 +16,10 @@ set -eo pipefail
 source "$(dirname "$0")/env.sh"
 ACCEPT_DEGRADED=0
 MODE=dry
-TELEMETRY=bridge
+TELEMETRY=direct
 CLEARANCE=0.15
 MAX_SPEED=0.10
-PREFLIGHT_ARGS=()
+PREFLIGHT_ARGS=(--direct-telemetry)
 LAUNCH_ARGS=()
 while [ $# -gt 0 ]; do
   arg="$1"; shift
@@ -25,6 +29,7 @@ while [ $# -gt 0 ]; do
     --accept-degraded) ACCEPT_DEGRADED=1 ;;
     --physical) MODE=physical ;;
     --direct-telemetry) TELEMETRY=direct; PREFLIGHT_ARGS=(--direct-telemetry) ;;
+    --bridge-telemetry) TELEMETRY=bridge; PREFLIGHT_ARGS=() ;;
     *) echo "Unknown option: $arg (see the header of this script)"; exit 2 ;;
   esac
 done
@@ -84,7 +89,15 @@ BOUNDARY=$(echo "$BOUNDARY_JSON" | python3 -c 'import json,sys; d=json.load(sys.
 if [ -z "$BOUNDARY" ]; then
   echo "REFUSED: cannot compute the stop boundary: $BOUNDARY_JSON"; exit 2
 fi
-echo "Collision stop boundary: $BOUNDARY m from the nose (clearance $CLEARANCE m at <= $MAX_SPEED m/s)"
+SLOW_BOUNDARY=$(echo "$BOUNDARY_JSON" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("slow_boundary_m",""))')
+SLOWDOWN_RATIO=$(echo "$BOUNDARY_JSON" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("slowdown_ratio",""))')
+if [ -n "$SLOW_BOUNDARY" ]; then
+  echo "Collision stop boundary: $BOUNDARY m from the nose (clearance $CLEARANCE m at <= 0.10 m/s)"
+  echo "Collision SLOWDOWN boundary: $SLOW_BOUNDARY m from the nose (full stop from $MAX_SPEED m/s); inside it every"
+  echo "  command is scaled by $SLOWDOWN_RATIO (<= 0.10 m/s, turning scaled too). NOT validated above 0.10 m/s."
+else
+  echo "Collision stop boundary: $BOUNDARY m from the nose (clearance $CLEARANCE m at <= $MAX_SPEED m/s)"
+fi
 echo "  $BOUNDARY_JSON"
 LAUNCH_ARGS+=(clearance:="$CLEARANCE" max_speed:="$MAX_SPEED" calibration:="$CALIBRATION")
 if [ "$MODE" = physical ]; then
@@ -97,8 +110,9 @@ setsid bash -c 'echo $$ > "$1"; shift; exec ros2 launch lite3_locomotion navigat
   "$RUN_DIR/pgid" "${LAUNCH_ARGS[@]}" > "$RUN_DIR/launch.log" 2>&1 < /dev/null &
 sleep 1
 PGID=$(cat "$RUN_DIR/pgid")
-printf 'PGID=%s\nRUN_DIR=%s\nSTARTED=%s\nMODE=%s\nTELEMETRY=%s\nCLEARANCE=%s\nMAX_SPEED=%s\nBOUNDARY=%s\n' \
-  "$PGID" "$RUN_DIR" "$(date '+%F %T')" "$MODE" "$TELEMETRY" "$CLEARANCE" "$MAX_SPEED" "$BOUNDARY" > "$STATE_FILE"
+printf 'PGID=%s\nRUN_DIR=%s\nSTARTED=%s\nMODE=%s\nTELEMETRY=%s\nCLEARANCE=%s\nMAX_SPEED=%s\nBOUNDARY=%s\nSLOW_BOUNDARY=%s\nSLOWDOWN_RATIO=%s\n' \
+  "$PGID" "$RUN_DIR" "$(date '+%F %T')" "$MODE" "$TELEMETRY" "$CLEARANCE" "$MAX_SPEED" "$BOUNDARY" \
+  "$SLOW_BOUNDARY" "$SLOWDOWN_RATIO" > "$STATE_FILE"
 
 if [ "$MODE" = physical ]; then
   echo "== 3/3 Waiting for readiness and verifying twist_mux is the only, dead-man-locked command path"

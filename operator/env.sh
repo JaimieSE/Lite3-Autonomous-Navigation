@@ -18,6 +18,8 @@ for f in /opt/ros/humble/setup.bash "$UNIVERSITY_WS/install/local_setup.bash" \
   source "$f"
 done
 export ROS_DOMAIN_ID=8          # group-8 domain; the robot-side system computer uses 64
+# 4 MB UDP socket buffers for LiDAR clouds (see the comment in the file); no sudo, only our processes
+export FASTRTPS_DEFAULT_PROFILES_FILE="$OPERATOR_DIR/fastdds_lite3.xml"
 unset ROS_LOCALHOST_ONLY
 mkdir -p "$LOG_ROOT"
 

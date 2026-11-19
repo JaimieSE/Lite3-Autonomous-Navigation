@@ -221,7 +221,7 @@ def test_both_stop_layers_failing_is_caught_by_the_runner(tmp_path):
 @pytest.mark.parametrize('kwargs, text', [
     (dict(measured_coast=None), 'no measured coast'),
     (dict(min_clearance=0.40), 'is below the'),
-    (dict(cm_boundary=0.31, trigger_distance=0.31), 'within 0.05 m of the 0.3 m backup lock'),
+    (dict(cm_boundary=0.21, trigger_distance=0.21), 'within 0.05 m of the 0.2 m backup lock'),
     (dict(distance=0.45), 'path not clear'),
 ])
 def test_not_ready_sends_nothing(tmp_path, kwargs, text):
@@ -232,8 +232,8 @@ def test_not_ready_sends_nothing(tmp_path, kwargs, text):
 
 
 def test_separation_refusal_suggests_the_navigation_clearance(tmp_path):
-    seq, a = build(tmp_path, cm_boundary=0.31)
-    robot = FakeNavRobot(Telemetry(), SimLite3(start='lying'), obstacles=S.nose_box(1.0), cm_boundary=0.31)
+    seq, a = build(tmp_path, cm_boundary=0.21)
+    robot = FakeNavRobot(Telemetry(), SimLite3(start='lying'), obstacles=S.nose_box(1.0), cm_boundary=0.21)
     runner = SequenceRunner(seq, robot, MODE_SIM, log=lambda *_: None)
     runner.nav_clearance_hint = 0.15
     step = {s['id']: s for s in runner.run()['steps']}['approach_stop']
@@ -306,7 +306,7 @@ def test_travel_and_duration_never_change_speed_or_stopping(tmp_path):
 @pytest.mark.parametrize('key, value', [
     ('vx', 0.06), ('max_travel_m', 2.0), ('duration_s', 61.0), ('max_sensor_age_s', 0.6),
     ('min_lidar_hz', 7.0), ('detect_scans', 1), ('detect_scans', 2.5), ('response_limit_s', 0.6),
-    ('detection_range_m', 3.0), ('initial_clear_m', 0.38), ('stop_distance_m', 0.25),
+    ('detection_range_m', 3.0), ('initial_clear_m', 0.38), ('stop_distance_m', 0.15),
     ('min_clearance_m', 0.05), ('lost_track_scans', 9), ('suppression_proof_s', 3.0),
 ])
 def test_sequence_refuses_values_outside_the_envelope(tmp_path, key, value):

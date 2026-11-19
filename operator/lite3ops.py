@@ -38,6 +38,7 @@ REQUIRED_PACKAGES = ('lite3_launcher', 'fast_lio', 'lite3_locomotion', 'twist_mu
                      'slam_toolbox', 'pointcloud_to_laserscan', 'livox_ros_driver2', 'nav2_msgs')
 ROBOT_TOPICS = ('/joint_states', '/imu/data', '/leg_odom2')
 CLOUD_TOPICS = ('/livox/points', '/livox/lidar')
+HAZARD_PIPELINE_S = 0.30   # cloud arrival -> hazards at collision_monitor (relay + terrain_monitor), see check_network
 FRAG_FIX = ('sudo sysctl -w net.ipv4.ipfrag_high_thresh=67108864 '
             'net.ipv4.ipfrag_low_thresh=50331648 net.ipv4.ipfrag_time=3')
 FRAG_RECOMMENDED_HIGH = 32 * 1024 * 1024
@@ -218,9 +219,12 @@ def check_network(report, ros, seconds, direct=False):
     memory_before = frag_memory()
     before = reasm_counters()
     types = msg_types()
-    rates = ros.measure({t: types[t] for t in ROBOT_TOPICS + CLOUD_TOPICS}, seconds)
-    after = reasm_counters()
-    memory_after = frag_memory()
+    # Direct mode: the clouds are read in domain 64 by sensor_relay, so measure them there (pulling the
+    # bridged copies here would only make the bridge send them again over the robot link).
+    rates = ros.measure({t: types[t] for t in ROBOT_TOPICS + (() if direct else CLOUD_TOPICS)}, seconds)
+    if not direct:
+        after = reasm_counters()
+        memory_after = frag_memory()
     for topic in ROBOT_TOPICS:
         r = rates[topic]
         if not direct:
@@ -229,14 +233,11 @@ def check_network(report, ros, seconds, direct=False):
                        f"{r['hz']} Hz, max gap {r['max_gap_s']} s",
                        'robot bridge/telemetry not flowing: check robot is on and lab bridge is running')
         elif topic in TERRAIN_INPUTS:
-            # Direct mode: the test runner reads telemetry in domain 64 (checked separately); the
-            # bridged copy only feeds terrain_monitor, which needs gaps well under 0.5 s.
-            ok = r['hz'] >= 20 and (r['max_gap_s'] or 9) < 0.8 * TERRAIN_STALE_S
-            report.add('OK' if ok else 'FAIL', f'bridged {topic} (terrain monitor input)',
-                       f"{r['hz']} Hz, max gap {r['max_gap_s']} s (needs >= 20 Hz, gaps < "
-                       f"{0.8 * TERRAIN_STALE_S:.1f} s)",
-                       'bridge relay too degraded even for the terrain monitor: ask lab staff to check '
-                       'lite3_domain_bridge_8 on 192.168.10.64')
+            # Direct mode: the test runner reads telemetry in domain 64 (checked separately), and
+            # terrain_monitor reads it through lite3_locomotion/sensor_relay from domain 64 too
+            # (2026-11-19: the bridge relayed /joint_states at 4.8-23 Hz). The bridged copy is unused.
+            report.add('OK', f'bridged {topic}', f"{r['hz']} Hz (not used: terrain_monitor reads it via "
+                       'sensor_relay from domain 64, checked below)')
         else:
             report.add('OK', f'bridged {topic}', f"{r['hz']} Hz (not used in direct mode)")
     if direct:
@@ -246,19 +247,35 @@ def check_network(report, ros, seconds, direct=False):
             direct_rates = sys_ros.measure({t: types[t] for t in ROBOT_TOPICS}, seconds)
         finally:
             sys_ros.close()
-        for topic, r in direct_rates.items():
+        # Clouds AFTER the telemetry, in their OWN participant and best effort, exactly as sensor_relay
+        # reads them. A reliable 400 KB stream in the telemetry's participant stalls its receive path on
+        # every lost fragment: 2026-11-19 preflight saw joints/IMU/odometry all gap 0.87-1.06 s at once,
+        # while a raw best-effort A/B in a separate participant showed max gap 0.12 s with clouds flowing.
+        cloud_ros = Ros(domain=SYSTEM_DOMAIN, name='lite3_operator_check_clouds')
+        try:
+            time.sleep(2.5)
+            direct_rates.update(cloud_ros.measure({t: (types[t][0], False) for t in CLOUD_TOPICS}, seconds))
+            after = reasm_counters()
+            memory_after = frag_memory()
+            ages = cloud_ros.stamp_ages('/livox/points', 3.0)
+        finally:
+            cloud_ros.close()
+        for topic in ROBOT_TOPICS:
+            r = direct_rates[topic]
             ok = r['hz'] >= 100 and (r['max_gap_s'] or 9) < 0.25
             report.add('OK' if ok else 'FAIL', f'robot telemetry {topic} (direct, domain 64)',
                        f"{r['hz']} Hz, max gap {r['max_gap_s']} s",
                        'robot-side telemetry itself degraded: check the robot / system computer')
         rates = {**rates, **{f'{t}@64': r for t, r in direct_rates.items()}}
     for topic in CLOUD_TOPICS:
-        r = rates[topic]
+        r = direct_rates[topic] if direct else rates[topic]
         level = 'OK' if r['hz'] >= 8 and (r['max_gap_s'] or 9) < 0.5 else \
             'WARN' if r['hz'] >= 5 else 'FAIL'
-        report.add(level, f'LiDAR {topic}', f"{r['hz']} Hz, max gap {r['max_gap_s']} s",
+        report.add(level, f'LiDAR {topic}' + (' (direct, domain 64)' if direct else ''),
+                   f"{r['hz']} Hz, max gap {r['max_gap_s']} s",
                    'see "LiDAR rate low" in operator/README.md (IP fragment check below)')
-    ages = ros.stamp_ages('/livox/points', 3.0)
+    if not direct:
+        ages = ros.stamp_ages('/livox/points', 3.0)
     if ages:
         p95 = ages[min(len(ages) - 1, int(0.95 * len(ages)))]
         ok = 0.0 <= p95 <= 1.0
@@ -268,8 +285,13 @@ def check_network(report, ros, seconds, direct=False):
             try:
                 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src' / 'lite3_locomotion'))
                 from lite3_locomotion import collision_profile as CP
+                # The live readiness check (nav_steps._boundary_problems) measures the delay until the
+                # HAZARDS reach collision_monitor: cloud arrival + sensor_relay + terrain_monitor queue and
+                # processing. Measured 2026-11-19 on healthy data: hazards p95 0.27-0.31 s (3 s windows up
+                # to 0.46 s) vs cloud arrival p95 0.13-0.15 s. Sizing the boundary from arrival alone made
+                # healthy data fail that check ("0.21 m < 0.32 m required NOW"), so add the pipeline.
                 CP.update_calibration(CALIBRATION_FILE, sources=[f'preflight {time.strftime("%F %T")}'],
-                                      sensing_age_s=round(p95 + 0.02, 3))
+                                      sensing_age_s=round(p95 + HAZARD_PIPELINE_S, 3))
             except (ImportError, ValueError, OSError) as error:
                 report.add('WARN', 'calibration update', str(error))
     d_ok = after['ReasmOKs'] - before['ReasmOKs']

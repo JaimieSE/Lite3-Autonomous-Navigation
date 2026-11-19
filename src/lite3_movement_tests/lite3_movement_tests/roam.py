@@ -7,6 +7,8 @@ stand + verified standing) before anything moves.
 
 Command path (all existing components; this module talks to none of them directly):
 
+    scan-walk (default): walk through a known open corridor. If none is visible, search in short
+      left/right Nav2 turns and check each new map for an opening.
     frontier / patrol goal -> Nav2 (SLAM map, costmaps incl. terrain hazards, planner, MPPI)
       -> velocity_smoother (max_velocity = the selected speed mode, read back)
       -> /nav_cmd_vel (prio 10) -> twist_mux [dead-man fed only while every check passes,
@@ -68,9 +70,22 @@ HARD_MAX_GOAL_S = 240.0
 MODE_NAMES = ('slow', 'normal', 'fast')
 SEARCH_CLEARANCE_M = 0.25             # frontier search (robot start + BFS): footprint half-width 0.185 + margin
 COSTMAP_VETO = 70                      # Nav2 OccupancyGrid scale: 99 inscribed, 100 lethal
+LARGE_SPIN_RADIUS_M = 1.0              # above this (stack faster than ~0.15 m/s) warn: goals need ~2 m+ open
 MIN_RAW_BYTES = 10000                  # serialized /livox/points; a healthy Mid-360 scan is ~0.2-0.5 MB
 DEFAULT_MODES = {'slow': (0.05, 0.15), 'normal': (0.08, 0.20), 'fast': (0.10, 0.20)}
 SPEED_GRACE_S = 2.0                    # after lowering the speed, the smoother ramps down
+STRATEGIES = ('scan_walk', 'frontier')
+SCAN_STEP_RAD = math.radians(30)
+# Relative 30-degree steps: look up to 60 degrees to the preferred side, then 60 to the other.
+SCAN_STEPS = (1, 1, -1, -1, -1, -1)
+# behavior_server Spin publishes nav_cmd_vel directly (NOT through the velocity_smoother cap), at
+# up to its max_rotational_vel = 0.2 rad/s = the validated turn rate. While spinning the robot-side
+# yaw check therefore allows this instead of the selected mode's yaw rate.
+SPIN_WZ_RAD_S = 0.20
+SPIN_STALL_S = 12.0                    # no turn progress (lock / collision_monitor holding) -> give up
+TERRAIN_STOP_RADIUS_M = 0.45           # lite3_locomotion.terrain.StopParams.stop_radius_m (default)
+MAP_SETTLE_S = 2.5                     # slam_toolbox map_update_interval 2 s: let the spin's scans land
+WALK_PROGRESS_M = 0.3                  # a walk that got this far is a success even if Nav2 aborted
 STATES = ('READY', 'ROAMING', 'PAUSED', 'STOPPING', 'STOPPED', 'SAFETY_STOP')
 EXIT = {'STOPPED': 0, 'SAFETY_STOP': 1, 'INTERVENTION_REQUIRED': 2, 'REFUSED': 3}
 
@@ -93,7 +108,7 @@ class RoamConfig:
                  max_minutes=HARD_MAX_ROAM_MINUTES, abort_clearance_m=0.08, frontier_radius_m=3.0,
                  frontier_clearance_m=0.40, stuck_s=20.0, max_map_age_s=15.0, max_sensor_age_s=0.5,
                  min_lidar_hz=HARD_MIN_LIDAR_HZ, watchdog_timeout_s=2.0, max_goal_failures=5,
-                 stack_max_speed=0.10):
+                 stack_max_speed=0.10, strategy='frontier'):
         self.speed_limit = _finite(speed_limit, 'speed_limit', 0.02, min(HARD_MAX_SPEED_M_S, stack_max_speed))
         modes = {**DEFAULT_MODES, **(modes or {})}         # unspecified modes keep their defaults
         self.modes = {}
@@ -120,6 +135,9 @@ class RoamConfig:
         self.min_lidar_hz = _finite(min_lidar_hz, 'min_lidar_hz', HARD_MIN_LIDAR_HZ, 20.0)
         self.watchdog_timeout_s = _finite(watchdog_timeout_s, 'watchdog_timeout', 0.5, HARD_MAX_WATCHDOG_S)
         self.max_goal_failures = int(_finite(max_goal_failures, 'max_goal_failures', 1, 20))
+        if strategy not in STRATEGIES:
+            raise ConfigError(f'unknown strategy {strategy!r} ({", ".join(STRATEGIES)})')
+        self.strategy = strategy
 
     def mode_speed(self, mode):
         return self.modes[mode]
@@ -294,6 +312,166 @@ class Explorer:
         self.recent = self.recent[-20:]
 
 
+class ScanWalk:
+    """Select a walk from the current map, preferring an open corridor straight ahead.
+
+    A direction is open while: the centre-line cell was seen FREE on the SLAM map (unknown = not
+    seen, ends the ray), no occupied SLAM cell lies within the corridor half-width, and the Nav2
+    global costmap (incl. the terrain point-cloud hazards) stays below the veto cost on the centre
+    line. The walk goal stops WALK_STANDOFF_M before an obstacle. Pure: unit-tested."""
+
+    HEADINGS = 36                     # every 10 deg
+    MIN_WALK_M = 0.5
+    # The terrain proximity stop locks ALL Nav2 output - turning in place included - while a hazard is
+    # within stop_ahead_m ahead (any motion) or TERRAIN_STOP_RADIUS_M around. A walk ending inside
+    # either zone leaves the robot unable to spin away (seen in simulation). So: stop short of the LIVE
+    # stop_ahead_m (it grows with speed: ~1.45 m from centre at 0.5 m/s) and keep the radius clear.
+    STANDOFF_M = 0.65                 # minimum: base_link this far before an obstacle (nose 0.305 + 0.35)
+    STOP_AHEAD_MARGIN_M = 0.15        # beyond the live stop_ahead_m (coast + map/terrain disagreement)
+    UNSEEN_STANDOFF_M = 0.20          # ... before unseen space / the geofence / the ray limit
+    CORRIDOR_HALF_M = TERRAIN_STOP_RADIUS_M + 0.05   # nothing occupied this close beside the path
+    BLIND_RADIUS_M = 0.45             # under/next to the robot: /scan range_min 0.4 leaves it unknown
+    SPIN_CORRIDOR_HALF_M = 0.30       # terrain ahead-zone / collision_monitor polygon half-width
+    BACKTRACK_FACTOR = 0.3            # directions within 60 deg of where we came from
+    REVISIT_FACTOR = 0.5              # goals within 0.5 m of a recent goal
+
+    def __init__(self, cfg, anchor):
+        self.cfg = cfg
+        self.anchor = anchor
+        self.came_from = None          # heading of the last walk (its reverse is discouraged)
+        self.recent = []
+        self.last_status = None
+        self.last_rays = []
+        self.vetoed = 0
+        self.stop_ahead_m = None       # live terrain_monitor value (base_link centre), set each choose
+        self.cm_front_m = None         # collision_monitor stop polygon front (base_link centre), at start
+
+    def stop_zone(self):
+        """How far ahead (from base_link) something stops ALL motion, turning included: the terrain
+        proximity stop ahead zone or the collision_monitor stop polygon, whichever reaches further."""
+        return max(self.stop_ahead_m or 0.0, self.cm_front_m or 0.0)
+
+    def standoff(self):
+        return max(self.STANDOFF_M, self.stop_zone() + self.STOP_AHEAD_MARGIN_M)
+
+    def spin_radius(self):
+        """A full turn sweeps the stop zone (length x corridor) around the robot: nothing known may lie
+        inside this radius of a goal, or the spin there stalls the moment it faces it."""
+        return max(TERRAIN_STOP_RADIUS_M, math.hypot(self.stop_zone(), ScanWalk.SPIN_CORRIDOR_HALF_M)) + 0.05
+
+    @staticmethod
+    def known_obstacles(grid, costmap, centre, reach):
+        """World points of occupied SLAM cells and costmap-vetoed cells within reach of centre."""
+        pts = []
+        for g, test in ((grid, lambda v: v > 20), (costmap, lambda v: v >= COSTMAP_VETO)):
+            if g is None:
+                continue
+            cx, cy = g.cell(*centre)
+            r = math.ceil(reach / g.resolution)
+            for j in range(max(0, cy - r), min(g.height, cy + r + 1)):
+                for i in range(max(0, cx - r), min(g.width, cx + r + 1)):
+                    if test(g.value((i, j))):
+                        pts.append(g.world((i, j)))
+        return pts
+
+    def spin_clear(self, x, y, obstacles):
+        r = self.spin_radius()
+        return all(math.hypot(ox - x, oy - y) >= r for ox, oy in obstacles)
+
+    def inside(self, x, y, margin=0.4):
+        return math.hypot(x - self.anchor[0], y - self.anchor[1]) <= self.cfg.geofence_m - margin
+
+    def block(self, x, y, now, seconds):      # interface parity with Explorer
+        pass
+
+    def sent(self, goal):
+        self.recent = (self.recent + [(goal['x'], goal['y'])])[-10:]
+        self.came_from = goal['yaw']
+
+    def _blocked(self, grid, costmap, x, y, c, s, lateral, d):
+        """Known obstacle at (x, y): occupied SLAM cell across the corridor, or costmap veto on the line."""
+        if any(grid.contains(o) and grid.value(o) > 20
+               for o in (grid.cell(x - k * s, y + k * c) for k in lateral)):
+            return True
+        if costmap is not None and d >= self.BLIND_RADIUS_M:
+            cc = costmap.cell(x, y)
+            return costmap.contains(cc) and costmap.value(cc) >= COSTMAP_VETO
+        return False
+
+    def ray(self, grid, costmap, pose, heading):
+        """(open length, what ended it, distance of the first KNOWN obstacle) along heading.
+
+        Open = seen free and unobstructed. The obstacle search continues past the open end (unseen
+        space, geofence, range limit) by the standoff, so a goal can never be placed just in front of
+        a known obstacle that lies beyond the point where the open stretch ends."""
+        res = grid.resolution
+        c, s = math.cos(heading), math.sin(heading)
+        lateral = [k * res for k in range(-math.floor(self.CORRIDOR_HALF_M / res),
+                                          math.floor(self.CORRIDOR_HALF_M / res) + 1)]
+        limit = min(self.cfg.frontier_radius_m, self.cfg.geofence_m * 2)
+        d, free, end = 0.0, None, 'range'
+        horizon = limit + self.standoff()
+        while d <= horizon:
+            x, y = pose[0] + d * c, pose[1] + d * s
+            if self._blocked(grid, costmap, x, y, c, s, lateral, d):
+                return (d if free is None else free), ('obstacle' if free is None else end), d
+            if free is None:
+                cell = grid.cell(x, y)
+                if d > limit:
+                    free, end = limit, 'range'
+                elif not self.inside(x, y):
+                    free, end = d, 'geofence'
+                elif not grid.contains(cell) or (d >= self.BLIND_RADIUS_M and not 0 <= grid.value(cell) <= 20):
+                    free, end = d, 'unseen'
+                if free is not None:
+                    horizon = min(horizon, free + self.standoff())
+            d += res
+        return (limit if free is None else free), end, math.inf
+
+    def choose(self, grid, pose, now, costmap=None, forward_blocked=False):
+        rays = []
+        reach = min(self.cfg.frontier_radius_m, self.cfg.geofence_m * 2) + self.spin_radius()
+        obstacles = self.known_obstacles(grid, costmap, pose[:2], reach)
+        self.spin_blocked = 0
+        for i in range(self.HEADINGS):
+            heading = math.atan2(math.sin(pose[2] + i * 2 * math.pi / self.HEADINGS),
+                                 math.cos(pose[2] + i * 2 * math.pi / self.HEADINGS))
+            turn = abs(math.atan2(math.sin(heading - pose[2]), math.cos(heading - pose[2])))
+            if forward_blocked and turn <= SCAN_STEP_RAD:
+                continue
+            free, end, obstacle = self.ray(grid, costmap, pose, heading)
+            walk = min(free - (0.0 if end == 'obstacle' else self.UNSEEN_STANDOFF_M), obstacle - self.standoff())
+            if obstacle - self.standoff() < free - (0.0 if end == 'obstacle' else self.UNSEEN_STANDOFF_M):
+                end = 'obstacle'
+            # Back off along the ray until the next spin fits (nothing known inside spin_radius).
+            while walk >= self.MIN_WALK_M and not self.spin_clear(
+                    pose[0] + walk * math.cos(heading), pose[1] + walk * math.sin(heading), obstacles):
+                walk -= 0.10
+            if walk < self.MIN_WALK_M:
+                self.spin_blocked += 1
+                continue
+            gx, gy = pose[0] + walk * math.cos(heading), pose[1] + walk * math.sin(heading)
+            score = walk
+            if self.came_from is not None and abs(math.atan2(
+                    math.sin(heading - self.came_from - math.pi), math.cos(heading - self.came_from - math.pi))) < math.pi / 3:
+                score *= self.BACKTRACK_FACTOR
+            if any(math.hypot(gx - rx, gy - ry) < 0.5 for rx, ry in self.recent):
+                score *= self.REVISIT_FACTOR
+            rays.append((round(score, 2), -turn, heading, walk, free, end, gx, gy))
+            if i == 0:  # The current heading already has a usable corridor.
+                break
+        rays.sort(reverse=True)
+        self.last_rays = [{'heading_deg': _r(math.degrees(h), 0), 'walk_m': _r(w, 2), 'free_m': _r(f, 2),
+                           'ends_at': e} for _, _, h, w, f, e, _, _ in rays[:3]]
+        if not rays:
+            self.last_status = 'no_open_direction'
+            return None
+        self.last_status = 'open_direction'
+        _, _, heading, walk, free, end, gx, gy = rays[0]
+        return {'kind': 'walk', 'x': gx, 'y': gy, 'yaw': heading, 'score': _r(walk),
+                'free_m': _r(free, 2), 'ends_at': end}
+
+
 def known_area_m2(grid):
     return sum(1 for v in grid.data if v >= 0) * grid.resolution ** 2
 
@@ -304,11 +482,20 @@ class WatchdogLogic:
     possible: leg odometry for the area, robot-side commands for speed). Pure: unit-tested and
     used by the watchdog process and the simulator."""
 
-    def __init__(self, speed_limit, geofence_m, max_tilt=0.40, telemetry_age=0.5, heartbeat_s=2.0):
+    # Staleness limits (2026-11-18, operator: fewer false trips from robot<->onboard-PC link delays).
+    # Preflight max gaps over 53 sessions: telemetry 0.78 s (p95 0.45), /livox/points 0.83 s (p95 0.65).
+    # Was 0.5 s / 1.0 s, which ordinary link hiccups exceeded. Kept just above the observed worst
+    # case: the watchdog is the backstop; collision_monitor and the terrain lock act on obstacles.
+    TELEMETRY_AGE_S = 1.0
+    RAW_LIDAR_AGE_S = 1.25
+
+    def __init__(self, speed_limit, geofence_m, max_tilt=0.40, telemetry_age=TELEMETRY_AGE_S,
+                 heartbeat_s=2.0, raw_lidar_age=RAW_LIDAR_AGE_S):
         self.speed_limit = speed_limit
         self.geofence_m = geofence_m
         self.max_tilt = max_tilt
         self.telemetry_age = telemetry_age
+        self.raw_lidar_age = raw_lidar_age
         self.heartbeat_s = heartbeat_s
         self.origin = None
         self.fast_since = None
@@ -331,7 +518,7 @@ class WatchdogLogic:
                 reasons.append(f'leg-odometry distance {d:.2f} m beyond geofence {self.geofence_m} m + 0.75')
         raw = getattr(telemetry, 'raw_cloud', None)
         if raw is not None and raw.total:
-            if raw.age(now) > 1.0:
+            if raw.age(now) > self.raw_lidar_age:
                 reasons.append(f'raw LiDAR /livox/points stale ({_r(raw.age(now), 2)} s)')
             elif max((n for _, n in raw.window(now, 1.0)), default=0) < MIN_RAW_BYTES:
                 reasons.append('raw LiDAR nearly empty (sensor blind or blocked)')
@@ -358,17 +545,17 @@ class WatchdogLogic:
 
 # ---------------------------------------------------------------------------------- readiness
 VALIDATED_SPEED_M_S = 0.10             # backup-lock distance and coast were validated up to here
-DEFAULT_STOP_AHEAD_M = 0.60            # terrain_monitor default (from base_link centre), restored afterwards
+DEFAULT_STOP_AHEAD_M = 0.505           # terrain_monitor default (from base_link centre), restored afterwards
 
 
 def backup_distance(cfg, boundary_m, mode):
-    """Nose distance of the terrain backup lock. 0.30 m is the validated backup up to 0.10 m/s. Above
+    """Nose distance of the terrain backup lock. 0.20 m is the backup up to 0.10 m/s (0.30 m validated). Above
     that the robot would travel past it before stopping, so it moves out to just inside the
     collision_monitor boundary (one 5 cm grid cell), and the stack must have been started with a
     boundary computed for that speed."""
     if mode != MODE_PHYSICAL or cfg.speed_limit <= VALIDATED_SPEED_M_S + 1e-9 or not boundary_m:
         return HARD_MIN_STOP_DISTANCE_M
-    return min(1.5, max(HARD_MIN_STOP_DISTANCE_M, round(boundary_m - 0.05, 2)))
+    return min(2.95, max(HARD_MIN_STOP_DISTANCE_M, round(boundary_m - 0.05, 2)))   # 3.0 m max boundary - 1 cell
 
 
 def readiness_sequence(mode, boundary_check, backup_nose=HARD_MIN_STOP_DISTANCE_M):
@@ -414,6 +601,7 @@ class RoamSession:
         self.auth = authorization
         self.watchdog = watchdog                 # in-process WatchdogLogic (simulation) or None
         self.watchdog_external = False           # True when a watchdog process must be alive
+        self.slowdown_ratio = None               # collision_monitor slowdown polygon ratio (fast stacks)
         self.script = sorted(script or [])       # [(seconds after roaming starts, cmd, arg)]
         self.sim_stop_after_s = sim_stop_after_s
         self.state = 'READY'
@@ -421,12 +609,14 @@ class RoamSession:
         self.speed_changed = -math.inf
         self.goal = None
         self.goal_sent_at = None
+        self.cancel_request = None
         self.goal_timeout = None
         self.progress = None                     # (time, x, y) of last 0.10 m of progress
         self.failures = 0
         self.events = []
         self.stats = {'goals_sent': 0, 'goals_succeeded': 0, 'goals_failed': 0, 'frontier_goals': 0,
-                      'patrol_goals': 0, 'distance_m': 0.0, 'max_from_anchor_m': 0.0,
+                      'patrol_goals': 0, 'walk_goals': 0, 'spins': 0, 'spins_completed': 0,
+                      'walks_to_obstacle': 0, 'distance_m': 0.0, 'max_from_anchor_m': 0.0,
                       'min_clearance_m': math.inf, 'pauses': 0, 'speed_changes': 0}
         self.reason = None
         self.runner = None
@@ -528,9 +718,10 @@ class RoamSession:
         v, w = self.cfg.mode_speed(self.speed_mode)
         if now - self.speed_changed > SPEED_GRACE_S:
             for _, c in t.system_cmd.window(now, 0.3):
-                if c.vx > v + 0.01 or abs(c.wz) > w + 0.02:
+                yaw_cap = max(w, SPIN_WZ_RAD_S) if self._spinning(now) else w
+                if c.vx > v + 0.01 or abs(c.wz) > yaw_cap + 0.02:
                     return (f'robot-side command vx {c.vx:+.3f} wz {c.wz:+.3f} above the selected '
-                            f'{self.speed_mode} mode ({v} m/s, {w} rad/s)')
+                            f'{self.speed_mode} mode ({v} m/s, {yaw_cap} rad/s)')
         for _, c in t.system_cmd.window(now, 0.3):
             if c.vx < -0.005:
                 return 'reverse command reached the robot (no rear sensing)'
@@ -583,6 +774,173 @@ class RoamSession:
         self.stats[f'{goal["kind"]}_goals'] += 1
         self.event('goal', kind=goal['kind'], x=_r(goal['x'], 2), y=_r(goal['y'], 2), distance_m=_r(d, 2))
 
+    # -------------------------------------------------------------- spin-and-walk
+    def _spinning(self, now):
+        """A spin is active, or ended < 1 s ago (its last commands are still in the window)."""
+        if self.goal and self.goal.get('kind') == 'spin':
+            return True
+        return now - getattr(self, '_spin_ended', -math.inf) < 1.0
+
+    def _start_spin(self, now, pose, angle):
+        # behavior_server min_rotational_vel 0.1 rad/s; a slowdown polygon (stacks above 0.10 m/s) scales
+        # turning down by the same ratio while something is near, so allow for that
+        allowance = abs(angle) / (0.1 * (self.slowdown_ratio or 1.0)) + 20.0
+        if not self.robot.nav_spin(angle, allowance):
+            self._walk_failed(now, 'Nav2 rejected the spin')
+            return
+        self.goal = {'kind': 'spin', 'x': pose[0], 'y': pose[1], 'yaw': pose[2]}
+        self.scan_map_time = self.map[0]
+        self.goal_sent_at = now
+        self.spin_progress = (now, 0.0)
+        self.stats['spins'] += 1
+        self.event('spin', degrees=_r(math.degrees(angle), 0), map_m2=_r(known_area_m2(self.map[1]), 1) if self.map else None)
+
+    def _end_spin(self, now, how, spun):
+        self.event('spin_' + how, turned_deg=_r(math.degrees(spun or 0.0), 0))
+        if how == 'done':
+            self.stats['spins_completed'] += 1
+        self.goal = None
+        self._spin_ended = now
+        self.choose_after = now if how == 'opening' else now + MAP_SETTLE_S
+
+    def _walk_candidate(self, now, pose):
+        sample = self._terrain_now(now)
+        if sample is not None and sample.stop_ahead_m:
+            self.explorer.stop_ahead_m = sample.stop_ahead_m
+        near = (sample is not None and sample.obstacle_ahead_m is not None
+                and sample.obstacle_ahead_m <= self.explorer.standoff())
+        return self.explorer.choose(self.map[1], pose, now, self._costmap(), forward_blocked=near)
+
+    def _search_turn(self, now, pose):
+        if self.scan_index >= len(SCAN_STEPS):
+            self._pause('no open walking corridor after checking both sides')
+            return
+        if self.scan_index == 0:
+            costmap = self._costmap()
+            left, right = (self.explorer.ray(self.map[1], costmap, pose, pose[2] + sign * SCAN_STEP_RAD)[0]
+                           for sign in (1, -1))
+            self.scan_sign = 1 if left >= right else -1
+        angle = self.scan_sign * SCAN_STEPS[self.scan_index] * SCAN_STEP_RAD
+        self.scan_index += 1
+        self._start_spin(now, pose, angle)
+
+    def _start_walk(self, now, pose, goal):
+        if not self.robot.nav_send_goal(goal['x'], goal['y'], goal['yaw']):
+            self._walk_failed(now, 'Nav2 rejected the walk goal')
+            return
+        self.robot.set_speed_limit(self.cfg.mode_speed(self.speed_mode)[0])   # after the MPPI reset
+        self.explorer.sent(goal)
+        self.goal = goal
+        self.goal_sent_at = now
+        d = math.hypot(goal['x'] - pose[0], goal['y'] - pose[1])
+        self.goal_timeout = min(HARD_MAX_GOAL_S, d / self.cfg.mode_speed(self.speed_mode)[0] * 3 + 30)
+        self.progress = (now, pose[0], pose[1])
+        self.scan_index = 0
+        self.walk_start = (pose[0], pose[1])
+        self.stats['goals_sent'] += 1
+        self.stats['walk_goals'] += 1
+        self.event('walk', heading_deg=_r(math.degrees(goal['yaw']), 0), distance_m=_r(d, 2),
+                   open_m=goal['free_m'], ends_at=goal['ends_at'], x=_r(goal['x'], 2), y=_r(goal['y'], 2))
+
+    def _end_walk(self, now, pose, how):
+        walked = math.hypot(pose[0] - self.walk_start[0], pose[1] - self.walk_start[1])
+        self.goal = None
+        self.choose_after = now + MAP_SETTLE_S
+        if how == 'reached' or walked >= WALK_PROGRESS_M:
+            self.failures = 0
+            self.stats['goals_succeeded'] += 1
+            if how != 'reached':
+                self.stats['walks_to_obstacle'] += 1
+            self.event('walk_end', how=how, walked_m=_r(walked, 2))
+        else:
+            self._walk_failed(now, f'walk ended after {walked:.2f} m ({how})')
+
+    def _walk_failed(self, now, why):
+        self.stats['goals_failed'] += 1
+        self.failures += 1
+        self.goal = None
+        self.choose_after = now + MAP_SETTLE_S
+        self.event('walk_failed', reason=why, consecutive=self.failures)
+        if self.failures >= self.cfg.max_goal_failures:
+            sample = self._terrain_now(now)
+            held = f' (terrain proximity stop holding: {sample.reason}; move the robot or the object)' \
+                if sample is not None and sample.stop else ''
+            self._pause(f'{self.failures} consecutive spins/walks found no way on{held}: check the area, '
+                        'then resume')
+
+    def _scan_walk(self, now, pose):
+        """Walk on the first usable map; search both sides only while a corridor is missing."""
+        sample = self._terrain_now(now)
+        if sample is None or sample.stop:
+            self._pause('terrain proximity stop or stale status; check the area before resuming')
+            return
+        if self.goal is None:
+            if now >= self.choose_after and self.map is not None:
+                goal = self._walk_candidate(now, pose)
+                if goal is None:
+                    self._search_turn(now, pose)
+                else:
+                    self._start_walk(now, pose, goal)
+            return
+        status = self.robot.nav_status()
+        result = status.get('result')
+        if self.cancel_request:
+            requested_at, reason = self.cancel_request
+            if result:
+                self.cancel_request = None
+                if self.goal['kind'] == 'spin':
+                    self._end_spin(now, reason, status.get('spun_rad'))
+                elif reason == 'obstacle ahead (walking standoff)':
+                    self._end_walk(now, pose, reason)
+                else:
+                    self._walk_failed(now, reason)
+            elif now - requested_at > 3.0:
+                self._pause('Nav2 cancellation has no terminal result')
+            return
+        if self.goal['kind'] == 'spin':
+            spun = status.get('spun_rad') or 0.0
+            if not result and self.map is not None and self.map[0] != self.scan_map_time:
+                self.scan_map_time = self.map[0]
+                if self._walk_candidate(now, pose) is not None:
+                    self._cancel_scan_walk(now, 'opening')
+                    return
+            if spun > self.spin_progress[1] + 0.1:
+                self.spin_progress = (now, spun)
+            if result == 'SUCCEEDED':
+                self._end_spin(now, 'done', spun)
+            elif result:
+                self._end_spin(now, 'incomplete', spun)       # partial scans still help: walk anyway
+            elif now - self.spin_progress[0] > SPIN_STALL_S:
+                self.event('spin_stalled', turned_deg=_r(math.degrees(spun), 0))
+                self._pause('scan made no angular progress')
+            return
+        # End an approach while there is still room to replan before the proximity lock.
+        heading_error = math.atan2(math.sin(self.goal['yaw'] - pose[2]), math.cos(self.goal['yaw'] - pose[2]))
+        approaching = (abs(heading_error) <= SCAN_STEP_RAD and sample.obstacle_ahead_m is not None
+                       and sample.obstacle_ahead_m <= self.explorer.standoff())
+        if math.hypot(pose[0] - self.progress[1], pose[1] - self.progress[2]) >= 0.10:
+            self.progress = (now, pose[0], pose[1])
+        if result == 'SUCCEEDED':
+            self._end_walk(now, pose, 'reached')
+        elif result:
+            self._end_walk(now, pose, f'Nav2 {result}')
+        elif approaching:
+            self._cancel_scan_walk(now, 'obstacle ahead (walking standoff)')
+        elif now - self.goal_sent_at > self.goal_timeout:
+            self._cancel_scan_walk(now, 'timeout')
+        elif now - self.progress[0] > self.cfg.stuck_s:
+            self._cancel_scan_walk(now, f'no progress for {self.cfg.stuck_s:.0f} s')
+
+    def _cancel_scan_walk(self, now, reason):
+        if self.robot.nav_cancel():
+            self.cancel_request = (now, reason)
+        else:
+            self._pause(f'Nav2 did not acknowledge cancellation: {reason}')
+
+    def _terrain_now(self, now):
+        item = self.robot.telemetry.terrain.latest()
+        return None if item is None or now - item[0] > 0.5 else item[1]
+
     def _goal_failed(self, now, why):
         self.stats['goals_failed'] += 1
         self.failures += 1
@@ -594,6 +952,8 @@ class RoamSession:
             self._pause(f'{self.failures} consecutive goals failed: check the area, then resume')
 
     def _manage_goal(self, now, pose):
+        if self.cfg.strategy == 'scan_walk':
+            return self._scan_walk(now, pose)
         if self.goal is None:
             self._send_goal(now, pose)
             return
@@ -645,6 +1005,9 @@ class RoamSession:
             return f'not resumed: {problem}'
         self.failures = 0
         self.goal = None
+        self.scan_index = 0
+        self.cancel_request = None
+        self.choose_after = now
         self.state = 'ROAMING'
         self.reason = None
         self.runner.nav_active_until = math.inf
@@ -758,7 +1121,28 @@ class RoamSession:
             return self._finish(summary, 'REFUSED')
         self.anchor = (pose[0], pose[1])
         self.area0 = known_area_m2(grid[1])
-        self.explorer = Explorer(self.cfg, self.anchor)
+        self.explorer = (ScanWalk if self.cfg.strategy == 'scan_walk' else Explorer)(self.cfg, self.anchor)
+        self.scan_index = 0
+        self.scan_sign = 1
+        self.choose_after = -math.inf
+        if self.cfg.strategy == 'scan_walk' and hasattr(r, 'collision_boundary'):
+            boundary = r.collision_boundary()                  # running polygon, nose distance
+            self.explorer.cm_front_m = None if boundary is None else boundary + 0.305
+            slow = r.collision_boundary('PolygonSlow') if self.cfg.speed_limit > VALIDATED_SPEED_M_S + 1e-9 \
+                else None
+            if slow:
+                self.slowdown_ratio = min(1.0, CP.SLOW_TIER_SPEED_M_S / self.cfg.speed_limit)
+            self.event('scan_walk', collision_polygon_front_m=_r(self.explorer.cm_front_m, 2),
+                       slowdown_polygon_front_m=_r(slow + 0.305, 2) if slow else None,
+                       spin_radius_m=_r(self.explorer.spin_radius(), 2))
+            if self.explorer.spin_radius() > LARGE_SPIN_RADIUS_M:
+                # Physical 2026-11-18: navigation ran with a 1.19 m polygon (high --max-speed stack), so
+                # every goal needed ~3 m of open floor around it and nothing in the room qualified.
+                self.log(f'WARNING: the running navigation stack stops all motion within '
+                         f'{self.explorer.stop_zone():.2f} m ahead, so every walk goal needs an open circle '
+                         f'about {2 * self.explorer.spin_radius():.1f} m across. In a cluttered area roaming '
+                         f'will find no way on and pause. For roaming restart navigation at 0.10 m/s: '
+                         f'operator/stop_navigation.sh, then operator/roam.sh start --physical.')
         self.runner.geofence = (self.anchor[0], self.anchor[1], self.cfg.geofence_m)
         self.runner.origin = None
         self.t_roam = r.now()
@@ -866,10 +1250,16 @@ class RoamSession:
 
     def _dry_tick(self, now, pose):
         """Dry: nothing is published. Evaluate what roaming would do and report health."""
-        if self.goal is None or now - (self.goal_sent_at or -math.inf) > 5.0:
+        if self.goal_sent_at is None or now - self.goal_sent_at > 5.0:
             grid = self.map
             if grid is not None and pose is not None:
-                goal = self.explorer.choose(grid[1], pose, now, self._costmap())
+                if self.cfg.strategy == 'scan_walk':
+                    sample = self._terrain_now(now)
+                    goal = self._walk_candidate(now, pose) if sample and not sample.stop else None
+                    if goal is None:
+                        self.event('would_scan' if sample and not sample.stop else 'would_pause')
+                else:
+                    goal = self.explorer.choose(grid[1], pose, now, self._costmap())
                 if goal and (self.goal is None or (goal['x'], goal['y']) != (self.goal['x'], self.goal['y'])):
                     self.event('would_send_goal', kind=goal['kind'], x=_r(goal['x'], 2), y=_r(goal['y'], 2))
                 self.goal, self.goal_sent_at = goal, now
@@ -920,8 +1310,11 @@ def write_roam_report(summary, directory):
              f'- Stop reason: {data["stop_reason"]}',
              f'- Readiness: {data["readiness_verdict"]} (report in readiness/)',
              f'- Rest verified after stop: {data.get("rest_verified")}',
-             f'- Goals: {s["goals_sent"]} sent ({s["frontier_goals"]} frontier, {s["patrol_goals"]} patrol), '
-             f'{s["goals_succeeded"]} reached, {s["goals_failed"]} failed',
+             f'- Strategy: {data["config"].get("strategy", "frontier")}',
+             f'- Goals: {s["goals_sent"]} sent ({s["frontier_goals"]} frontier, {s["patrol_goals"]} patrol, '
+             f'{s.get("walk_goals", 0)} walk), {s["goals_succeeded"]} reached, {s["goals_failed"]} failed',
+             f'- Spins: {s.get("spins", 0)} started, {s.get("spins_completed", 0)} completed; walks ended at an '
+             f'obstacle: {s.get("walks_to_obstacle", 0)}',
              f'- Distance (SLAM pose): {s["distance_m"]} m; farthest from start {s["max_from_anchor_m"]} m '
              f'(geofence {data["config"]["geofence_m"]} m)',
              f'- Minimum obstacle clearance: {s["min_clearance_m"]} m',
@@ -981,7 +1374,11 @@ def parse(argv):
                      help=f'session bound, minutes [1-{HARD_MAX_ROAM_MINUTES:.0f}]; roaming otherwise '
                           'runs until you stop it')
     run.add_argument('--abort-clearance', type=float, default=0.08, help='footprint clearance abort, m')
-    run.add_argument('--frontier-radius', type=float, default=3.0, help='frontier search radius, m [1-5]')
+    run.add_argument('--strategy', default='scan-walk', choices=('scan-walk', 'frontier'),
+                     help='scan-walk (default): walk an open corridor, scanning in short turns only when needed; '
+                          'repeat; frontier: frontier goals with patrol fallback')
+    run.add_argument('--frontier-radius', type=float, default=3.0,
+                     help='frontier search radius / longest scan-walk leg, m [1-5]')
     run.add_argument('--frontier-clearance', type=float, default=0.40, help='goal clearance, m [0.3-1]')
     run.add_argument('--max-map-age', type=float, default=15.0, help='SLAM map freshness, s [3-30]')
     run.add_argument('--max-sensor-age', type=float, default=0.5, help='LiDAR/terrain freshness, s')
@@ -999,7 +1396,131 @@ def parse(argv):
     sp = sub.add_parser('speed', help='switch speed mode: slow | normal | fast | up | down')
     sp.add_argument('value')
     sub.add_parser('modes', help='show speed modes and what is (not) verifiable on this robot')
+    plan = sub.add_parser('plan', help='print the effective speed limits, stop zones and turning clearance '
+                                       'for a stack speed (nothing is started or commanded)')
+    plan.add_argument('--max-speed', type=float, default=VALIDATED_SPEED_M_S,
+                      help='navigation stack speed the boundary is computed for (default 0.10)')
+    plan.add_argument('--clearance', type=float, default=0.05, help='collision stop clearance, m')
+    plan.add_argument('--speed-limit', type=float, default=None, help='session ceiling (default --max-speed)')
+    plan.add_argument('--modes', default='')
+    plan.add_argument('--calibration', default=None, help='calibration.json (default: the operator one)')
+    plan.add_argument('--json', action='store_true')
     return p.parse_args(argv)
+
+
+def session_modes(text, limit):
+    """Speed modes for a session. Above the validated 0.10 m/s the 'fast' mode becomes the session limit
+    (unless --modes sets it), so a raised limit is reachable with `roam.sh speed fast` - and only by
+    that explicit switch: sessions still start in 'slow'."""
+    modes = parse_modes(text)
+    if limit > VALIDATED_SPEED_M_S + 1e-9 and not any(
+            part.split('=')[0].strip() == 'fast' for part in (text or '').split(',')):
+        modes['fast'] = (round(limit, 3), DEFAULT_MODES['fast'][1])
+    return modes
+
+
+def terrain_backup_nose(speed_limit, boundary_m):
+    """backup_distance() for a physical session at speed_limit (nose distance of the terrain lock)."""
+    if speed_limit <= VALIDATED_SPEED_M_S + 1e-9 or not boundary_m:
+        return HARD_MIN_STOP_DISTANCE_M
+    return min(2.95, max(HARD_MIN_STOP_DISTANCE_M, round(boundary_m - 0.05, 2)))
+
+
+def effective_settings(max_speed, clearance=0.05, cal=None, speed_limit=None, modes_text=''):
+    """Every speed-dependent setting a physical roam at this stack speed would run with. Pure."""
+    cal = cal or CP.Calibration()
+    limit = max_speed if speed_limit is None else speed_limit
+    tier = CP.tiers(clearance, max_speed, cal)                  # ValueError beyond the 3.0 m cap
+    b = tier['stop']
+    full = tier['slow'] or b                                    # full-speed stop: slowdown polygon if any
+    cm_front = b['boundary_m'] + CP.NOSE_M
+    backup = terrain_backup_nose(limit, b['boundary_m'])
+    sw = ScanWalk(RoamConfig(speed_limit=min(limit, max_speed), stack_max_speed=max_speed,
+                             strategy='scan_walk'), (0.0, 0.0))
+    sw.stop_ahead_m, sw.cm_front_m = backup + CP.NOSE_M, cm_front
+    modes = session_modes(modes_text, limit)
+    accel = 0.5                                                 # velocity_smoother / MPPI max_accel
+    extrapolated = max_speed > max(cal.coast_speed_m_s, VALIDATED_SPEED_M_S) + 1e-9
+    return {
+        'stack_max_speed_m_s': max_speed, 'session_speed_limit_m_s': limit, 'clearance_m': clearance,
+        'modes': {name: {'speed_m_s': v, 'yaw_rad_s': w, 'selectable': v <= limit + 1e-9,
+                         'smoother_cap': [v, 0.0, w], 'mppi_speed_limit_m_s': v,
+                         'robot_cmd_abort_above_m_s': round(v + 0.01, 3),
+                         'leg_odom_abort_above_m_s': round(max(2 * v, v + 0.05), 3)}
+                  for name, (v, w) in modes.items()},
+        'watchdog_cmd_abort_above_m_s': round(limit + 0.02, 3),
+        'collision_boundary_from_nose_m': b['boundary_m'],
+        'slowdown_boundary_from_nose_m': tier['slow']['boundary_m'] if tier['slow'] else None,
+        'slowdown_ratio': tier['slowdown_ratio'],
+        'boundary_parts': {k: full[k] for k in ('reaction_travel_m', 'latency_s', 'coast_m', 'sensor_margin_m',
+                                                'clearance_m', 'required_m')},
+        'coast_basis': (f'ASSUMED: {cal.coast_m} m measured at {cal.coast_speed_m_s} m/s, scaled '
+                        f'(speed ratio)^{CP.COAST_EXPONENT_ABOVE_VALIDATED} above 0.10 m/s'
+                        if extrapolated else f'measured ({cal.coast_m} m at {cal.coast_speed_m_s} m/s, '
+                                             'scaled linearly up to 0.10 m/s)'),
+        'terrain_stop_from_nose_m': backup,
+        'stop_zone_from_centre_m': round(sw.stop_zone(), 3),
+        'walk_standoff_from_centre_m': round(sw.standoff(), 3),
+        'turn_clearance_radius_m': round(sw.spin_radius(), 3),
+        'open_floor_needed_across_m': round(2 * sw.spin_radius(), 2),
+        'time_to_full_speed_s': round(limit / accel, 2),
+        'distance_to_full_speed_m': round(limit ** 2 / (2 * accel), 3),
+        'scan_step_s': round(SCAN_STEP_RAD / NAV2_MAX_YAW_RATE_RAD_S, 1),
+        'spin_360_s': round(2 * math.pi / NAV2_MAX_YAW_RATE_RAD_S, 1),
+        'validated': max_speed <= VALIDATED_SPEED_M_S + 1e-9,
+    }
+
+
+def print_plan(s, scale_speeds=(0.10, 0.15, 0.20, 0.30, 0.40, 0.50), clearance=0.05, cal=None):
+    ok = 'VALIDATED' if s['validated'] else 'NOT VALIDATED (stopping distance above 0.10 m/s is assumed)'
+    print(f'Roam speed plan: stack --max-speed {s["stack_max_speed_m_s"]} m/s, session limit '
+          f'{s["session_speed_limit_m_s"]} m/s, clearance {s["clearance_m"]} m  [{ok}]')
+    print('\nSpeed limit chain (each layer caps the one before it):')
+    print('  1 Nav2 static ceilings  MPPI vx_max 1.0, velocity_smoother max_velocity 1.0 (never the limit)')
+    print(f'  2 collision boundary    computed for {s["stack_max_speed_m_s"]} m/s at navigation start '
+          '(roam refuses a session limit above it)')
+    print(f'  3 session limit         {s["session_speed_limit_m_s"]} m/s: no mode above it can be selected')
+    print('  4 selected mode         velocity_smoother max_velocity set + read back (hard clamp after MPPI);')
+    print('                          MPPI /speed_limit re-sent after every goal start (Humble resets it)')
+    print('  5 runtime checks        robot-side command > mode + 0.01 m/s, leg odometry > max(2v, v+0.05),')
+    print(f'                          watchdog command > {s["watchdog_cmd_abort_above_m_s"]} m/s -> safety stop')
+    print('\nSpeed modes (sessions start in slow; faster only via `roam.sh speed ...`):')
+    for name, m in s['modes'].items():
+        print(f'  {name:<7} {m["speed_m_s"]:.2f} m/s {m["yaw_rad_s"]:.2f} rad/s  '
+              f'{"selectable" if m["selectable"] else "ABOVE LIMIT: refused"}  '
+              f'(odometry abort > {m["leg_odom_abort_above_m_s"]} m/s)')
+    p = s['boundary_parts']
+    print('\nStopping (at the stack speed):')
+    full_stop = (f'reaction {p["reaction_travel_m"]:.3f} ({p["latency_s"]:.2f} s) + coast {p["coast_m"]:.3f} + '
+                 f'margin {p["sensor_margin_m"]:.2f} + clearance {p["clearance_m"]:.2f} = {p["required_m"]:.2f}')
+    if s['slowdown_boundary_from_nose_m']:
+        print(f'  collision_monitor slow  {s["slowdown_boundary_from_nose_m"]:.2f} m from the nose: everything '
+              f'(turning too) x{s["slowdown_ratio"]} -> <= 0.10 m/s; full stop from '
+              f'{s["stack_max_speed_m_s"]} m/s: {full_stop}')
+        print(f'  collision_monitor stop  {s["collision_boundary_from_nose_m"]:.2f} m from the nose (sized for '
+              f'0.10 m/s): the only zone that locks turning')
+    else:
+        print(f'  collision_monitor stop  {s["collision_boundary_from_nose_m"]:.2f} m from the nose = {full_stop}')
+    print(f'  coast                   {s["coast_basis"]}')
+    print(f'  terrain backup stop     {s["terrain_stop_from_nose_m"]:.2f} m from the nose')
+    print(f'  scan-walk               walk ends {s["walk_standoff_from_centre_m"]:.2f} m (centre) before '
+          f'obstacles; turning needs {s["turn_clearance_radius_m"]:.2f} m radius clear = '
+          f'{s["open_floor_needed_across_m"]:.1f} m of open floor across')
+    print(f'  acceleration            full speed after {s["time_to_full_speed_s"]} s / '
+          f'{s["distance_to_full_speed_m"]} m (0.5 m/s^2); 30 deg scan step {s["scan_step_s"]} s (0.20 rad/s)')
+    print('\nScaling (same clearance and calibration):')
+    print('  speed  stop      slowdown  terrain  turn radius  open floor  coast basis')
+    for v in scale_speeds:
+        try:
+            e = effective_settings(v, clearance, cal)
+        except ValueError as error:
+            print(f'  {v:.2f}   refused: {error}')
+            continue
+        slow = e['slowdown_boundary_from_nose_m']
+        print(f'  {v:.2f}   {e["collision_boundary_from_nose_m"]:.2f} m    '
+              f'{(f"{slow:.2f} m" if slow else "-"):<8}  {e["terrain_stop_from_nose_m"]:.2f} m   '
+              f'{e["turn_clearance_radius_m"]:.2f} m       {e["open_floor_needed_across_m"]:.1f} m      '
+              f'{"measured" if e["validated"] else "assumed"}')
 
 
 def build_config(a, state):
@@ -1008,13 +1529,14 @@ def build_config(a, state):
     if limit > stack_max + 1e-9:
         raise ConfigError(f'--speed-limit {limit} exceeds the {stack_max} m/s the collision stop boundary '
                           'was computed for (restart navigation with --max-speed)')
-    modes = parse_modes(a.modes)
+    modes = session_modes(a.modes, limit)
     # Modes above the session limit stay listed but cannot be selected (refused at switch time).
     return RoamConfig(speed_limit=limit, modes=modes, start_mode=a.speed, geofence_m=a.geofence,
                       max_minutes=a.max_minutes, abort_clearance_m=a.abort_clearance,
                       frontier_radius_m=a.frontier_radius, frontier_clearance_m=a.frontier_clearance,
                       max_map_age_s=a.max_map_age, max_sensor_age_s=a.max_sensor_age,
-                      min_lidar_hz=a.min_lidar_hz, stack_max_speed=stack_max)
+                      min_lidar_hz=a.min_lidar_hz, stack_max_speed=stack_max,
+                      strategy=a.strategy.replace('-', '_'))
 
 
 def parse_script(text):
@@ -1115,6 +1637,29 @@ def main(argv=None):
     if a.action == 'modes':
         show_modes(DEFAULT_MODES, float(state.get('MAX_SPEED', 0.10)))
         return 0
+    if a.action == 'plan':
+        cal_path = a.calibration or (Path(os.environ.get('LITE3_STATE_FILE') or
+                                          Path.home() / 'lite3_ws/log/operator/state.env').parent / 'calibration.json')
+        cal = CP.load_calibration(cal_path)
+        if a.speed_limit is not None and a.speed_limit > a.max_speed + 1e-9:
+            print(f'REFUSED: --speed-limit {a.speed_limit} exceeds --max-speed {a.max_speed}')
+            return 2
+        try:
+            s = effective_settings(a.max_speed, a.clearance, cal, a.speed_limit, a.modes)
+        except (ValueError, ConfigError) as error:
+            print(f'REFUSED: {error}')
+            return 2
+        if a.json:
+            print(json.dumps(s, indent=1))
+        else:
+            print(f'Calibration: {cal_path} ({len(cal.sources)} sources)')
+            print_plan(s, clearance=a.clearance, cal=cal)
+            if state.get('MAX_SPEED'):
+                print(f'\nRunning navigation: --max-speed {state.get("MAX_SPEED")} --clearance '
+                      f'{state.get("CLEARANCE")} (boundary {state.get("BOUNDARY")} m, {state.get("MODE")} mode)'
+                      + ('' if abs(float(state['MAX_SPEED']) - a.max_speed) < 1e-9 else
+                         ' - DIFFERENT from this plan: operator/stop_navigation.sh first'))
+        return 0
     return run_session(a, state, directory)
 
 
@@ -1123,7 +1668,9 @@ def run_session(a, state, directory):
     if mode == MODE_SIM:
         directory = Path(directory) / 'sim'      # never mixes with a real session's control files
     try:
-        cfg = build_config(a, state if mode != MODE_SIM else {})
+        # sim: no stack; the stand-in runs with the boundary roam.sh would start navigation with
+        cfg = build_config(a, state if mode != MODE_SIM else
+                           ({'MAX_SPEED': str(a.speed_limit)} if a.speed_limit else {}))
         script = parse_script(a.sim_script)
     except (ConfigError, ValueError) as error:
         print(f'REFUSED: {error}')
@@ -1185,7 +1732,10 @@ def run_session(a, state, directory):
                                            direct=a.direct_telemetry or state.get('TELEMETRY') == 'direct')
         if mode == MODE_SIM:
             from .roam_sim import make_sim_robot
-            robot = make_sim_robot()
+            tier = CP.tiers(0.05, max(cfg.speed_limit, 0.08))      # what roam.sh would start navigation with
+            robot = make_sim_robot(cm_boundary=tier['stop']['boundary_m'],
+                                   cm_slow_boundary=tier['slow']['boundary_m'] if tier['slow'] else None,
+                                   cm_slowdown_ratio=tier['slowdown_ratio'])
             robot.cancelled = cancel.is_set
             watchdog = None if a.no_watchdog else WatchdogLogic(cfg.speed_limit, cfg.geofence_m)
         else:

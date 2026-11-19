@@ -19,7 +19,7 @@ def grid_from_occupancy(msg):
 
 class RoamRobot(NavRobot):
     """NavRobot + /map (slam_toolbox), /global_costmap/costmap (incl. the terrain point-cloud
-    hazards), /livox/points (raw LiDAR: rate and serialized size) and /cloud_registered_body
+    hazards), /lite3/livox_points (raw LiDAR via sensor_relay: rate and serialized size) and /cloud_registered_body
     (Fast-LIO alive)."""
 
     def _extra_setup(self):
@@ -59,7 +59,9 @@ class RoamRobot(NavRobot):
 
         node.create_subscription(OccupancyGrid, '/map', keep('map'), latched)
         node.create_subscription(OccupancyGrid, '/global_costmap/costmap', keep('costmap'), latched)
-        node.create_subscription(PointCloud2, '/livox/points', lambda raw: t.raw_cloud.add(
+        # sensor_relay's domain-64 copy: subscribing the bridged /livox/points would make the bridge
+        # send every cloud again over the robot link (and it arrives ~0.8 s later)
+        node.create_subscription(PointCloud2, '/lite3/livox_points', lambda raw: t.raw_cloud.add(
             time.monotonic(), len(raw)), qos_profile_sensor_data, raw=True)
         node.create_subscription(PointCloud2, '/cloud_registered_body', lambda raw: t.lio_cloud.add(
             time.monotonic(), len(raw)), qos_profile_sensor_data, raw=True)

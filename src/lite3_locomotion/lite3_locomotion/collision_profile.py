@@ -24,11 +24,13 @@ NOSE_M = 0.305               # Nav2 footprint front edge ahead of base_link
 REAR_M = 0.305
 HALF_WIDTH_M = 0.185
 CORRIDOR_HALF_WIDTH_M = 0.30  # same corridor as terrain_monitor (footprint + 0.115)
-MIN_BOUNDARY_M = 0.30        # never closer than the validated terrain backup stop
-MAX_SPEED_M_S = 0.50         # hard speed ceiling (operator decision 2026-11-17); validated only to 0.10
+MIN_BOUNDARY_M = 0.20        # operator decision 2026-11-19 (was 0.30): stop 20 cm before the nose,
+                             # same as the terrain backup stop (terrain.StopParams.stop_ahead_m - NOSE_M)
+MAX_SPEED_M_S = 1.00         # hard speed ceiling (operator decision 2026-11-18, was 0.50); validated only to 0.10
 VALIDATED_SPEED_M_S = 0.10   # coast/latency behaviour measured up to here
 COAST_EXPONENT_ABOVE_VALIDATED = 1.5
-MAX_BOUNDARY_M = 1.50
+MAX_BOUNDARY_M = 3.00        # was 1.50; 1.0 m/s needs ~2.83 m. Must stay inside the terrain grid's
+                             # forward reach (TerrainParams.size_m / 2 - NOSE_M) or hazards go unseen.
 
 # Conservative defaults used until the session has measured better values.
 DEFAULTS = {'sensing_age_s': 0.50, 'processing_s': 0.05, 'path_latency_s': 0.10,
@@ -50,7 +52,7 @@ class Calibration:
             value = getattr(self, name)
             if not (isinstance(value, (int, float)) and math.isfinite(value) and 0.0 <= value <= 2.0):
                 raise ValueError(f'{name}={value} invalid')
-        if not 0.01 <= self.coast_speed_m_s <= 0.5:
+        if not 0.01 <= self.coast_speed_m_s <= MAX_SPEED_M_S:
             raise ValueError('coast_speed_m_s invalid')
         if self.sensor_margin_m < 0.05:
             raise ValueError('sensor_margin_m must be >= 0.05 (terrain grid resolution)')
@@ -80,6 +82,31 @@ def boundary(clearance_m, v_max_m_s, cal=Calibration()):
     return {k: round(v, 4) for k, v in parts.items()}
 
 
+SLOW_TIER_SPEED_M_S = VALIDATED_SPEED_M_S   # inside the slowdown polygon the robot runs at most this
+
+
+def tiers(clearance_m, v_max_m_s, cal=Calibration()):
+    """Stop / slowdown polygons for a stack speed.
+
+    Up to 0.10 m/s: one STOP polygon sized for v_max (unchanged). Above: the STOP polygon is sized for
+    the slow tier (0.10 m/s) and a SLOWDOWN polygon, sized for v_max, scales every command (turning too)
+    by v_slow / v_max while anything is inside it. The robot is then never faster than 0.10 m/s when it
+    reaches the stop polygon, and only that small polygon locks it completely - a single v_max-sized STOP
+    polygon also stops in-place turns, so anything within ~1 m left the robot unable to turn away
+    (simulation 2026-11-19: 0.30 m/s never moved in a 3 m room).
+    The slowdown polygon holds the FULL stopping distance for v_max (decelerating to v_slow needs less),
+    plus the reaction travel at v_slow so the hand-over between the polygons has margin."""
+    if v_max_m_s <= SLOW_TIER_SPEED_M_S + 1e-9:
+        return {'stop': boundary(clearance_m, v_max_m_s, cal), 'slow': None, 'slowdown_ratio': None}
+    stop = boundary(clearance_m, SLOW_TIER_SPEED_M_S, cal)
+    full = boundary(clearance_m, v_max_m_s, cal)
+    slow_m = math.ceil((full['boundary_m'] + stop['reaction_travel_m']) * 100) / 100
+    if slow_m > MAX_BOUNDARY_M:
+        raise ValueError(f'slowdown boundary {slow_m:.2f} m exceeds {MAX_BOUNDARY_M} m')
+    return {'stop': stop, 'slow': {**full, 'boundary_m': slow_m},
+            'slowdown_ratio': round(SLOW_TIER_SPEED_M_S / v_max_m_s, 4)}
+
+
 def stop_polygon(boundary_m):
     """collision_monitor 'points' (base_link): corridor from behind the body to the boundary."""
     front = round(NOSE_M + boundary_m, 3)
@@ -93,9 +120,9 @@ def polygon_boundary(points):
     return round(max(points[0::2]) - NOSE_M, 3)
 
 
-def collision_monitor_params(boundary_m, cmd_in, cmd_out):
-    """Full ros__parameters for nav2_collision_monitor (Humble 1.1.x)."""
-    return {'collision_monitor': {'ros__parameters': {
+def collision_monitor_params(boundary_m, cmd_in, cmd_out, slow_boundary_m=None, slowdown_ratio=None):
+    """Full ros__parameters for nav2_collision_monitor (Humble 1.1.x); slowdown polygon optional."""
+    params = {'collision_monitor': {'ros__parameters': {
         'use_sim_time': False,
         'base_frame_id': 'base_link',
         'odom_frame_id': 'odom',
@@ -105,7 +132,13 @@ def collision_monitor_params(boundary_m, cmd_in, cmd_out):
         # Humble IGNORES sources older than this (treats them as "no obstacle"). Observed data
         # age is <= 0.5 s; staleness beyond that is caught by the terrain_stop lock (0.5 s).
         'source_timeout': 1.0,
-        'base_shift_correction': True,
+        # OFF (2026-11-18). With it on, Humble looks up odom->base_link at the CURRENT time for every
+        # cmd_vel, so each command blocks until the Fast-LIO TF catches up: throughput = 1 / TF latency
+        # (~10 of 20 zeros at 0.1 s; 2 Hz at >= 0.5 s), and beyond transform_tolerance the hazard source
+        # is dropped for that cycle (collision_monitor blind). Measured live: TF 1.4 s behind when the
+        # domain-bridge link was congested -> M10 zero_delivery 2 of 20. The hazard cloud is already in
+        # base_link, and boundary() covers robot travel during the sensing age, so the shift is redundant.
+        'base_shift_correction': False,
                 # Humble stops publishing ZEROS once the robot has been stopped for this long (verified on the real
         # binary 2026-11-17: 0 messages after 10 s idle, also on a fresh start). The collision_monitor only
         # publishes in reaction to its input (the mux output), so a long timeout adds no traffic while
@@ -119,6 +152,16 @@ def collision_monitor_params(boundary_m, cmd_in, cmd_out):
         'hazards': {'type': 'pointcloud', 'topic': '/lite3_terrain/hazards',
                     'min_height': -1.0, 'max_height': 1.0, 'enabled': True},
     }}}
+    if slow_boundary_m:
+        if not (slow_boundary_m > boundary_m and 0.0 < slowdown_ratio < 1.0):
+            raise ValueError('slowdown polygon must lie outside the stop polygon, ratio in (0, 1)')
+        ros = params['collision_monitor']['ros__parameters']
+        ros['polygons'] = ['PolygonStop', 'PolygonSlow']        # stop outranks slowdown in Humble
+        ros['PolygonSlow'] = {'type': 'polygon', 'points': stop_polygon(slow_boundary_m),
+                              'action_type': 'slowdown', 'slowdown_ratio': float(slowdown_ratio),
+                              'max_points': 1, 'visualize': True, 'polygon_pub_topic': 'polygon_slowdown',
+                              'enabled': True}
+    return params
 
 
 def load_calibration(path):
@@ -158,7 +201,11 @@ def main(argv=None):
     args = parser.parse_args(argv)
     cal = load_calibration(args.calibration)
     try:
-        result = boundary(args.clearance, args.max_speed, cal)
+        tier = tiers(args.clearance, args.max_speed, cal)
+        result = dict(tier['stop'])                  # boundary_m = the STOP polygon (state BOUNDARY)
+        if tier['slow']:
+            result.update(slow_boundary_m=tier['slow']['boundary_m'], slowdown_ratio=tier['slowdown_ratio'],
+                          slow_required_m=tier['slow']['required_m'])
     except ValueError as error:
         print(json.dumps({'error': str(error)}))
         return 2

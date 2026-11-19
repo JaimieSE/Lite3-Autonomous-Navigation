@@ -136,6 +136,15 @@ class NavSteps(ProximityStopSteps):
                                 '(LiDAR link degraded?)')
             if lidar_hz < p['min_lidar_hz']:
                 problems.append(f'LiDAR odometry {lidar_hz:.1f} Hz < {p["min_lidar_hz"]} Hz')
+            lags = sorted(v for _, v in t.lidar_odom.window(now, p['window_s']) if v is not None)
+            if lags:
+                lag = lags[min(len(lags) - 1, int(0.95 * len(lags)))]
+                detail['lidar_odometry_lag_p95_s'] = _r(lag)
+                if lag > p['max_odom_lag_s']:
+                    problems.append(f'LiDAR odometry {lag:.2f} s behind real time (> {p["max_odom_lag_s"]} s): '
+                                    'SLAM pose and TF are stale. Usually the robot->PC link is congested '
+                                    '(the sensor_relay log shows the domain-64 /livox/imu and cloud rates; close '
+                                    'RViz/ros2 CLI subscribers of /livox/* in domain 64; check the robot link)')
             sample = self._terrain()
             if sample is None:
                 problems.append('terrain status stale')
@@ -165,11 +174,18 @@ class NavSteps(ProximityStopSteps):
 
     def _boundary_problems(self, p, detail):
         """Running collision_monitor boundary vs what the LIVE sensing delay requires."""
-        live = self._live_calibration({'path_latency_s': 0.10, 'coast_m': p['coast_m'],
-                                       'coast_speed_m_s': p['coast_speed_m_s'], 'sensor_margin_m': 0.05})
-        cal, measured = live
         try:
-            need = CP.boundary(p['cm_clearance_m'], p['cm_max_speed_m_s'], cal)
+            cal, measured = self._live_calibration({'path_latency_s': 0.10, 'coast_m': p['coast_m'],
+                                                    'coast_speed_m_s': p['coast_speed_m_s'],
+                                                    'sensor_margin_m': 0.05})
+        except ValueError as error:          # e.g. sensing_age_s 2.66 s is outside the model's 0-2 s range
+            detail['collision_boundary'] = {'error': str(error)}
+            return [f'LIVE LiDAR sensing delay is beyond what the stopping boundary can cover ({error}): the '
+                    'LiDAR data is seconds late. Check the robot link / perception host load (sensor_relay '
+                    'log "relay timing" shows the cloud age on arrival)']
+        try:
+            tier = CP.tiers(p['cm_clearance_m'], p['cm_max_speed_m_s'], cal)
+            need = tier['stop']
         except ValueError as error:
             detail['collision_boundary'] = {'live': measured, 'error': str(error)}
             return [f'the stopping boundary for {p["cm_max_speed_m_s"]} m/s with {p["cm_clearance_m"]} m '
@@ -188,6 +204,16 @@ class NavSteps(ProximityStopSteps):
             problems.append(f'collision stop boundary {actual} m < {need["required_m"]} m required NOW '
                             f'(live sensing delay {measured.get("sensing_age_p95_s")} s): restart navigation '
                             'so the boundary is recomputed')
+        if tier['slow']:            # above 0.10 m/s the slowdown polygon carries the full-speed stop
+            slow = self.robot.collision_boundary('PolygonSlow')
+            detail['collision_boundary'].update(slow_running_m=slow, slow_required_now=tier['slow']['required_m'])
+            if slow is None:
+                problems.append(f'collision_monitor slowdown polygon missing: the stack must have been started '
+                                f'with --max-speed {p["cm_max_speed_m_s"]} (restart navigation)')
+            elif slow + 1e-9 < tier['slow']['required_m']:
+                problems.append(f'collision slowdown boundary {slow} m < {tier["slow"]["required_m"]} m required '
+                                f'NOW for {p["cm_max_speed_m_s"]} m/s (live sensing delay '
+                                f'{measured.get("sensing_age_p95_s")} s): restart navigation')
         return problems
 
     def step_zero_delivery(self, step):
@@ -196,8 +222,36 @@ class NavSteps(ProximityStopSteps):
         if not self.robot.can_actuate:
             return self.PREVIEW, 'would send zeros on the stop input and verify delivery', {}
         self._check(feed=False)
-        t0 = self.robot.now()
+        # Zeros published before DDS matches the new stop publisher are silently dropped, so wait for
+        # the path to be discovered first (dead-man NOT fed meanwhile: the robot stays locked).
+        match_start = self.robot.now()
+        path = self.robot.stop_path_status() if hasattr(self.robot, 'stop_path_status') else {'problems': []}
+        while path['problems'] and self.robot.now() - match_start < p['match_timeout_s']:
+            self._check(feed=False)
+            self.robot.wait(0.05)
+            path = self.robot.stop_path_status()
+        path['waited_s'] = _r(self.robot.now() - match_start)
+        if path['problems']:
+            return (self.FAILED, f'stop path not connected after {p["match_timeout_s"]} s (no zeros sent): '
+                    f'{path["problems"]}', {'stop_path': path, 'problems': path['problems']})
+        # Warm-up: our own domain-64 observer must also be matched to the bridge before anything can be
+        # measured, and Humble rclpy cannot report a subscription's matched publishers. So send zeros
+        # until the first one is SEEN at motion_sender (live 2026-11-18: path ready at 0.45 s, observer
+        # first saw a zero 0.86 s later), then measure a full burst. Zeros on the stop input are harmless.
         self.commands_sent = True
+        warm_start = self.robot.now()
+        while not self.robot.telemetry.system_cmd.since(warm_start):
+            if self.robot.now() - warm_start >= p['match_timeout_s']:
+                path['warmup_s'] = _r(self.robot.now() - warm_start)
+                return (self.FAILED, f'no zero observed at motion_sender within {p["match_timeout_s"]} s of '
+                        'warm-up (stop path, domain bridge or our domain-64 observer)',
+                        {'stop_path': path, 'problems': ['zeros never observed at motion_sender']})
+            self._check(feed=False)
+            self._stop_command()
+            self.robot.wait(self.seq.safety.command_period_s)
+        path['warmup_s'] = _r(self.robot.now() - warm_start)
+        self.robot.wait(self.seq.safety.command_period_s)
+        t0 = self.robot.now()
         while self.robot.now() - t0 < p['duration_s']:
             self._check(feed=False)
             self._stop_command()
@@ -211,10 +265,14 @@ class NavSteps(ProximityStopSteps):
         observed = self.robot.telemetry.system_cmd.since(t0)
         during = [(t, c) for t, c in observed if t <= t1 + 0.3]
         idle = [(t, c) for t, c in observed if t >= idle_start]
+        # While locked only the stop input can pass, and only zeros. A zero shortly after the burst is
+        # one of ours arriving late (bridge/executor lag); a non-zero, or a zero long after, is a breach.
+        idle_breach = [(t, c) for t, c in idle if not c.is_zero or t - t1 > p['late_zero_s']]
         first = during[0][0] - t0 if during else None
-        detail = {'zeros_sent_s': _r(t1 - t0), 'observed_at_motion_sender': len(during),
+        detail = {'stop_path': path, 'zeros_sent_s': _r(t1 - t0), 'observed_at_motion_sender': len(during),
                   'first_after_s': _r(first), 'nonzero_observed': sum(not c.is_zero for _, c in during),
-                  'messages_while_idle_locked': len(idle)}
+                  'messages_while_idle_locked': len(idle_breach),
+                  'late_zero_stragglers': len(idle) - len(idle_breach)}
         problems = []
         if not during or first > p['deadline_s']:
             problems.append(f'zeros not observed at motion_sender within {p["deadline_s"]} s')
@@ -222,8 +280,9 @@ class NavSteps(ProximityStopSteps):
             problems.append('non-zero command observed during a zero-only test')
         if len(during) < p['duration_s'] * 10:
             problems.append(f'only {len(during)} of ~{p["duration_s"] * 20:.0f} zeros arrived')
-        if idle:
-            problems.append(f'{len(idle)} commands reached motion_sender while idle and locked')
+        if idle_breach:
+            problems.append(f'{len(idle_breach)} commands reached motion_sender while idle and locked '
+                            f'(non-zero, or a zero > {p["late_zero_s"]} s after the burst)')
         detail['problems'] = problems
         return ((self.PASSED, 'stop path delivers zeros to motion_sender; idle mux silent', detail)
                 if not problems else (self.FAILED, '; '.join(problems), detail))

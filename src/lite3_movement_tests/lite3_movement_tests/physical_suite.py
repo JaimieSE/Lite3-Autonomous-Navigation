@@ -9,7 +9,7 @@ against a software stand-in. Only ``--physical`` moves the robot, and only when:
   * the operator types the test ID at the confirmation prompt for EACH test.
 
 Terminal parameters can only narrow the hard limits in config.py (speed <= 0.5 m/s, validated to 0.10,
-stop distance >= 0.30 m from the nose, ...). Values outside them are refused, not clamped.
+stop distance >= 0.20 m from the nose, ...). Values outside them are refused, not clamped.
 """
 
 import argparse
@@ -35,7 +35,7 @@ from .report import write_reports
 from .runner import MODE_PHYSICAL, MODE_READONLY, MODE_SIM, SequenceRunner
 
 VALIDATED_SPEED_M_S = 0.10            # coast, latency and the 0.30 m backup lock were validated up to here
-DEFAULT_STOP_AHEAD_M = 0.60           # terrain.StopParams default (centre), restored afterwards
+DEFAULT_STOP_AHEAD_M = 0.505          # terrain.StopParams default (centre), restored afterwards
 EXIT = {'PASSED': 0, 'READONLY_CHECKS_PASSED': 0, 'FAILED_SAFE': 1, 'INTERVENTION_REQUIRED': 2}
 
 CONFIRM_ITEMS = (
