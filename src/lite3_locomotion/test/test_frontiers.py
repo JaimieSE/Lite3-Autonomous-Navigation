@@ -3,7 +3,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from lite3_locomotion.exploration_preview import grid_from_message, main
 from lite3_locomotion.frontiers import FrontierConfig, Grid, select_frontiers
 
 
@@ -133,37 +132,3 @@ def test_invalid_grid_rejected(kwargs):
     fields.update(kwargs)
     with pytest.raises(ValueError):
         Grid(**fields)
-
-
-@pytest.mark.parametrize('args', [
-    ['--ros-args', '-r', '/map:=/cmd_vel'], ['--output-topic', '/goal_pose'],
-    ['--radius', '100'], ['--clearance', '-1'], ['--radius', 'nan'],
-])
-def test_preview_rejects_remapping_and_invalid_options(args, monkeypatch):
-    import sys
-    monkeypatch.setitem(sys.modules, 'rclpy', None)
-    with pytest.raises(SystemExit) as error:
-        main(args)
-    assert error.value.code == 2
-
-
-def message():
-    return SimpleNamespace(
-        header=SimpleNamespace(frame_id='map'), data=[0] * 9,
-        info=SimpleNamespace(width=3, height=3, resolution=1.0,
-                             origin=SimpleNamespace(
-                                 position=SimpleNamespace(x=0.0, y=0.0),
-                                 orientation=SimpleNamespace(x=0.0, y=0.0, z=0.0, w=1.0))),
-    )
-
-
-def test_ros_map_conversion_is_offline_and_checks_frame_and_rotation():
-    msg = message()
-    assert grid_from_message(msg).width == 3
-    msg.header.frame_id = 'odom'
-    with pytest.raises(ValueError):
-        grid_from_message(msg)
-    msg.header.frame_id = 'map'
-    msg.info.origin.orientation.x = 0.5
-    with pytest.raises(ValueError):
-        grid_from_message(msg)

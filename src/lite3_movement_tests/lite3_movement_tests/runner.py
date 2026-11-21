@@ -117,7 +117,11 @@ class SequenceRunner(NavSteps):
         if tilt is None or max(abs(tilt[0]), abs(tilt[1])) > lim.max_tilt_rad:
             return 'body tilt beyond limit or IMU orientation invalid'
         handle = t.handle.latest()
-        if handle and now - handle[0] < 1.0 and max(
+        # While roam drives the robot with AI-state axis commands (stairs), the robot reports those axes on
+        # /handle_state too: 2026-11-21 its own first axis command read as "remote input". STOP on the remote
+        # acts on the robot directly and is unaffected.
+        own_axes = now < getattr(self, 'own_axis_until', -math.inf)
+        if handle and not own_axes and now - handle[0] < 1.0 and max(
                 abs(handle[1].vx), abs(handle[1].vy), abs(handle[1].wz)) > req.max_handle_axis:
             return 'handheld remote input detected (operator takeover)'
         odom = t.odom.latest()

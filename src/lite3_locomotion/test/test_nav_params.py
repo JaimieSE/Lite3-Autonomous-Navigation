@@ -30,14 +30,14 @@ def test_velocity_caps_match_validated_envelope_and_no_reverse():
     mppi = get('controller_server', 'ros__parameters', 'FollowPath')
     from lite3_locomotion import collision_profile as CP
     # Static ceiling = the hard speed ceiling (2026-11-17: 0.5); every session caps it lower and verifies it.
-    assert mppi['vx_max'] <= CP.MAX_SPEED_M_S and mppi['vx_min'] == 0.0 and mppi['wz_max'] <= 0.20
+    assert mppi['vx_max'] <= CP.MAX_SPEED_M_S and mppi['vx_min'] == 0.0 and mppi['wz_max'] <= 1.5
     assert mppi['vy_max'] == 0.0
     smoother = get('velocity_smoother', 'ros__parameters')
     assert smoother['max_velocity'][0] <= CP.MAX_SPEED_M_S and smoother['min_velocity'][0] == 0.0
-    assert smoother['max_velocity'][2] <= 0.20 and smoother['min_velocity'][2] >= -0.20
+    assert smoother['max_velocity'][2] <= 1.5 and smoother['min_velocity'][2] >= -1.5
     behaviors = get('behavior_server', 'ros__parameters')
     assert behaviors['behavior_plugins'] == ['spin', 'wait']
-    assert behaviors['max_rotational_vel'] <= 0.20
+    assert behaviors['max_rotational_vel'] <= 1.5
 
 
 def test_behavior_tree_has_no_blind_reverse():
@@ -105,3 +105,20 @@ def test_physical_mux_config_loaded_only_when_motion_allowed():
     src = (ROOT / 'launch' / 'navigation.launch.py').read_text()
     assert "    if allow:   # dead-man lock" in src
     assert "mux_params.append(os.path.join(share, 'params', 'twist_mux_physical.yaml'))" in src
+
+
+def test_mppi_samples_and_horizon_allow_full_speed_on_short_walks():
+    """2026-11-21: ~0.18 m/s at a 0.5 m/s cap. Nav2-default speed sampling, 2.0 s horizon, rate = 1/model_dt."""
+    c = get('controller_server', 'ros__parameters')
+    mppi = c['FollowPath']
+    assert mppi['vx_std'] == 0.2 and mppi['time_steps'] == 40
+    assert abs(c['controller_frequency'] * mppi['model_dt'] - 1.0) < 1e-9
+    assert mppi['prune_distance'] >= mppi['time_steps'] * mppi['model_dt'] * mppi['vx_max']
+
+
+def test_launch_refuses_a_pre_built_map_by_default():
+    """Competition: live autonomous mapping only (no saved map + AMCL)."""
+    src = (ROOT / 'launch' / 'navigation.launch.py').read_text()
+    assert "DeclareLaunchArgument('slam', default_value='True')" in src
+    assert "DeclareLaunchArgument('allow_saved_map', default_value='false')" in src
+    assert 'slam:=False uses a pre-built map' in src

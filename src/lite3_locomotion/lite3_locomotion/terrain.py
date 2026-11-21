@@ -40,11 +40,20 @@ class TerrainParams:
     size_m: float = 8.0                 # square grid centred on the robot (was 6.0: 4.0 m ahead covers
                                         # the 3.0 m max collision boundary + 0.305 m nose)
     floor_tolerance_m: float = 0.04     # |height| within this = floor
-    max_step_m: float = 0.10            # placeholder: traversable rise without stair gait
-    max_drop_m: float = 0.10            # placeholder: lower than this below floor = drop-off
+    # Rise still walkable (not an obstacle). No vendor guide gives a climbable height (Motion Development
+    # Guide s1.2 lists dimensions only). Competition: ~5 cm stairs + rubble; RUG H-Step is the documented
+    # high-lift gait (Comm Interface s1.2.5). Set per run: start_navigation.sh --max-step M.
+    max_step_m: float = 0.40            # was 0.30 (operator: smaller hazard cloud; /scan covers >= ~0.43 m), 0.18 (course 12:33: stacked/unseen-top lips marked as walls
+                                        # boxed the robot in at the start); before that 0.10, 0.12, 0.15; course lips are 0.10-0.15 m (operator 2026-11-21),
+                                        # judged as the jump to the lowest neighbouring cell (see build_grid)
+    max_drop_m: float = 0.18            # deeper than this = drop-off; was 0.10, 0.15 (stepping off a 0.10-0.15 m
+                                        # lip counts as a step down, 2026-11-21)
     body_clearance_m: float = 0.75      # points above this (over floor) are overhead
     min_points_per_cell: int = 2
-    self_filter_x: tuple = (-0.40, 0.40)   # robot body/legs box in base_link (URDF ~0.61 x 0.37 m)
+    # Front edge measured 2026-11-20 (standing, 108 clouds): own-body returns reach x 0.289 at most (head,
+    # 0.43-0.50 m up), none ahead of the nose (0.305). 0.32 = +3 cm margin; was 0.40, which hid 9.5 cm
+    # ahead of the nose and made a stop line closer than that blind.
+    self_filter_x: tuple = (-0.40, 0.32)   # robot body/legs box in base_link (URDF ~0.61 x 0.37 m)
     self_filter_y: tuple = (-0.25, 0.25)
     corridor_half_width_m: float = 0.30  # footprint half width 0.185 + margin
     corridor_length_m: float = 4.0
@@ -164,10 +173,17 @@ def build_grid(level_points, floor_z, params, floor_source='given'):
     max_h[:] = hi.reshape(n, n)
     min_h[:] = lo.reshape(n, n)
     seen = counts >= params.min_points_per_cell
+    # Course of stacked 0.10-0.15 m lips (operator 2026-11-21): a second tier is 0.25 m above the floor the robot
+    # stands on but only one lip above the tier before it. A cell above max_step is an obstacle unless it can be
+    # REACHED from the seen floor through cells whose tops differ by <= max_step (flood fill). Walls, poles and
+    # objects whose base is hidden stay obstacles: nothing walkable leads up to them. Drops stay absolute.
+    reachable = _reachable(np.where(seen, max_h, np.nan), params)
     with np.errstate(invalid='ignore'):
         drop = seen & (min_h < -params.max_drop_m)
-        obstacle = seen & (max_h > params.max_step_m)
-        step = seen & (max_h > params.floor_tolerance_m) & ~obstacle
+        obstacle = seen & (max_h > params.max_step_m) & ~reachable
+        step_up = seen & (max_h > params.floor_tolerance_m) & ~obstacle
+        step_down = seen & (min_h < -params.floor_tolerance_m) & ~drop & ~obstacle & ~step_up   # lower floor
+        step = step_up | step_down
         free = seen & ~obstacle & ~step & ~drop & (np.abs(max_h) <= params.floor_tolerance_m)
     labels[seen & over_only.reshape(n, n)] = OVERHEAD
     labels[free] = FREE
@@ -175,6 +191,31 @@ def build_grid(level_points, floor_z, params, floor_source='given'):
     labels[drop] = DROP
     labels[obstacle] = OBSTACLE
     return TerrainGrid(labels, max_h, min_h, counts, origin, res, floor_z, floor_source)
+
+
+STEP_TOP_CLEAR_M = 0.30   # no obstacle this close behind a step, or it is a wall's base, not a step
+
+
+def _reachable(top, params, max_iterations=200):
+    """Cells reachable from the seen floor (|top| <= floor tolerance) by steps of <= max_step between 8-neighbours
+    (top = cell top height above floor, NaN = unseen). Iterative dilation; ~n/2 rounds at most."""
+    n0, n1 = top.shape
+    with np.errstate(invalid='ignore'):
+        reach = np.abs(top) <= params.floor_tolerance_m
+        walkable = np.isfinite(top) & (top <= params.body_clearance_m)
+    shifts = [(dy, dx) for dy in (-1, 0, 1) for dx in (-1, 0, 1) if dy or dx]
+    for _ in range(max_iterations):
+        grown = reach.copy()
+        for dy, dx in shifts:
+            src = (slice(max(0, -dy), n0 - max(0, dy)), slice(max(0, -dx), n1 - max(0, dx)))
+            dst = (slice(max(0, dy), n0 - max(0, -dy)), slice(max(0, dx), n1 - max(0, -dx)))
+            with np.errstate(invalid='ignore'):
+                ok = reach[src] & walkable[dst] & (np.abs(top[dst] - top[src]) <= params.max_step_m)
+            grown[dst] |= ok
+        if (grown == reach).all():
+            break
+        reach = grown
+    return reach
 
 
 def corridor_summary(grid, params):
@@ -186,6 +227,20 @@ def corridor_summary(grid, params):
     for name, code in (('obstacle', OBSTACLE), ('drop', DROP), ('step', STEP)):
         hits = [xs[c] for c in cols if np.any(grid.labels[rows, c] == code)]
         first[f'nearest_{name}_m'] = round(float(min(hits)), 3) if hits else None
+    # Signed height of the nearest step (+ up / - down): roam's automatic stair trigger reads it.
+    first['nearest_step_rise_m'] = None
+    # A step has a walkable top: an obstacle starting just behind it means the cells are the base of a wall seen
+    # from above (depth camera, 2026-11-21: a wall 0.5 m ahead read as a 0.13 m "step" and started AI mode).
+    wall_base = first['nearest_step_m'] is not None and first['nearest_obstacle_m'] is not None and \
+        first['nearest_obstacle_m'] - first['nearest_step_m'] < STEP_TOP_CLEAR_M
+    if first['nearest_step_m'] is not None and not wall_base:
+        c = int(np.argmin(np.abs(xs - first['nearest_step_m'])))
+        cells = rows[grid.labels[rows, c] == STEP]
+        up, down = grid.max_height[cells, c], grid.min_height[cells, c]
+        with np.errstate(invalid='ignore'):
+            top = float(np.nanmax(up)) if np.isfinite(up).any() else 0.0
+            low = float(np.nanmin(down)) if np.isfinite(down).any() else 0.0
+        first['nearest_step_rise_m'] = round(top if top >= -low else low, 3)
     near_cols = np.where((xs >= params.near_field_m[0]) & (xs <= params.near_field_m[1]))[0]
     near = grid.labels[np.ix_(rows, near_cols)]
     corridor = grid.labels[np.ix_(rows, cols)]
@@ -277,19 +332,24 @@ class StopParams:
     stop_ahead_m: footprint front 0.305 m + 0.20 m nose-to-obstacle stop boundary (operator decision
     2026-11-19, was 0.295 m). Covers the calibrated stop up to 0.08 m/s (reaction ~0.03 + coast ~0.06
     + 5 cm grid margin = 0.14 m, leaving >= 5 cm); at 0.10 m/s about 4 cm would remain.
-    stop_radius_m: footprint corner radius 0.357 m (in-place turns) + margin.
+    body_margin_m: hazard within this distance of the body footprint (0.61 x 0.37 m box) on any side.
+    Operator 2026-11-20 (course <= 1.5 m wide): was a 0.40 m circle round the centre, which stopped
+    the robot for walls 21 cm beside it. In-place turns are covered by roam's turn-room check and
+    Nav2's footprint collision checking, not by this backup lock.
     """
-    stop_ahead_m: float = 0.505
-    stop_radius_m: float = 0.45
-    half_width_m: float = 0.30
+    stop_ahead_m: float = 0.505         # default nose + 0.20 (physical tests); roaming lowers it to 0.405
+    body_margin_m: float = 0.05         # 5 cm round the footprint (was a 0.40 m circle; operator 2026-11-20)
+    half_width_m: float = 0.235         # body half width 0.185 + 5 cm (was 0.30)
     release_hold_s: float = 1.0
 
 
 # Runtime-adjustable range of the proximity stop (ROS parameters on terrain_monitor). The lower
 # bounds are the validated defaults: a test may make the stop MORE conservative, never less.
 NOSE_OFFSET_M = 0.305          # footprint front edge ahead of base_link
-STOP_LIMITS = {'stop_ahead_m': (StopParams.stop_ahead_m, 3.40),   # was 1.80; 2.95 m nose + 0.305 at 1.0 m/s
-               'stop_radius_m': (StopParams.stop_radius_m, 1.00)}
+STOP_LIMITS = {'stop_ahead_m': (0.355, 3.40),   # floor nose + 0.05 for roaming (operator 2026-11-20);   # was 1.80; 2.95 m nose + 0.305 at 1.0 m/s
+               'body_margin_m': (StopParams.body_margin_m, 1.00)}
+FOOTPRINT_HALF_LENGTH_M = 0.305   # Nav2 footprint [[0.305, 0.185], ...]
+FOOTPRINT_HALF_WIDTH_M = 0.185
 
 
 def updated_stop_params(params, name, value):
@@ -312,9 +372,10 @@ def proximity_stop(grid, params=StopParams()):
         return False, None
     x, y = xs[cols], ys[rows]
     ahead = (x > 0) & (x <= params.stop_ahead_m) & (np.abs(y) <= params.half_width_m)
-    around = np.hypot(x, y) <= params.stop_radius_m
+    around = (np.abs(x) <= FOOTPRINT_HALF_LENGTH_M + params.body_margin_m) & \
+             (np.abs(y) <= FOOTPRINT_HALF_WIDTH_M + params.body_margin_m)
     if ahead.any():
         return True, f'hazard {float(x[ahead].min()):.2f} m ahead'
     if around.any():
-        return True, f'hazard within {params.stop_radius_m} m'
+        return True, f'hazard within {params.body_margin_m} m of the body'
     return False, None

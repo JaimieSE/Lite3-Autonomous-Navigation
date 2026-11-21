@@ -20,6 +20,39 @@ import time
 from .telemetry import Telemetry, TwistSample
 
 POSTURE_TOGGLE = 0x21010202   # documented stand/sit toggle; also used by university drain_patrol
+# Motion Host Communication Interface V1.1.0 s1.2.5: gait switches, simple commands (value 0, type 0),
+# valid when NOT in AI state and in move mode. Same /simple_cmd path as the posture toggle.
+# Comm Interface s1.2.1: heartbeat 0x21040001 (value -, simple command), "sent at a minimal frequency of 2Hz".
+# Neither the vendor transfer node nor the university stack sends it (checked 2026-11-21), so it is
+# opt-in (roam --heartbeat) until verified on the robot.
+# Comm Interface s1.2.11 perception switches: code 0x21012109, value in the command-value field.
+# 0x00 all AI off / 0x20 auto stop -> motion host (here via /simple_cmd); 0x40 obstacle avoidance -> the
+# PERCEPTION host UDP 192.168.1.103:43899 (documented address; differs per network, configurable).
+AI_OPTIONS_CODE = 0x21012109
+AI_OPTIONS = {'all_off': 0x00, 'auto_stop': 0x20, 'obstacle_avoidance': 0x40}
+PERCEPTION_HOST_DEFAULT = ('192.168.1.103', 43899)
+
+
+def send_perception_udp(code, value, host=PERCEPTION_HOST_DEFAULT):
+    """Simple command [code, value, type 0] (Comm Interface s1.1.1, little-endian uint32) to the perception host."""
+    import socket, struct
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        return sock.sendto(struct.pack('<III', code, value, 0), host) == 12
+
+
+# AI state and axis commands (Comm Interface s1.2.2, s1.2.3.2, s1.2.7, s1.2.13). In AI state navigation mode
+# is unavailable and motion is by axis commands at >= 20 Hz (250 ms timeout). The axis value RANGE was lost
+# from the PDF text export; only the dead zones are known (forward +-6553), so values are config.
+AI_ENTER = 0x21010528
+AI_EXIT = 0x2101052B
+AI_GAIT_BASIC = 0x2101052A
+NAVIGATION_MODE = 0x21010C03
+AXIS_FORWARD = 0x21010130
+AXIS_FORWARD_DEAD_ZONE = 6553
+HEARTBEAT_CODE = 0x21040001
+HEARTBEAT_PERIOD_S = 0.5
+GAITS = {'flat_slow': 0x21010300, 'flat_medium': 0x21010307, 'flat_fast': 0x21010303,
+         'rug_general': 0x21010401, 'rug_grip': 0x21010402, 'rug_hstep': 0x21010407}
 NODE_NAME = 'lite3_movement_test'
 SENSORS = ('imu', 'joint', 'odom2', 'odom', 'ultrasound')
 
@@ -150,6 +183,47 @@ class RosRobot:
 
     def send_posture_toggle(self):
         """Publish exactly one volatile toggle; report delivery evidence, never success."""
+        return self.send_simple_command(POSTURE_TOGGLE)
+
+    def start_heartbeat(self, period_s=HEARTBEAT_PERIOD_S):
+        """Publish the documented heartbeat on /simple_cmd (domain 64) every period_s until close."""
+        if not self.can_actuate:
+            return False
+        if not 0 < period_s <= HEARTBEAT_PERIOD_S:
+            raise ValueError('heartbeat must be sent at 2 Hz or faster (Comm Interface s1.2.1)')
+        node = self._nodes[self.wiring.system_domain]
+        pub = node.create_publisher(self._Simple, self.wiring.posture_topic, self._volatile)
+        msg = self._Simple()
+        msg.cmd_code, msg.size, msg.type = HEARTBEAT_CODE, 0, 0
+        self._heartbeat = (pub, node.create_timer(period_s, lambda: pub.publish(msg)))
+        return True
+
+    def send_gait(self, name):
+        """One documented gait switch (GAITS); the deployed bridge does not report the active gait."""
+        return self.send_simple_command(GAITS[name])
+
+    def send_ai_option(self, name, perception_host=PERCEPTION_HOST_DEFAULT):
+        """Documented perception switch (s1.2.11). Robot must not be in AI state."""
+        value = AI_OPTIONS[name]
+        if name == 'obstacle_avoidance':
+            return {'published': send_perception_udp(AI_OPTIONS_CODE, value, perception_host),
+                    'to': f'{perception_host[0]}:{perception_host[1]}'}
+        return self.send_simple_command(AI_OPTIONS_CODE, value)
+
+    def send_axis(self, code, value):
+        """Fire-and-forget simple command on a persistent publisher (axis commands must run at >= 20 Hz;
+        send_simple_command's per-call publisher and match wait are far too slow for that)."""
+        if not self.can_actuate:
+            raise RuntimeError('read-only interface has no publishers')
+        if getattr(self, '_axis_pub', None) is None:
+            self._axis_pub = self._nodes[self.wiring.system_domain].create_publisher(
+                self._Simple, self.wiring.posture_topic, self._volatile)
+        msg = self._Simple()
+        msg.cmd_code, msg.size, msg.type = int(code), int(value), 0
+        self._axis_pub.publish(msg)
+
+    def send_simple_command(self, code, value=0):
+        """Publish exactly one volatile simple command; report delivery evidence, never success."""
         if not self.can_actuate:
             raise RuntimeError('read-only interface has no publishers')
         node = self._nodes[self.wiring.system_domain]
@@ -166,14 +240,14 @@ class RosRobot:
                 return {'published': False, 'definitely_not_sent': True,
                         'reason': 'motion_sender not matched on posture topic'}
             msg = self._Simple()
-            msg.cmd_code, msg.size, msg.type = POSTURE_TOGGLE, 0, 0
+            msg.cmd_code, msg.size, msg.type = code, value, 0   # size = command value (s1.1.1)
             sent = time.monotonic()
             pub.publish(msg)
             deadline = sent + 1.0
             while time.monotonic() < deadline and not any(
-                    t >= sent and c == POSTURE_TOGGLE for t, c in self._posture_seen):
+                    t >= sent and c == code for t, c in self._posture_seen):
                 time.sleep(0.01)
-            return {'published': True, 'cmd_code': hex(POSTURE_TOGGLE),
+            return {'published': True, 'cmd_code': hex(code),
                     'matched_subscribers': pub.get_subscription_count(),
                     'observed_in_system_domain': any(t >= sent for t, _ in self._posture_seen)}
         finally:
@@ -239,6 +313,8 @@ class RosRobot:
 OPS_TEST_TOPIC = '/lite3_ops/test_cmd_vel'
 OPS_STOP_TOPIC = '/lite3_ops/stop_cmd_vel'
 OPS_HOLD_TOPIC = '/lite3_ops/hold'
+CLEAR_COSTMAP_SERVICES = ('/global_costmap/clear_entirely_global_costmap',
+                          '/local_costmap/clear_entirely_local_costmap')
 MUX_OUT_TOPIC = '/lite3_ops/mux_out'           # twist_mux -> collision_monitor
 CM_NODE = 'collision_monitor'                  # the ONLY publisher of /cmd_vel
 TERRAIN_NODE = 'lite3_terrain_monitor'
@@ -289,7 +365,9 @@ class NavRobot(RosRobot):
             stop = s.get('stop') or {}
             t.on_terrain(now(), stop.get('active', True), stop.get('reason'),
                          (s.get('corridor') or {}).get('nearest_obstacle_m'), stop.get('ahead_m'),
-                         s.get('problems'), s.get('processing_s'))
+                         s.get('problems'), s.get('processing_s'),
+                         (s.get('corridor') or {}).get('nearest_step_m'),
+                         (s.get('corridor') or {}).get('nearest_step_rise_m'))
 
         def on_hazards(msg):
             t.hazard_age.add(now(), time.time() - (msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9))
@@ -341,6 +419,9 @@ class NavRobot(RosRobot):
             self._speed_pub = node.create_publisher(SpeedLimit, '/speed_limit', 10)
             self._param_client = node.create_client(SetParameters,
                                                     f'/{TERRAIN_NODE}/set_parameters')
+            from nav2_msgs.srv import ClearEntireCostmap
+            self._ClearEntireCostmap = ClearEntireCostmap
+            self._clear_clients = [node.create_client(ClearEntireCostmap, name) for name in CLEAR_COSTMAP_SERVICES]
 
     def stop_path_status(self):
         """Is the commanded-stop path discovered end to end? Publishers created moments ago drop
@@ -402,6 +483,20 @@ class NavRobot(RosRobot):
         while not future.done() and time.monotonic() < deadline:
             time.sleep(0.02)
         return future.result() if future.done() else None
+
+    def clear_costmaps(self):
+        """Nav2 ClearEntireCostmap on the global and local costmap (the recovery Nav2's default behaviour
+        tree runs). The terrain hazard source marks without clearing, so marks made while the robot rocked
+        on a lip stay lethal on free floor (2026-11-21: 842 lethal cells on SLAM-free floor within 1.6 m).
+        Not a motion command. Returns the services that answered."""
+        if not self.can_actuate:
+            raise RuntimeError('read-only interface clears nothing')
+        done = []
+        for name, client in zip(CLEAR_COSTMAP_SERVICES, self._clear_clients):
+            if client.wait_for_service(timeout_sec=1.0) and \
+                    self._call(client, self._ClearEntireCostmap.Request()) is not None:
+                done.append(name)
+        return done
 
     def set_nav_velocity_cap(self, vx, wz):
         """Hard ceiling on Nav2's output at the velocity_smoother (dynamic max_velocity), read back.
@@ -516,12 +611,12 @@ class NavRobot(RosRobot):
         return {'active': g['handle'] is not None and g['result'] is None, 'result': g['result'],
                 'recoveries': g['recoveries'], 'spun_rad': g.get('spun_rad')}
 
-    def nav_cancel(self):
+    def nav_cancel(self, timeout_s=3.0):
         handle = self._goal.get('handle')
         if handle is None or self._goal.get('result'):
             return True
         future = handle.cancel_goal_async()
-        deadline = time.monotonic() + 3.0
+        deadline = time.monotonic() + timeout_s
         while not future.done() and time.monotonic() < deadline:
             time.sleep(0.02)
         return future.done()
@@ -552,6 +647,24 @@ class NavRobot(RosRobot):
             values = future.result().values if future.done() else []
             points = list(values[0].double_array_value) if values else []
             return round(max(points[0::2]) - 0.305, 3) if points else None
+        finally:
+            node.destroy_client(client)
+
+    def collision_approach_time(self):
+        """time_before_collision of the running collision_monitor approach action (None if absent)."""
+        from rcl_interfaces.srv import GetParameters
+        node = self._nodes[self.wiring.velocity_domain]
+        client = node.create_client(GetParameters, f'/{CM_NODE}/get_parameters')
+        try:
+            if not client.wait_for_service(timeout_sec=2.0):
+                return None
+            future = client.call_async(GetParameters.Request(names=['FootprintApproach.time_before_collision']))
+            deadline = time.monotonic() + 2.0
+            while not future.done() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            values = future.result().values if future.done() else []
+            value = values[0].double_value if values and values[0].type == 3 else 0.0   # 3 = PARAMETER_DOUBLE
+            return round(value, 3) if value > 0 else None
         finally:
             node.destroy_client(client)
 

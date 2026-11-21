@@ -4,18 +4,6 @@
 set -o pipefail
 source "$(dirname "$0")/env.sh"
 
-if [ -f "$TEST4_PID_FILE" ] && kill -0 "$(cat "$TEST4_PID_FILE")" 2>/dev/null; then
-  echo "== Stopping Test 4"
-  kill -INT "$(cat "$TEST4_PID_FILE")"
-  for _ in $(seq 1 20); do kill -0 "$(cat "$TEST4_PID_FILE")" 2>/dev/null || break; sleep 0.5; done
-fi
-rm -f "$TEST4_PID_FILE"
-if [ -f "$PHYSICAL_PID_FILE" ] && kill -0 "$(cat "$PHYSICAL_PID_FILE")" 2>/dev/null; then
-  echo "== Stopping the physical test (it commands a stop and verifies rest first)"
-  kill -INT "$(cat "$PHYSICAL_PID_FILE")"
-  for _ in $(seq 1 30); do kill -0 "$(cat "$PHYSICAL_PID_FILE")" 2>/dev/null || break; sleep 0.5; done
-fi
-rm -f "$PHYSICAL_PID_FILE"
 ROAM_PID_FILE="$LOG_ROOT/roam.pid"
 if [ -f "$ROAM_PID_FILE" ] && kill -0 "$(cat "$ROAM_PID_FILE")" 2>/dev/null; then
   echo "== Stopping M10 roaming (it cancels Nav2, commands zeros and verifies rest first)"

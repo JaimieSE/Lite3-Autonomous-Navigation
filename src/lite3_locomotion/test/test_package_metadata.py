@@ -22,12 +22,10 @@ def test_active_install_has_no_duplicate_stack_or_motion_entry_points(monkeypatc
     runpy.run_path(str(root / 'setup.py'))
     assert captured['packages'] == ['lite3_locomotion']
     names = {entry.split('=')[0].strip() for entry in captured['entry_points']['console_scripts']}
-    assert names == {'exploration_coordinator', 'autonomy_control', 'exploration_preview',
-                     'locomotion_controller', 'terrain_monitor',
-                     'sensor_relay'}  # sensor relay only (domain 64 -> 8), no command path
+    assert names == {'terrain_monitor', 'sensor_relay'}  # M0-M9 controller/preview removed 2026-11-21
     installed = [path for _, paths in captured['data_files'] for path in paths]
     assert sorted(p for p in installed if p.startswith('launch/')) == [
-        'launch/autonomy.launch.py', 'launch/navigation.launch.py']
+        'launch/navigation.launch.py']
     assert sorted(p for p in installed if p.startswith('params/')) == [
         'params/nav2_lite3.yaml', 'params/navigate_through_poses_no_backup.xml',
         'params/navigate_to_pose_no_backup.xml', 'params/twist_mux_locks.yaml', 'params/twist_mux_physical.yaml']
@@ -56,8 +54,10 @@ def test_lidar_consumers_read_the_domain_64_relay_not_the_bridge():
     root = Path(__file__).resolve().parents[1]
     from lite3_locomotion import sensor_relay as R
     relayed = {source: output for _, source, output, _, _ in R.RELAYS}
-    assert relayed['/livox/lidar'] == '/lite3/livox_lidar' and relayed['/livox/points'] == '/lite3/livox_points'
+    assert relayed['/livox/lidar'] == '/lite3/livox_lidar'
+    assert '/livox/points' not in relayed
     launch = (root / 'launch' / 'navigation.launch.py').read_text()
+    assert "package='lite3_livox_cloud', executable='livox_cloud'" in launch
     assert 'SetRemap(src=LIDAR_SOURCE, dst=LIDAR_DIRECT)' in launch            # Fast-LIO
     assert '(POINTS_SOURCE, POINTS_DIRECT)' in launch                         # terrain_monitor
     roam_ros = (root.parent / 'lite3_movement_tests' / 'lite3_movement_tests' / 'roam_ros.py').read_text()

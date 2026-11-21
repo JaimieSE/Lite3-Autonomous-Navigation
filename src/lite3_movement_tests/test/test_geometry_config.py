@@ -13,7 +13,11 @@ from lite3_movement_tests.geometry import (
 from lite3_movement_tests.sim_model import LYING_POSE, STANDING_POSE
 from lite3_movement_tests.telemetry import OdomSample, displacement
 
-SEQUENCE = Path(__file__).resolve().parents[1] / 'config' / 'basic_walk.yaml'
+# The M0-M9 walk sequences were removed 2026-11-21: validation and authorization are checked against the
+# sequence roaming actually runs (its readiness checks).
+from lite3_movement_tests import roam as R
+SEQUENCE = Path(__import__('tempfile').mkdtemp()) / 'roam_readiness.yaml'
+SEQUENCE.write_text(yaml.safe_dump(R.readiness_sequence(R.MODE_PHYSICAL, {}), sort_keys=False))
 LEVEL = (0.0, 0.0)
 
 
@@ -87,24 +91,15 @@ def _base():
     return yaml.safe_load(SEQUENCE.read_text())
 
 
-def test_default_sequence_loads_within_hard_limits():
+def test_roam_readiness_sequence_loads_within_hard_limits():
     seq = cfg.load_sequence(SEQUENCE)
-    moves = [s for s in seq.all_steps if s.type == 'velocity_move']
-    assert moves and all(abs(s.params['vx']) <= 0.03 for s in moves)
+    assert not [s for s in seq.all_steps if s.type == 'velocity_move']     # readiness never drives
     assert sum(s.timeout_s for s in seq.all_steps) <= cfg.HARD_MAX_SESSION_S
 
 
 @pytest.mark.parametrize('mutate, message', [
-    (lambda d: d['steps'][5].update(vx=1.1), 'vx'),
-    (lambda d: d['steps'][5].update(duration_s=10), 'duration_s'),
-    (lambda d: d['steps'][5].pop('expect'), 'expect'),
-    (lambda d: d['steps'].pop(6), 'stop_verify'),
-    (lambda d: d['steps'].insert(0, d['steps'].pop(2)), 'readiness'),
-    (lambda d: d['steps'][3].update(target='jump'), 'target'),
-    (lambda d: d['steps'][3].update(timeout_s=60), 'timeout'),
     (lambda d: d['steps'][0].update(bogus=1), 'unknown'),
     (lambda d: d['safety'].update(geofence_radius_m=10), 'geofence'),
-    (lambda d: d['finalize'].append(dict(d['steps'][5], id='x')), 'finalize'),
 ])
 def test_sequence_validation_rejects(tmp_path, mutate, message):
     data = _base()
@@ -115,7 +110,7 @@ def test_sequence_validation_rejects(tmp_path, mutate, message):
 
 def _auth(seq, **changes):
     template = cfg.authorization_template(seq)
-    template['operator_confirmations'] = {k: True for k in cfg.REQUIRED_CONFIRMATIONS}
+    template['operator_confirmations'] = {k: True for k in template['operator_confirmations']}
     template.update(changes)
     return template
 
@@ -153,9 +148,8 @@ def test_authorization_bound_to_sequence_hash_and_expiry(tmp_path):
 def test_authorization_scope_limits(tmp_path):
     seq = cfg.load_sequence(SEQUENCE)
     data = _auth(seq)
-    data['limits'].update(max_speed_m_s=0.01, allow_posture_commands=False)
+    data['limits'].update(allow_posture_commands=False)      # roam stands the robot up
     problems = cfg.check_authorization(_load_auth(tmp_path, data), seq)
-    assert any('speed exceeds' in p for p in problems)
     assert any('posture commands not authorized' in p for p in problems)
     data['limits']['max_speed_m_s'] = 5.0
     with pytest.raises(cfg.ConfigError):

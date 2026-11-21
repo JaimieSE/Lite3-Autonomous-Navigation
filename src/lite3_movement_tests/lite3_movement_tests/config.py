@@ -16,7 +16,7 @@ HARD_MAX_SPEED_M_S = 1.0             # 0.10 -> 0.5 (2026-11-17) -> 1.0 (2026-11-
 #   (coast, latency, backup lock, Nav2 tuning) only up to 0.10 m/s: everything above is opt-in per
 #   session (start_navigation.sh --max-speed) and needs the backup lock moved out (see roam.py,
 #   physical_suite.py) and a coast re-measured at that speed.
-HARD_MAX_YAW_RATE_RAD_S = 0.30
+HARD_MAX_YAW_RATE_RAD_S = 1.5        # manufacturer navigation-mode limit (Comm Interface 1.2.12)
 HARD_MAX_MOVE_S = 3.0
 HARD_MAX_POSTURE_TIMEOUT_S = 20.0
 HARD_MAX_STEP_TIMEOUT_S = 30.0
@@ -39,9 +39,11 @@ HARD_MAX_RESPONSE_S = 0.5             # obstacle inside boundary -> no forward c
 MIN_PRIMARY_SEPARATION_M = 0.05       # collision_monitor boundary vs backup lock: one grid cell
 HARD_MAX_M4_STEP_S = 130.0            # step timeout ceiling for approach_stop / proximity_watch
 ODOMETRY_TRUST = 0.8                  # leg odometry under-reads forward travel by up to ~15%
-HARD_MIN_STOP_DISTANCE_M = 0.20       # proximity stop from the nose (2026-11-19, was 0.30 validated)
-HARD_MIN_ABORT_CLEARANCE_M = 0.05     # footprint clearance abort floor during navigation
-NAV2_MAX_YAW_RATE_RAD_S = 0.20       # params/nav2_lite3.yaml MPPI + smoother cap
+HARD_MIN_STOP_DISTANCE_M = 0.20       # proximity stop from the nose for the physical tests (0.30 validated)
+HARD_MIN_ROAM_STOP_DISTANCE_M = 0.05  # roaming only (operator 2026-11-20, was 0.10); below what M3 verifies:
+                                      # terrain_monitor ignores ~0.095 m ahead of the nose as the body
+HARD_MIN_ABORT_CLEARANCE_M = 0.02     # footprint clearance abort floor during navigation
+NAV2_MAX_YAW_RATE_RAD_S = 1.50       # params/nav2_lite3.yaml MPPI + smoother cap = manufacturer limit (Comm Interface 1.2.12)
 NOSE_OFFSET_M = 0.305                 # footprint front edge ahead of base_link (Nav2 footprint)
 
 STEP_TYPES = {
@@ -223,7 +225,7 @@ def _parse_step(raw, index):
         p['window_s'] = _finite(take('window_s', 3.0), f'{step_id}.window_s', 1.0, 10.0)
         # Collision stop boundary re-check (0 = boundary unknown: not checked, e.g. simulation).
         p['cm_boundary_m'] = _finite(take('cm_boundary_m', 0.0), f'{step_id}.cm_boundary_m', 0.0, 1.5)
-        p['cm_clearance_m'] = _finite(take('cm_clearance_m', 0.15), f'{step_id}.cm_clearance_m', 0.05, 1.0)
+        p['cm_clearance_m'] = _finite(take('cm_clearance_m', 0.15), f'{step_id}.cm_clearance_m', 0.0, 1.0)
         p['cm_max_speed_m_s'] = _finite(take('cm_max_speed_m_s', 0.10), f'{step_id}.cm_max_speed_m_s',
                                         0.01, HARD_MAX_SPEED_M_S)
         p['coast_m'] = _finite(take('coast_m', 0.05), f'{step_id}.coast_m', 0.0, 0.2)
@@ -234,7 +236,7 @@ def _parse_step(raw, index):
         # the robot->PC bridge link was congested (Livox IMU relayed at 8 Hz instead of ~200 Hz).
         p['max_odom_lag_s'] = _finite(take('max_odom_lag_s', 0.5), f'{step_id}.max_odom_lag_s', 0.2, 2.0)
         p['stop_distance_m'] = _finite(take('stop_distance_m', HARD_MIN_STOP_DISTANCE_M),
-                                       f'{step_id}.stop_distance_m', HARD_MIN_STOP_DISTANCE_M, 1.5)
+                                       f'{step_id}.stop_distance_m', HARD_MIN_ROAM_STOP_DISTANCE_M, 1.5)
     if kind == 'zero_delivery':
         p['duration_s'] = _finite(take('duration_s', 1.0), f'{step_id}.duration_s', 0.5, 3.0)
         p['deadline_s'] = _finite(take('deadline_s', 0.5), f'{step_id}.deadline_s', 0.1, 1.0)

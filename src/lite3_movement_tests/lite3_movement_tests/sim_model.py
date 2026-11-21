@@ -221,6 +221,23 @@ class FakeRobot:
         self.model.command_toggle(self.t)
         return {'published': True, 'matched_subscribers': 1, 'observed_in_system_domain': True}
 
+    def send_simple_command(self, code, value=0):
+        if not self.can_actuate:
+            raise RuntimeError('read-only interface')
+        self.sent.append((self.t, 'simple', code, value))
+        return {'published': True, 'matched_subscribers': 1, 'observed_in_system_domain': True}
+
+    def send_axis(self, code, value):
+        self.sent.append((self.t, 'axis', code, value))
+        if code == 0x21010130:                    # simulated: axis forward walks like a speed command
+            self.model.command_velocity(self.t, 0.05 if abs(value) > 6553 else 0.0, 0.0)
+
+    def send_gait(self, name):
+        if not self.can_actuate:
+            raise RuntimeError('read-only interface')
+        self.sent.append((self.t, 'gait', name))
+        return {'published': True, 'matched_subscribers': 1, 'observed_in_system_domain': True}
+
     def command_path_health(self):
         return self.healthy, {'problems': [] if self.healthy else ['competing publisher']}
 
@@ -262,20 +279,19 @@ def box_points(x, y, size=0.3, step=0.05):
 
 class FakeNavRobot(FakeRobot):
     def __init__(self, telemetry, model, nav_fault='none', obstacles=(), cm_boundary=0.37,
-                 cm_slow_boundary=None, cm_slowdown_ratio=None, **kwargs):
+                 cm_approach_s=None, **kwargs):
         self.faults = set(nav_fault.split('+'))
         if self.faults - set(NAV_FAULTS):
             raise ValueError(f'unknown nav fault {nav_fault}')
         self.nav_fault = nav_fault
         self.cm_boundary = cm_boundary            # collision_monitor stop polygon, nose distance
-        self.cm_slow_boundary = cm_slow_boundary  # optional slowdown polygon (stacks above 0.10 m/s)
-        self.cm_slowdown_ratio = cm_slowdown_ratio
+        self.cm_approach_s = cm_approach_s        # optional approach action (stacks above 0.10 m/s)
         self.cm_stopping = False
         self.obstacles = list(obstacles)
         self.inputs = {}
         self.last_feed = -math.inf
         self.stop_ahead = 0.505
-        self.stop_radius = 0.45
+        self.body_margin = 0.05                   # terrain.StopParams.body_margin_m
         self.last_hazard = -math.inf
         self.terrain_stop = False
         self.speed_limit = 0.0
@@ -308,7 +324,7 @@ class FakeNavRobot(FakeRobot):
         # nav2_collision_monitor (Humble): STOP polygon over the hazard points -> zeros.
         if 'cm_disabled' not in self.faults:
             front = 0.305 + self.cm_boundary
-            inside = any(-0.355 <= x <= front and abs(y) <= 0.30 for x, y in self._base_points())
+            inside = any(-0.355 <= x <= front and abs(y) <= 0.235 for x, y in self._base_points())
             if inside and 'cm_slow' in self.faults:
                 self.cm_inside_since = self.cm_inside_since or self.t
                 inside = self.t - self.cm_inside_since >= 0.6
@@ -324,10 +340,12 @@ class FakeNavRobot(FakeRobot):
                                              if inside else ('continue', 'Robot to continue normal operation'))
             if inside:
                 vx, wz = 0.0, 0.0
-            elif self.cm_slow_boundary:
-                slow_front = 0.305 + self.cm_slow_boundary
-                if any(-0.355 <= x <= slow_front and abs(y) <= 0.30 for x, y in self._base_points()):
-                    vx, wz = vx * self.cm_slowdown_ratio, wz * self.cm_slowdown_ratio
+            elif self.cm_approach_s and vx > 0:
+                # Humble approach: footprint simulated along the command; forward motion is scaled so the
+                # predicted collision is no sooner than time_before_collision. Turning in place is free.
+                ahead = [x - 0.305 for x, y in self._base_points() if x > 0.305 and abs(y) <= 0.185]
+                if ahead and min(ahead) / vx < self.cm_approach_s:
+                    vx = max(0.0, min(ahead)) / self.cm_approach_s
         self.mux_log.append((self.t, source, vx, wz))
         self.model.command_velocity(self.t, vx, wz)
         self.telemetry.on_system_cmd(self.t, vx, 0.0, wz)
@@ -368,18 +386,18 @@ class FakeNavRobot(FakeRobot):
             if self._walk_fault('terrain_stale_walk'):
                 return
             pts = self._base_points()
-            ahead = [x for x, y in pts if 0 < x <= 3.0 and abs(y) <= 0.30]   # terrain corridor
+            ahead = [x for x, y in pts if 0 < x <= 3.0 and abs(y) <= 0.235]   # terrain corridor
             nearest = min(ahead) if ahead else None
             trigger = self.stop_ahead - (0.15 if 'lock_late' in self.faults else 0.0)
             hazard = (nearest is not None and nearest <= trigger) or any(
-                math.hypot(x, y) <= self.stop_radius for x, y in pts)
+                abs(x) <= 0.305 + self.body_margin and abs(y) <= 0.185 + self.body_margin for x, y in pts)
             if hazard:
                 self.last_hazard = t
             self.terrain_stop = t - self.last_hazard < 1.0
             reason = None
             if hazard:
                 reason = (f'hazard {nearest:.2f} m ahead' if nearest is not None and nearest <= trigger
-                          else f'hazard within {self.stop_radius} m')
+                          else f'hazard within {self.body_margin} m of the body')
             self.telemetry.on_terrain(t, self.terrain_stop, reason if hazard else
                                       ('release hold' if self.terrain_stop else None),
                                       nearest, self.stop_ahead, (), 0.03)
@@ -490,7 +508,7 @@ class FakeNavRobot(FakeRobot):
         return {'ok': True, 'requested': [vx, 0.0, wz], 'max_velocity': [vx, 0.0, wz]}
 
     def set_stop_distance(self, ahead_m):
-        if ahead_m < 0.505:
+        if ahead_m < 0.355:
             return {'ok': False, 'reason': 'below floor'}
         self.stop_ahead = ahead_m
         return {'ok': True}
@@ -515,7 +533,11 @@ class FakeNavRobot(FakeRobot):
                 'result': self.goal_state['result'], 'recoveries': self.goal_state['recoveries'],
                 'spun_rad': self.goal_state.get('spun_rad')}
 
-    def nav_cancel(self):
+    def clear_costmaps(self):
+        self.costmap_clears = getattr(self, 'costmap_clears', 0) + 1
+        return ['/global_costmap/clear_entirely_global_costmap', '/local_costmap/clear_entirely_local_costmap']
+
+    def nav_cancel(self, timeout_s=3.0):
         if self.goal is not None or getattr(self, 'spin', None):
             self.goal = None
             self.spin = None
@@ -531,4 +553,7 @@ class FakeNavRobot(FakeRobot):
     def collision_boundary(self, polygon='PolygonStop'):
         if 'cm_missing' in self.faults:
             return None
-        return self.cm_boundary if polygon == 'PolygonStop' else self.cm_slow_boundary
+        return self.cm_boundary if polygon == 'PolygonStop' else None
+
+    def collision_approach_time(self):
+        return None if 'cm_missing' in self.faults else self.cm_approach_s

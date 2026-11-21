@@ -5,8 +5,6 @@ UNIVERSITY_WS="$HOME/ros2_ws"
 OPERATOR_DIR="$LITE3_WS/operator"
 LOG_ROOT="$LITE3_WS/log/operator"
 STATE_FILE="$LOG_ROOT/state.env"
-TEST4_PID_FILE="$LOG_ROOT/test4.pid"
-PHYSICAL_PID_FILE="$LOG_ROOT/physical.pid"
 export LITE3_STATE_FILE="$STATE_FILE"
 
 for f in /opt/ros/humble/setup.bash "$UNIVERSITY_WS/install/local_setup.bash" \

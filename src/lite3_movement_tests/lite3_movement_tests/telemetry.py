@@ -58,6 +58,8 @@ class TerrainSample:
     stop_ahead_m: float         # active proximity-stop distance, or None if not reported
     problems: tuple
     processing_s: float = None  # terrain_monitor processing time for this cloud
+    step_ahead_m: float = None  # nearest step (up or down) in the forward corridor, or None
+    step_rise_m: float = None   # its signed height: + up, - down (stair trigger, 2026-11-21)
 
 
 class Stream:
@@ -140,9 +142,9 @@ class Telemetry:
         self.system_cmd.add(stamp, TwistSample(vx, vy, wz))
 
     def on_terrain(self, stamp, stop, reason, obstacle_ahead_m, stop_ahead_m, problems,
-                   processing_s=None):
+                   processing_s=None, step_ahead_m=None, step_rise_m=None):
         self.terrain.add(stamp, TerrainSample(bool(stop), reason, obstacle_ahead_m, stop_ahead_m,
-                                              tuple(problems or ()), processing_s))
+                                              tuple(problems or ()), processing_s, step_ahead_m, step_rise_m))
 
     def on_clearance(self, stamp, value):
         self.clearance.add(stamp, value)
@@ -222,6 +224,17 @@ def assess_stationary(telemetry, now, window_s, criteria=StationaryCriteria()):
     detail = {k: (round(v, 5) if isinstance(v, float) else v) for k, v in detail.items()}
     detail['reasons'] = reasons
     return not reasons, detail
+
+
+def sustained_planar_overspeed(telemetry, now, limit, window_s=0.5):
+    """Reject sustained high velocity unless the existing rest check verifies a frozen estimate."""
+    odom = telemetry.odom.window(now, window_s)
+    if len(odom) < 5 or min(math.hypot(o.vx, o.vy) for _, o in odom) <= limit:
+        return False
+    if not odometry_frozen([o for _, o in odom]):
+        return True
+    still, detail = assess_stationary(telemetry, now, window_s)
+    return not (still and detail.get('odometry_frozen'))
 
 
 def wrap_angle(angle):

@@ -23,10 +23,16 @@ OUTPUT = Path(__file__).resolve().parents[1] / 'params' / 'nav2_lite3.yaml'
 SHARE_PLACEHOLDER = '__LITE3_LOCOMOTION_SHARE__'
 
 MAX_VX = 1.00     # hard ceiling (2026-11-18, was 0.50); every runner caps the session speed below it, verified
-MAX_WZ = 0.20
+MAX_WZ = 1.50     # manufacturer navigation-mode limit (Motion Host Communication Interface 1.2.12, 0x0141: [-1.5, 1.5] rad/s)
 # Perception reach for up to 1.0 m/s: the collision boundary can reach 3.0 m from the nose (3.3 m from
 # base_link), so costmaps must see beyond it.
 LOCAL_COSTMAP_SIZE_M = 8
+# Speed (2026-11-21): the robot walked ~0.2 m/s at a 0.5 m/s cap because MPPI's goal critic aims to arrive
+# at the end of its horizon (speed ~ distance / horizon on short walk goals) and samples speeds narrowly.
+# The vendor lite_nav2.yaml (Perception guide s8.3.3) is on the robot and was not readable here.
+MPPI_VX_STD = 0.2          # was 0.1 (university); 0.2 is the Nav2 MPPI default
+MPPI_TIME_STEPS = 40       # was 56 (2.8 s horizon at model_dt 0.05); 40 = 2.0 s
+CONTROLLER_FREQUENCY_HZ = 20.0   # was 30; = 1 / model_dt as Nav2 warns at startup
 SCAN_OBSTACLE_RANGE_M = 3.5
 SCAN_RAYTRACE_RANGE_M = 4.0
 
@@ -37,7 +43,8 @@ HAZARD_SOURCE = {
     'clearing': False,
     'min_obstacle_height': -2.0,   # drop-off cells sit at floor level, below odom z=0
     'max_obstacle_height': 2.0,
-    'obstacle_max_range': 4.0,     # was 3.0; terrain grid now reaches 4.0 m ahead
+    'obstacle_max_range': 1.0,     # was 1.5 (operator: smaller hazard cloud), 4.0 (2026-11-21 RViz: hazards to 4 m left lethal blobs all round
+                                   # the course that nothing clears; LiDAR scan + SLAM cover longer range)
     'obstacle_min_range': 0.0,
     'expected_update_rate': 0.5,   # costmap goes stale (controller stops) if terrain_monitor dies
 }
@@ -65,12 +72,14 @@ def patches():
         (mppi + 'vx_min', 0.0),
         (mppi + 'vy_max', 0.0),
         (mppi + 'wz_max', MAX_WZ),
-        (mppi + 'vx_std', 0.1),
-        (mppi + 'wz_std', 0.2),
+        (mppi + 'vx_std', MPPI_VX_STD),
+        (mppi + 'time_steps', MPPI_TIME_STEPS),
+        ('controller_server.ros__parameters.controller_frequency', CONTROLLER_FREQUENCY_HZ),
+        (mppi + 'wz_std', 0.4),            # Nav2 default; 0.2 barely explored turns once wz_max was 1.5
         (mppi + 'ax_max', 0.5),
         (mppi + 'ax_min', -0.5),
         (mppi + 'az_max', 0.5),
-        (mppi + 'prune_distance', 3.0),     # >= MPPI horizon at 1.0 m/s (56 x 0.05 s = 2.8 m)
+        (mppi + 'prune_distance', 3.0),     # >= MPPI horizon at 1.0 m/s (40 x 0.05 s = 2.0 m)
         ('local_costmap.local_costmap.ros__parameters.width', LOCAL_COSTMAP_SIZE_M),
         ('local_costmap.local_costmap.ros__parameters.height', LOCAL_COSTMAP_SIZE_M),
         ('velocity_smoother.ros__parameters.smoothing_frequency', 20.0),
@@ -107,6 +116,11 @@ def patches():
         # "cannot raytrace" (thousands of warnings in every launch.log since 2026-11-17), so it marks
         # but never clears, and stale obstacles (people walking past) stay in both costmaps for good.
         out.append((costmap + '.ros__parameters.voxel_layer.enabled', False))
+        # Course <= 1.5 m wide (operator 2026-11-20): a 1.0 m inflation covered the whole lane, so MPPI
+        # paid obstacle cost everywhere; 0.55 leaves the middle ~0.4 m cost-free, steeper fall-off.
+        # was 0.55 (operator 2026-11-21: course ~1.5 m wide, the inflation band hid the walkable path)
+        out.append((costmap + '.ros__parameters.inflation_layer.inflation_radius', 0.30))
+        out.append((costmap + '.ros__parameters.inflation_layer.cost_scaling_factor', 4.0))
         for layer in ('obstacle_layer', 'voxel_layer'):
             scan = costmap + '.ros__parameters.' + layer + '.scan.'
             out.append((scan + 'obstacle_max_range', SCAN_OBSTACLE_RANGE_M))

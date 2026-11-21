@@ -10,7 +10,7 @@ Outputs (new, read-only consumers): /lite3_terrain/grid (OccupancyGrid),
 as an extra Nav2 costmap observation source), /lite3_terrain/status (JSON), /lite3_terrain/stop (Bool) for a twist_mux lock:
 true when an obstacle/drop is within the proximity zone or inputs are invalid;
 held true for 1 s after clearing. If this node stops, the lock's timeout engages.
-ROS parameters stop_ahead_m / stop_radius_m (from base_link centre) may be raised at
+ROS parameters stop_ahead_m (from base_link centre) / body_margin_m (round the footprint) may be raised at
 runtime for a test, never below the validated defaults (terrain.STOP_LIMITS); the
 active values are reported in status.stop.
 The stop signal is a perception output; blocking motion is the mux's job.
@@ -52,6 +52,9 @@ def decode_xyz(msg):
     return xyz[np.isfinite(xyz).all(1) & (np.linalg.norm(xyz, axis=1) > 0.05)]
 
 
+DEPTH_MAX_AGE_S = 0.5      # depth points older than this are not fused
+
+
 def main(args=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--no-accumulate', action='store_true')
@@ -73,7 +76,7 @@ def main(args=None):
     node = Node('lite3_terrain_monitor')
     buffer = Buffer()
     TransformListener(buffer, node)
-    state = {'tilt': None, 'legs': None, 'busy': False, 'extrinsic': None}
+    state = {'tilt': None, 'legs': None, 'busy': False, 'extrinsic': None, 'depth': None}
     accumulator = None if options.no_accumulate else T.Accumulator()
     grid_pub = node.create_publisher(OccupancyGrid, '/lite3_terrain/grid', 1)
     hazard_pub = node.create_publisher(PointCloud2, '/lite3_terrain/hazards', 1)
@@ -84,6 +87,9 @@ def main(args=None):
     state['last_hazard'] = -math.inf
     for name in T.STOP_LIMITS:
         node.declare_parameter(name, getattr(state['stop_params'], name))
+    # Operator 2026-11-20 (docs-only stops): false = obstacles go to the Nav2 costmaps only, as in the
+    # vendor navigation; the lock then only engages on invalid/stale inputs (or if this node dies).
+    state['proximity_stop'] = bool(node.declare_parameter('proximity_stop', True).value)
 
     def on_parameters(parameters):
         """Proximity-stop distances: may be raised for a test, never below the validated default."""
@@ -94,9 +100,12 @@ def main(args=None):
                     params = T.updated_stop_params(params, p.name, p.value)
         except ValueError as error:
             return SetParametersResult(successful=False, reason=str(error))
+        for p in parameters:          # roam's stair routine switches it off only while on the stairs
+            if p.name == 'proximity_stop':
+                state['proximity_stop'] = bool(p.value)
         state['stop_params'] = params
         node.get_logger().info(f'proximity stop now ahead {params.stop_ahead_m} m, '
-                               f'radius {params.stop_radius_m} m')
+                               f'body margin {params.body_margin_m} m')
         return SetParametersResult(successful=True)
     node.add_on_set_parameters_callback(on_parameters)
 
@@ -141,6 +150,10 @@ def main(args=None):
             r, t = state['extrinsic']
             base, _ = T.to_level(decode_xyz(msg), r, t, 0.0, 0.0)
             base = base[T.self_filter(base, params)]
+            depth = state['depth']                  # RealSense near field (sensor_relay, already base_link)
+            if depth is not None and now - depth[0] <= DEPTH_MAX_AGE_S and len(depth[1]):
+                base = np.vstack([base, depth[1][T.self_filter(depth[1], params)]])
+                status['depth_points'] = int(len(depth[1]))
             status['points'] = int(len(base))
             status['accumulated'] = False
             if accumulator is not None:
@@ -193,6 +206,8 @@ def main(args=None):
             if not node.context.ok():   # shutting down: nothing may be published any more
                 state['busy'] = False
                 return
+            if not state['proximity_stop']:
+                hazard = (False, None)          # obstacles: costmaps only (docs-only stops)
             if status['problems']:
                 hazard = (True, 'inputs invalid: ' + '; '.join(status['problems']))
             now = time.monotonic()
@@ -203,7 +218,8 @@ def main(args=None):
             status['stop'] = {'active': stop, 'reason': hazard[1] if hazard[0] else
                               ('release hold' if stop else None),
                               'ahead_m': stop_params.stop_ahead_m,
-                              'radius_m': stop_params.stop_radius_m}
+                              'body_margin_m': stop_params.body_margin_m,
+                              'proximity_stop': state['proximity_stop']}
             stop_pub.publish(Bool(data=stop))
             status['processing_s'] = round(time.monotonic() - started, 3)
             status_pub.publish(String(data=json.dumps(status)))
@@ -212,6 +228,11 @@ def main(args=None):
     node.create_subscription(Imu, '/imu/data', on_imu, qos_profile_sensor_data)
     node.create_subscription(JointState, '/joint_states', on_joints, qos_profile_sensor_data)
     node.create_subscription(PointCloud2, '/livox/points', on_cloud, qos_profile_sensor_data)
+
+    def on_depth(msg):
+        if msg.header.frame_id == 'base_link':
+            state['depth'] = (time.monotonic(), decode_xyz(msg))
+    node.create_subscription(PointCloud2, '/lite3/depth_points', on_depth, 2)
     from rclpy.executors import ExternalShutdownException
     try:
         rclpy.spin(node)

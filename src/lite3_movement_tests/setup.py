@@ -15,12 +15,7 @@ setup(
     zip_safe=True,
     maintainer='Lite3 workspace developer',
     maintainer_email='user@example.invalid',
-    description='Telemetry-verified, bounded Lite3 movement test sequences.',
+    description='Lite3 autonomous roaming (M10) with its readiness checks and simulator.',
     license='Apache-2.0',
-    entry_points={
-        'console_scripts': [
-            'movement_test = lite3_movement_tests.cli:main',
-            'movement_test_sim = lite3_movement_tests.sim_node:main',
-        ],
-    },
+    entry_points={'console_scripts': []},   # roaming runs via python3 -m lite3_movement_tests.roam
 )

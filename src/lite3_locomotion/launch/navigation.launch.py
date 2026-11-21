@@ -40,6 +40,8 @@ LIDAR_SOURCE, LIDAR_DIRECT = '/livox/lidar', '/lite3/livox_lidar'      # sensor_
 POINTS_SOURCE, POINTS_DIRECT = '/livox/points', '/lite3/livox_points'
 
 
+TERRAIN_MAX_STEP_M = 0.40   # was 0.30, 0.18; = lite3_locomotion.terrain.TerrainParams.max_step_m default
+
 def _setup(context):
     share = get_package_share_directory('lite3_locomotion')
     university = get_package_share_directory('lite3_launcher')
@@ -47,6 +49,12 @@ def _setup(context):
     allow = LaunchConfiguration('allow_robot_motion').perform(context).lower() == 'true'
     if output != DRY_OUTPUT and not allow:
         raise RuntimeError(f'mux_output={output} requires allow_robot_motion:=true')
+    # Competition rule: live autonomous mapping only. slam:=False would make the university launch load a
+    # saved map with AMCL (lite3_navigation.launch.py), so it is refused unless explicitly allowed.
+    if LaunchConfiguration('slam').perform(context).lower() != 'true' and \
+            LaunchConfiguration('allow_saved_map').perform(context).lower() != 'true':
+        raise RuntimeError('slam:=False uses a pre-built map (not allowed in the competition); '
+                           'pass allow_saved_map:=true only outside the competition')
     if allow and output != '/cmd_vel':
         raise RuntimeError('allow_robot_motion:=true is only meaningful with mux_output:=/cmd_vel')
     text = open(os.path.join(share, 'params', 'nav2_lite3.yaml')).read()
@@ -60,12 +68,17 @@ def _setup(context):
     tier = CP.tiers(float(LaunchConfiguration('clearance').perform(context)),
                     float(LaunchConfiguration('max_speed').perform(context)), cal)
     bound = tier['stop']
-    cm_params = CP.collision_monitor_params(
-        bound['boundary_m'], MUX_OUT, output,
-        tier['slow']['boundary_m'] if tier['slow'] else None, tier['slowdown_ratio'])
-    if tier['slow']:
-        print(f'[lite3] collision_monitor SLOWDOWN polygon {tier["slow"]["boundary_m"]} m from the nose, '
-              f'ratio {tier["slowdown_ratio"]} (-> <= {CP.SLOW_TIER_SPEED_M_S} m/s near obstacles)', flush=True)
+    approach = tier['approach']['time_before_collision_s'] if tier['approach'] else None
+    docs_only = LaunchConfiguration('stop_layers').perform(context) == 'docs'
+    if docs_only:
+        approach = None
+        print('[lite3] stop layers: DOCS (Perception Development Guide s8.2): obstacles are avoided by Nav2 '
+              'planning only; collision_monitor passes commands through, terrain proximity stop off. '
+              'The remote STOP button is the emergency stop.', flush=True)
+    cm_params = CP.collision_monitor_params(bound['boundary_m'], MUX_OUT, output, approach, docs_only=docs_only)
+    if approach:
+        print(f'[lite3] collision_monitor APPROACH: slows only when a collision along the current command is '
+              f'predicted within {approach} s (full speed otherwise; turning in place never slowed)', flush=True)
     handle, cm_file = tempfile.mkstemp(prefix='collision_monitor_lite3_', suffix='.yaml')
     with os.fdopen(handle, 'w') as stream:
         yaml.safe_dump(cm_params, stream)
@@ -76,14 +89,31 @@ def _setup(context):
                   os.path.join(share, 'params', 'twist_mux_locks.yaml')]
     if allow:   # dead-man lock + supervised test/stop inputs; see params/twist_mux_physical.yaml
         mux_params.append(os.path.join(share, 'params', 'twist_mux_physical.yaml'))
+    source = os.environ.get('LITE3_LIO_SOURCE', 'system')
+    if source not in ('system', 'local'):
+        raise ValueError('LITE3_LIO_SOURCE must be system or local')
+    if source == 'system':
+        bringup = GroupAction([
+            SetRemap(src='/fastlio/odometry', dst='/group8_lio/odometry'),
+            IncludeLaunchDescription(PythonLaunchDescriptionSource(
+                os.path.join(include, 'Base', 'odom_relay.launch.py'))),
+        ])
+    else:
+        bringup = GroupAction([
+            SetRemap(src=IMU_SOURCE, dst=IMU_DIRECT),
+            SetRemap(src=LIDAR_SOURCE, dst=LIDAR_DIRECT),
+            IncludeLaunchDescription(PythonLaunchDescriptionSource(os.path.join(include, 'lite3_bringup.launch.py'))),
+        ])
     return [
-        Node(package='lite3_locomotion', executable='sensor_relay', name='lite3_sensor_relay', output='screen'),
-        GroupAction([SetRemap(src=IMU_SOURCE, dst=IMU_DIRECT),     # scoped: only the bringup (Fast-LIO)
-                     SetRemap(src=LIDAR_SOURCE, dst=LIDAR_DIRECT),
-                     IncludeLaunchDescription(PythonLaunchDescriptionSource(
-                         os.path.join(include, 'lite3_bringup.launch.py')))]),
+        Node(package='lite3_locomotion', executable='sensor_relay', name='lite3_sensor_relay', output='screen',
+             additional_env={'LITE3_DEPTH_CAMERA': '1' if LaunchConfiguration('depth_camera').perform(context).lower()
+                             == 'true' else '0'}),
+        Node(package='lite3_livox_cloud', executable='livox_cloud', output='screen'),
+        bringup,
         Node(package='lite3_locomotion', executable='terrain_monitor', name='lite3_terrain_monitor',
-             output='screen', remappings=[('/joint_states', '/lite3/joint_states'),
+             output='screen', parameters=[{'proximity_stop': not docs_only}],
+             arguments=['--max-step', LaunchConfiguration('max_step').perform(context)],
+             remappings=[('/joint_states', '/lite3/joint_states'),
                                           ('/imu/data', '/lite3/imu_data'),
                                           (POINTS_SOURCE, POINTS_DIRECT)]),
         Node(package='twist_mux', executable='twist_mux', name='twist_mux', output='screen',
@@ -106,10 +136,18 @@ def generate_launch_description():
         DeclareLaunchArgument('mux_output', default_value=DRY_OUTPUT),
         DeclareLaunchArgument('allow_robot_motion', default_value='false'),
         DeclareLaunchArgument('slam', default_value='True'),
+        DeclareLaunchArgument('allow_saved_map', default_value='false'),
         DeclareLaunchArgument('clearance', default_value='0.15',
                               description='minimum obstacle clearance (m) the stop must leave'),
         DeclareLaunchArgument('max_speed', default_value='0.10',
                               description='fastest speed the boundary must cover (m/s, <= 0.5; validated to 0.10)'),
+        DeclareLaunchArgument('depth_camera', default_value='true',
+                              description='fuse the RealSense depth near field into the terrain monitor'),
+        DeclareLaunchArgument('max_step', default_value=str(TERRAIN_MAX_STEP_M),
+                              description='terrain: highest rise still walkable (m)'),
+        DeclareLaunchArgument('stop_layers', default_value='full', choices=['full', 'docs'],
+                              description='full: collision_monitor stop + terrain lock; docs: Nav2 '
+                                          'avoidance only (vendor navigation)'),
         DeclareLaunchArgument('calibration', default_value='',
                               description='operator calibration.json (measured latency/coast)'),
         OpaqueFunction(function=_setup),

@@ -177,7 +177,7 @@ class NavSteps(ProximityStopSteps):
         try:
             cal, measured = self._live_calibration({'path_latency_s': 0.10, 'coast_m': p['coast_m'],
                                                     'coast_speed_m_s': p['coast_speed_m_s'],
-                                                    'sensor_margin_m': 0.05})
+                                                    'sensor_margin_m': CP.DEFAULTS['sensor_margin_m']})
         except ValueError as error:          # e.g. sensing_age_s 2.66 s is outside the model's 0-2 s range
             detail['collision_boundary'] = {'error': str(error)}
             return [f'LIVE LiDAR sensing delay is beyond what the stopping boundary can cover ({error}): the '
@@ -204,16 +204,17 @@ class NavSteps(ProximityStopSteps):
             problems.append(f'collision stop boundary {actual} m < {need["required_m"]} m required NOW '
                             f'(live sensing delay {measured.get("sensing_age_p95_s")} s): restart navigation '
                             'so the boundary is recomputed')
-        if tier['slow']:            # above 0.10 m/s the slowdown polygon carries the full-speed stop
-            slow = self.robot.collision_boundary('PolygonSlow')
-            detail['collision_boundary'].update(slow_running_m=slow, slow_required_now=tier['slow']['required_m'])
-            if slow is None:
-                problems.append(f'collision_monitor slowdown polygon missing: the stack must have been started '
+        if tier['approach']:        # above 0.10 m/s the approach action brings the robot to <= 0.10 m/s
+            running = self.robot.collision_approach_time()
+            approach_need = tier['approach']['time_before_collision_s']
+            detail['collision_boundary'].update(approach_running_s=running,
+                                                approach_required_now_s=approach_need)
+            if running is None:
+                problems.append(f'collision_monitor approach action missing: the stack must have been started '
                                 f'with --max-speed {p["cm_max_speed_m_s"]} (restart navigation)')
-            elif slow + 1e-9 < tier['slow']['required_m']:
-                problems.append(f'collision slowdown boundary {slow} m < {tier["slow"]["required_m"]} m required '
-                                f'NOW for {p["cm_max_speed_m_s"]} m/s (live sensing delay '
-                                f'{measured.get("sensing_age_p95_s")} s): restart navigation')
+            elif running + 1e-9 < approach_need:
+                problems.append(f'collision approach time {running} s < {approach_need} s required NOW '
+                                f'(live sensing delay {measured.get("sensing_age_p95_s")} s): restart navigation')
         return problems
 
     def step_zero_delivery(self, step):

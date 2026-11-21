@@ -51,8 +51,8 @@ def test_low_step_is_step_and_high_riser_is_obstacle():
     assert low['nearest_step_m'] == pytest.approx(1.0, abs=0.05)
     assert low['nearest_obstacle_m'] is None
     assert low['max_rise_in_corridor_m'] == pytest.approx(0.07, abs=0.01)
-    stair = np.vstack([floor(x1=1.0), wall(1.0, -1, 1, FLOOR, FLOOR + 0.17),
-                       plane(1.0, 1.3, -1, 1, FLOOR + 0.17)])
+    stair = np.vstack([floor(x1=1.0), wall(1.0, -1, 1, FLOOR, FLOOR + 0.50),       # above the 0.40 limit
+                       plane(1.0, 1.3, -1, 1, FLOOR + 0.50)])
     assert summary(stair)['nearest_obstacle_m'] == pytest.approx(1.0, abs=0.05)
 
 
@@ -106,8 +106,8 @@ def test_lidar_extrinsic_and_tilt_map_floor_to_floor_height():
 
 
 def test_self_filter_removes_body_and_legs():
-    pts = np.array([[0.1, 0.0, -0.2], [0.35, 0.2, -0.3], [0.6, 0.0, -0.3]])
-    assert T.self_filter(pts, P).tolist() == [False, False, True]
+    pts = np.array([[0.1, 0.0, -0.2], [0.30, 0.2, -0.3], [0.6, 0.0, -0.3], [0.33, 0.0, 0.1]])
+    assert T.self_filter(pts, P).tolist() == [False, False, True, True]   # front edge 0.32 (measured)
 
 
 def test_occupancy_and_hazard_output():
@@ -153,16 +153,19 @@ def test_terrain_monitor_has_no_command_interfaces():
 
 
 def test_proximity_stop_ahead_and_around_but_not_far():
-    near_wall = np.vstack([floor(x1=0.45), wall(0.45, -1, 1, FLOOR, FLOOR + 1.0)])   # nose + 0.145 m
+    near_wall = np.vstack([floor(x1=0.35), wall(0.35, -1, 1, FLOOR, FLOOR + 1.0)])   # nose + 0.045 m
     stop, reason = T.proximity_stop(grid_of(near_wall))
     assert stop and 'ahead' in reason
     far_wall = np.vstack([floor(x1=1.5), wall(1.5, -1, 1, FLOOR, FLOOR + 1.0)])
     assert T.proximity_stop(grid_of(far_wall)) == (False, None)
-    side = np.vstack([floor(), wall(0.0, 0.33, 0.40, FLOOR, FLOOR + 1.0)])
-    side = np.vstack([side, np.array([[0.05, 0.36, FLOOR + 0.5]] * 5)])
+    # Beside the body: within 5 cm of the footprint side (y 0.185) stops, 0.36 m out (17 cm away) does not
+    # (operator 2026-11-20, course <= 1.5 m wide; was a 0.40 m circle round the centre).
+    side = np.vstack([floor(), np.array([[-0.10, 0.22, FLOOR + 0.5]] * 5)])
     stop, reason = T.proximity_stop(grid_of(side))
     assert stop and 'within' in reason
-    drop = np.vstack([floor(x1=0.40), plane(0.45, 2.9, -1, 1, FLOOR - 0.4)])
+    wide = np.vstack([floor(), np.array([[-0.10, 0.36, FLOOR + 0.5]] * 5)])
+    assert T.proximity_stop(grid_of(wide)) == (False, None)
+    drop = np.vstack([floor(x1=0.30), plane(0.35, 2.9, -1, 1, FLOOR - 0.4)])
     assert T.proximity_stop(grid_of(drop))[0]
 
 
@@ -170,9 +173,54 @@ def test_stop_distance_can_be_raised_but_never_reduced():
     from lite3_locomotion.terrain import STOP_LIMITS, StopParams, updated_stop_params
     base = StopParams()
     assert updated_stop_params(base, 'stop_ahead_m', 0.705).stop_ahead_m == 0.705
-    for bad in (0.50, -1.0, float('nan'), 5.0, True):
+    for bad in (0.35, -1.0, float('nan'), 5.0, True):
         with pytest.raises(ValueError):
             updated_stop_params(base, 'stop_ahead_m', bad)
     with pytest.raises(ValueError):
         updated_stop_params(base, 'release_hold_s', 0.0)
-    assert STOP_LIMITS['stop_ahead_m'][0] == base.stop_ahead_m
+    assert STOP_LIMITS['stop_ahead_m'][0] == 0.355       # roaming's 5 cm floor; default stays 0.505
+
+
+def test_step_limit_suits_stairs_and_rubble_and_launch_default_matches():
+    """2026-11-21: 5 cm competition stairs and rubble are steps, not obstacles; configurable per run."""
+    import re
+    from pathlib import Path
+    assert T.TerrainParams().max_step_m == 0.40           # course lips 0.10-0.15 m, two stacked (12:33 run)
+    launch = (Path(__file__).resolve().parents[1] / 'launch' / 'navigation.launch.py').read_text()
+    assert float(re.search(r'TERRAIN_MAX_STEP_M = ([0-9.]+)', launch).group(1)) == T.TerrainParams().max_step_m
+    assert "arguments=['--max-step'" in launch
+
+
+def test_course_ledge_lip_is_a_step_with_its_signed_rise():
+    """Course ledge (operator 2026-11-21): lip ~0.10-0.12 m up, and the same drop coming off it."""
+    params = T.TerrainParams()
+    up = np.vstack([floor(x1=0.9), plane(0.9, 2.5, -1, 1, FLOOR + 0.11)])
+    s = T.corridor_summary(grid_of(up), params)
+    assert s['nearest_obstacle_m'] is None and s['nearest_step_m'] is not None
+    assert 0.09 <= s['nearest_step_rise_m'] <= 0.13
+    down = np.vstack([floor(x1=1.6), plane(1.6, 2.2, -1, 1, FLOOR - 0.11)])   # standing floor is the larger area
+    s = T.corridor_summary(grid_of(down), params)
+    assert s['nearest_drop_m'] is None and -0.13 <= s['nearest_step_rise_m'] <= -0.09
+
+
+def test_wall_base_seen_from_above_is_not_a_step():
+    """Physical 2026-11-21: a wall 0.5 m ahead; the depth camera saw its foot (0.13 m) first -> false stair trigger."""
+    scene = np.vstack([floor(x1=0.47), plane(0.47, 0.52, -1, 1, FLOOR + 0.12), wall(0.55, -1, 1, FLOOR, FLOOR + 0.6)])
+    s = T.corridor_summary(grid_of(scene), T.TerrainParams())
+    assert s['nearest_obstacle_m'] is not None and s['nearest_step_rise_m'] is None
+
+
+def test_stacked_lips_are_steps_but_walls_stay_obstacles():
+    """Course 2026-11-21: tiers of 0.12 m lips (0.24 m above the start floor) are walkable; a wall is not."""
+    tiers = np.vstack([floor(x1=0.9), plane(0.9, 1.4, -1, 1, FLOOR + 0.12), plane(1.4, 2.0, -1, 1, FLOOR + 0.24)])
+    s = T.corridor_summary(grid_of(tiers), T.TerrainParams())
+    assert s['nearest_obstacle_m'] is None and 0.09 <= s['nearest_step_rise_m'] <= 0.14
+    scene = np.vstack([floor(x1=1.5), wall(1.5, -1, 1, FLOOR, FLOOR + 0.6)])
+    assert T.corridor_summary(grid_of(scene), T.TerrainParams())['nearest_obstacle_m'] is not None
+
+
+def test_two_stacked_course_lips_are_steps_not_a_wall():
+    """Course 2026-11-21 12:33: lips 0.12 + 0.12 ahead were marked as a wall and boxed the robot in."""
+    terrace = np.vstack([floor(x1=0.6), plane(0.6, 1.0, -1, 1, FLOOR + 0.12), plane(1.0, 2.5, -1, 1, FLOOR + 0.24)])
+    s = T.corridor_summary(grid_of(terrace), T.TerrainParams())
+    assert s['nearest_obstacle_m'] is None and s['nearest_step_m'] is not None

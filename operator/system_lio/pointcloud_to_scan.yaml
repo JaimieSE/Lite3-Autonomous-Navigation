@@ -1,0 +1,18 @@
+# pointcloud_to_laserscan: flatten the Mid-360 cloud into /scan for Nav2.
+# The cloud is transformed into target_frame first, so the 15 deg LiDAR
+# pitch is removed and min/max_height are heights relative to base_link.
+
+pointcloud_to_laserscan:
+  ros__parameters:
+    target_frame: base_link
+    transform_tolerance: 0.05
+    min_height: 0.1         # TODO: tune to the base_link height above ground so the floor is excluded
+    max_height: 0.5
+    angle_min: -3.14159
+    angle_max: 3.14159
+    angle_increment: 0.0087   # 0.5 deg
+    scan_time: 0.1            # Mid-360 at 10 Hz
+    range_min: 0.4            # drop hits on the robot body and legs
+    range_max: 20.0
+    use_inf: true
+    inf_epsilon: 1.0

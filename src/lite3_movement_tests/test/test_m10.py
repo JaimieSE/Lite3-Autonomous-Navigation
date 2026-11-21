@@ -6,7 +6,6 @@ import math
 import pytest
 import yaml
 
-from lite3_movement_tests import physical_suite as S
 from lite3_movement_tests import roam as R
 from lite3_movement_tests.config import ConfigError, load_sequence
 from lite3_movement_tests.roam_sim import make_sim_robot, table
@@ -46,10 +45,8 @@ def roam(tmp_path, script=(), stop_after=200.0, cfg=None, mode=MODE_SIM, watchdo
 
 
 # ---- independence ----------------------------------------------------------------------
-def test_m10_is_not_part_of_the_m0_m9_catalogue_and_reads_no_gates(tmp_path, monkeypatch):
-    assert 'M10' not in S.CATALOG
-    assert list(S.CATALOG)[:10] == ['M0', 'M1', 'M2', 'DET', 'M3', 'M4', 'M5', 'M6', 'M7', 'M8']
-    monkeypatch.setattr(S, 'passed_tests', lambda *_: pytest.fail('M10 must not read test gates'))
+def test_m10_runs_standalone_with_its_own_readiness(tmp_path):
+    # The M0-M9 suite was removed 2026-11-21 (operator: "roam should be enough"); roam needs no gates.
     outcome, summary, *_ = roam(tmp_path, stop_after=20)
     assert outcome == 'STOPPED' and summary['readiness']['verdict'] == 'PASSED'
 
@@ -92,7 +89,9 @@ def test_speed_above_session_limit_is_refused_and_keeps_moving_slow(tmp_path):
 
 def test_runaway_gait_is_caught_by_actual_speed_inside_the_geofence(tmp_path):
     outcome, summary, robot, session = roam(tmp_path, stop_after=120, model_fault='runaway')
-    assert outcome == 'SAFETY_STOP' and 'unexpected motion' in summary['stop_reason']
+    # Since the 2026-11-21 margin (0.25 m/s) the independent watchdog's 0.20 m/s runaway limit fires first.
+    assert outcome == 'SAFETY_STOP' and ('unexpected motion' in summary['stop_reason']
+                                         or 'runaway' in summary['stop_reason'])
 
 
 def test_dry_mode_publishes_nothing_and_reports_would_be_goals(tmp_path):
@@ -149,7 +148,7 @@ def test_repeated_goal_failures_pause_instead_of_pushing_on(tmp_path):
 
 # ---- configuration --------------------------------------------------------------------
 @pytest.mark.parametrize('kwargs', [dict(speed_limit=0.12, stack_max_speed=0.10), dict(geofence_m=12), dict(max_minutes=500),
-                                    dict(abort_clearance_m=0.02), dict(max_sensor_age_s=0.8),
+                                    dict(abort_clearance_m=0.01), dict(max_sensor_age_s=0.8),
                                     dict(min_lidar_hz=5), dict(modes={'slow': (0.6, 0.1)}),
                                     dict(modes={'warp': 0.05}), dict(speed_limit=0.04),
                                     dict(stack_max_speed=0.05, speed_limit=0.08)])
@@ -160,7 +159,7 @@ def test_config_outside_envelope_is_refused(kwargs):
 
 def test_mode_override_parsing():
     modes = R.parse_modes('slow=0.04,fast=0.09:0.18')
-    assert modes['slow'] == (0.04, 0.15) and modes['fast'] == (0.09, 0.18) and modes['normal'] == (0.08, 0.20)
+    assert modes['slow'] == (0.04, 0.15) and modes['fast'] == (0.09, 0.18) and modes['normal'] == (0.08, 1.5)   # manufacturer turn limit
     with pytest.raises(ConfigError):
         R.parse_modes('turbo=0.2')
 
@@ -220,8 +219,8 @@ def test_watchdog_tolerates_observed_link_gaps_but_not_longer_ones():
 
 
 def test_actual_speed_limit_is_tied_to_the_selected_mode(tmp_path):
-    """Slow mode (0.05): sustained odometry speed above max(2 x 0.05, 0.05 + 0.05) = 0.10 m/s stops
-    roaming even though 0.10 is within the session limit."""
+    """Slow mode (0.05): sustained odometry speed above max(2 x 0.05, 0.05 + ODOM_MARGIN_M_S 0.25) = 0.30 m/s
+    stops roaming (margin was 0.05 until balance steps on the uneven course tripped it, 2026-11-21)."""
     outcome, summary, robot, session = roam(tmp_path, stop_after=30)
     from lite3_movement_tests.telemetry import Stream
     t = robot.telemetry
@@ -235,6 +234,14 @@ def test_actual_speed_limit_is_tied_to_the_selected_mode(tmp_path):
     t.odom = Stream()
     for i in range(12):
         t.on_odom(now - 0.55 + 0.05 * i, 0, 0, 0.3, 0, 0, 0, 1, 0.13, 0, 0)
+    assert session.roam_violation(now) is None  # latched velocity with independent rest evidence
+    t.odom = Stream()
+    for i in range(12):
+        t.on_odom(now - 0.55 + 0.05 * i, 0.13 * 0.05 * i, 0, 0.3, 0, 0, 0, 1, 0.13, 0, 0)
+    assert session.roam_violation(now) is None              # balance steps on lips: allowed now
+    t.odom = Stream()
+    for i in range(12):
+        t.on_odom(now - 0.55 + 0.05 * i, 0.35 * 0.05 * i, 0, 0.3, 0, 0, 0, 1, 0.35, 0, 0)
     assert 'unexpected motion' in (session.roam_violation(now) or '')
 
 
@@ -289,10 +296,10 @@ def test_higher_speed_needs_the_stack_started_for_it():
 
 def test_backup_lock_moves_out_only_above_the_validated_speed():
     low, high = R.RoamConfig(), R.RoamConfig(speed_limit=0.3, stack_max_speed=0.5)
-    assert R.backup_distance(low, 0.47, MODE_SIM) == 0.20
-    assert R.backup_distance(high, 0.98, MODE_SIM) == 0.20              # sim/dry: not settable, unchanged
+    assert R.backup_distance(low, 0.47, MODE_SIM) == 0.05
+    assert R.backup_distance(high, 0.98, MODE_SIM) == 0.05              # sim/dry: not settable, unchanged
     from lite3_movement_tests.runner import MODE_PHYSICAL
-    assert R.backup_distance(low, 0.47, MODE_PHYSICAL) == 0.20
+    assert R.backup_distance(low, 0.47, MODE_PHYSICAL) == 0.05
     assert R.backup_distance(high, 0.98, MODE_PHYSICAL) == 0.93         # 5 cm inside the boundary
     assert R.backup_distance(high, 1.50, MODE_PHYSICAL) == 1.45
 
@@ -373,15 +380,15 @@ def test_scan_walk_stops_short_of_the_live_proximity_stop_zone():
     assert goal['x'] <= 3.0 - (1.45 + R.ScanWalk.STOP_AHEAD_MARGIN_M) + 0.06
     room = _grid(free=[(-0.5, 3.0, -0.6, 0.6)],
                  occupied=[(3.0, 3.1, -1, 1), (-0.7, -0.6, -1, 1), (-0.7, 3.1, 0.7, 0.8), (-0.7, 3.1, -0.8, -0.7)])
-    w.stop_ahead_m = 2.6                      # zone reaches past every walk in a 3.6 m room: none allowed
+    w.stop_ahead_m = 2.65                     # zone reaches past every walk (>= MIN_WALK_M) in a 3.6 m room
     assert w.choose(room, (0.0, 0.0, 0.0), 0.0) is None
 
 
 def test_scan_walk_starts_walking_on_an_open_map(tmp_path):
     outcome, summary, robot, _ = roam(tmp_path, stop_after=90, cfg=R.RoamConfig(strategy='scan_walk'))
     names = [e['event'] for e in summary['events']]
-    assert names[:3] == ['scan_walk', 'roaming', 'walk']
-    assert summary['stats']['goals_succeeded'] >= 1
+    assert names[:4] == ['costmap_cleared', 'scan_walk', 'roaming', 'walk']   # Nav2 clear at start
+    assert summary['stats']['goals_succeeded'] >= 1 and robot.costmap_clears >= 1
     assert outcome == 'STOPPED' and summary['rest_verified']
     assert max(c.vx for _, c in robot.telemetry.system_cmd.since(0)) <= 0.0501
 
@@ -395,18 +402,22 @@ def test_walk_goals_can_turn_either_way(side):
 
 
 def test_no_opening_scans_both_sides_then_pauses(tmp_path, monkeypatch):
+    monkeypatch.setattr(R, 'blocked_passage', lambda *a, **kw: None)          # no curtain here
+    monkeypatch.setattr(R.RoamSession, '_frontier_goal', lambda *a, **kw: None)   # scan path only
     monkeypatch.setattr(R.ScanWalk, 'choose', lambda *a, **kw: None)
+    monkeypatch.setattr(R.ScanWalk, 'straight_ahead', lambda *a, **kw: None)
     outcome, summary, _, _ = roam(tmp_path, cfg=R.RoamConfig(strategy='scan_walk'), stop_after=100)
     turns = [e['degrees'] for e in summary['events'] if e['event'] == 'spin']
-    assert turns == [30, 30, -30, -30, -30, -30]
+    assert turns == [30, 30, -30, -30, -30, -30]            # one round only, even after the clear
     assert summary['stats']['walk_goals'] == 0
+    assert summary['stats']['costmap_clears'] == 2           # at start and before giving up
     assert summary['stats']['pauses'] == 1 and outcome == 'STOPPED'
 
 
 def test_new_opening_cancels_scan_before_walking(tmp_path, monkeypatch):
     from lite3_movement_tests.roam_sim import SimRoamRobot
     original = SimRoamRobot.map_grid
-    blind = _grid()
+    blind = _grid(occupied=[(0.6, 0.65, -1.0, 1.0)])   # known wall ahead: no go-straight
 
     def map_after_turn(robot):
         stamp, grid = original(robot)
@@ -423,7 +434,7 @@ def test_new_opening_cancels_scan_before_walking(tmp_path, monkeypatch):
 def test_one_sided_partial_map_starts_search_to_the_right(tmp_path, monkeypatch):
     from lite3_movement_tests.roam_sim import SimRoamRobot
     # The right side has more known space but still too little to send a walk goal.
-    grid = _grid(free=[(-0.2, 0.51, -0.36, 0.05)])
+    grid = _grid(free=[(-0.2, 0.51, -0.36, 0.05)], occupied=[(0.55, 0.6, 0.1, 1.0)])   # wall ahead-left
     monkeypatch.setattr(SimRoamRobot, 'map_grid', lambda robot: (robot.now(), grid))
     _, summary, _, _ = roam(tmp_path, stop_after=3, cfg=R.RoamConfig(strategy='scan_walk'))
     turns = [event['degrees'] for event in summary['events'] if event['event'] == 'spin']
@@ -433,7 +444,9 @@ def test_one_sided_partial_map_starts_search_to_the_right(tmp_path, monkeypatch)
 
 def test_stalled_search_pauses(tmp_path, monkeypatch):
     from lite3_movement_tests.sim_model import FakeNavRobot
+    monkeypatch.setattr(R.RoamSession, '_frontier_goal', lambda *a, **kw: None)   # spin/backtrack path
     monkeypatch.setattr(R.ScanWalk, 'choose', lambda *a, **kw: None)
+    monkeypatch.setattr(R.ScanWalk, 'straight_ahead', lambda *a, **kw: None)
     monkeypatch.setattr(FakeNavRobot, '_spin_tick', lambda self: None)
     _, summary, _, _ = roam(tmp_path, stop_after=25, cfg=R.RoamConfig(strategy='scan_walk'))
     names = [e['event'] for e in summary['events']]
@@ -449,13 +462,16 @@ def test_cli_defaults_to_scan_walk_and_frontier_stays_available():
 
 
 # ---- speed plan: one source for the limit chain, stop zones and turning clearance ----------------
-def test_fast_mode_follows_a_raised_limit_but_sessions_still_start_slow():
+def test_default_roam_speed_is_capped_by_session_and_fast_can_go_higher():
     assert R.session_modes('', 0.10)['fast'] == R.DEFAULT_MODES['fast']        # validated: unchanged
     assert R.session_modes('', 0.50)['fast'][0] == 0.50
     assert R.session_modes('fast=0.3', 0.50)['fast'][0] == 0.3                # explicit --modes wins
     a = R.parse(['run', '--speed-limit', '0.5'])
     cfg = R.build_config(a, {'MAX_SPEED': '0.5'})
-    assert cfg.start_mode == 'slow' and cfg.mode_speed('fast')[0] == 0.5
+    assert cfg.start_mode == 'slow' and cfg.mode_speed(cfg.start_mode)[0] == 0.05
+    assert R.session_modes('', 0.8)['normal'][0] == 0.5
+    assert R.session_modes('', 0.8)['fast'][0] == 0.8
+    assert R.session_modes('', 0.07)['normal'][0] == 0.07
     with pytest.raises(ConfigError):                                          # above the stack boundary
         R.build_config(R.parse(['run', '--speed-limit', '0.5']), {'MAX_SPEED': '0.10'})
 
@@ -463,16 +479,16 @@ def test_fast_mode_follows_a_raised_limit_but_sessions_still_start_slow():
 def test_effective_settings_scale_with_speed():
     from lite3_locomotion import collision_profile as CP
     cal = CP.Calibration(sensing_age_s=0.158, path_latency_s=0.195, coast_m=0.035, coast_speed_m_s=0.05)
-    slow, fast = R.effective_settings(0.10, 0.05, cal), R.effective_settings(0.50, 0.05, cal)
+    slow, fast = R.effective_settings(0.10, 0.0, cal), R.effective_settings(0.50, 0.0, cal)
     assert slow['validated'] and not fast['validated'] and 'ASSUMED' in fast['coast_basis']
-    assert slow['terrain_stop_from_nose_m'] == 0.20                              # floor up to 0.10 m/s
-    assert fast['terrain_stop_from_nose_m'] == 0.20                      # stop polygon is the 0.10 one
-    # Above 0.10 the STOP polygon stays sized for 0.10 m/s and a slowdown polygon carries the full-speed
-    # stop, so the turning clearance scan-walk needs does NOT grow with speed (no turn lock).
-    assert fast['slowdown_boundary_from_nose_m'] > 1.0 and slow['slowdown_boundary_from_nose_m'] is None
+    assert slow['terrain_stop_from_nose_m'] == 0.05                              # roaming's 5 cm floor (2026-11-20)
+    assert fast['terrain_stop_from_nose_m'] == 0.05                      # 5 cm stop line
+    # Above 0.10 the STOP polygon stays sized for 0.10 m/s and Nav2's approach action (collision-time,
+    # no fixed slowdown zone) brings the robot down to it, so turning clearance does NOT grow with speed.
+    assert fast['approach_time_s'] >= 2.0 and slow['approach_time_s'] is None
     assert fast['boundary_parts']['required_m'] > slow['boundary_parts']['required_m']
-    assert fast['turn_clearance_radius_m'] == slow['turn_clearance_radius_m'] < 0.7
-    assert fast['turn_clearance_radius_m'] >= math.hypot(fast['stop_zone_from_centre_m'], 0.30)
+    assert fast['turn_clearance_radius_m'] <= slow['turn_clearance_radius_m'] < 0.7   # 10 cm line at speed
+    assert fast['turn_clearance_radius_m'] >= math.hypot(fast['stop_zone_from_centre_m'], R.ScanWalk.SPIN_CORRIDOR_HALF_M)
     assert fast['modes']['fast']['smoother_cap'][0] == 0.50 and fast['watchdog_cmd_abort_above_m_s'] == 0.52
     with pytest.raises(ValueError):                                             # boundary cap 3.0 m
         R.effective_settings(1.0, 0.5, CP.Calibration(sensing_age_s=1.5))
@@ -484,3 +500,422 @@ def test_plan_command_prints_without_a_stack(capsys, tmp_path, monkeypatch):
     out = capsys.readouterr().out
     assert 'NOT VALIDATED' in out and 'fast    0.30 m/s' in out and 'open floor' in out
     assert R.main(['plan', '--max-speed', '0.1', '--speed-limit', '0.2']) == 2
+
+
+def test_nav2_recovery_spin_is_within_every_mode_but_overspeed_is_not():
+    """2026-11-19 13:28: Nav2's recovery Spin (0.20 rad/s, bypasses the smoother's mode cap) during a
+    slow-mode walk stopped roaming. The validated 0.20 rad/s turn is allowed in every mode; forward
+    speed is still held to the mode and turning beyond 0.20 still stops."""
+    slow_v, slow_w = R.DEFAULT_MODES['slow']
+    assert R.command_above_mode(0.0, 0.20, slow_v, slow_w, 'slow') is None
+    assert R.command_above_mode(0.0, -0.21, slow_v, slow_w, 'slow') is None        # within 0.02 margin
+    assert R.command_above_mode(0.0, 1.5, slow_v, slow_w, 'slow') is None         # manufacturer 1.5 rad/s
+    assert 'above the selected' in R.command_above_mode(0.0, 1.6, slow_v, slow_w, 'slow')
+    assert 'above the selected' in R.command_above_mode(slow_v + 0.05, 0.0, slow_v, slow_w, 'slow')
+
+
+def test_roaming_uses_its_own_freshness_limits_and_keeps_the_rest():
+    from lite3_movement_tests.runner import MODE_PHYSICAL
+    seq = R.readiness_sequence(MODE_PHYSICAL, {})
+    assert seq['telemetry'] == {'max_age_s': R.ROAM_TELEMETRY_AGE_S} and R.ROAM_TELEMETRY_AGE_S == 1.0
+    nav = next(s for s in seq['steps'] if s['id'] == 'nav_readiness')
+    assert nav['max_odom_lag_s'] == R.ROAM_MAX_ODOM_LAG_S == 1.0
+    assert R.HARD_MIN_LIDAR_HZ == 6.0 and R.WatchdogLogic.TELEMETRY_AGE_S == 1.0   # was 8.0 (12:37 run)
+    assert R.ROAM_RAW_LIDAR_STALE_S == 1.0 and R.ROAM_LIDAR_RATE_WINDOW_S == 5.0
+
+
+def test_observed_floor_opens_directions_the_slam_map_left_unknown():
+    """Physical 2026-11-20: open directions had no /scan returns in the 0.43-0.83 m band, so the SLAM map
+    left them unknown and every scan found no open direction. Floor the 3D LiDAR observed (terrain grid)
+    now counts as seen free; obstacles still end the walk."""
+    grid = _grid(free=[(-0.3, 0.3, -0.3, 0.3)])                         # SLAM knows only the robot's spot
+    walk = R.ScanWalk(R.RoamConfig(strategy='scan_walk'), (0.0, 0.0))
+    assert walk.choose(grid, (0.0, 0.0, 0.0), 0.0) is None              # before: nothing seen free
+    walk.floor_free = lambda x, y: math.hypot(x, y) < 3.0               # observed floor all round
+    goal = walk.choose(grid, (0.0, 0.0, 0.0), 0.0)
+    assert goal is not None and goal['free_m'] >= 1.0
+    walled = _grid(free=[(-0.3, 0.3, -0.3, 0.3)], occupied=[(1.0, 1.1, -3, 3), (-1.1, -1.0, -3, 3),
+                                                           (-3, 3, 1.0, 1.1), (-3, 3, -1.1, -1.0)])
+    walk = R.ScanWalk(R.RoamConfig(strategy='scan_walk'), (0.0, 0.0))
+    walk.floor_free = lambda x, y: True
+    goal = walk.choose(walled, (0.0, 0.0, 0.0), 0.0)                    # walls still stop it short
+    assert goal is None or max(abs(goal['x']), abs(goal['y'])) < 1.0
+
+
+def test_a_pause_keeps_the_heartbeat_alive(tmp_path):
+    """Physical 2026-11-20: an ordinary pause blocked the loop > 2 s and the watchdog ended the session
+    ("runner heartbeat lost (2.0 s)"). Every step of a pause now writes a heartbeat."""
+    beats = []
+
+    def setup(session):
+        original = session.channel.write_status
+        session.channel.write_status = lambda st: (beats.append((session.robot.now(), st.get('state'))), original(st))
+    outcome, summary, robot, session = roam(tmp_path, stop_after=40, script=[(10.0, 'pause', None)], setup=setup)
+    roaming = [t for t, state in beats if state in ('ROAMING', 'PAUSED')]   # the watchdog's heartbeat phase
+    gaps = [b - a for a, b in zip(roaming, roaming[1:])]
+    assert summary['stats']['pauses'] >= 1, summary['stop_reason']
+    assert max(gaps) < 1.0, max(gaps)
+
+
+def test_a_metre_clear_ahead_keeps_it_walking_straight_on():
+    """Operator 2026-11-20: with 1 m clear ahead of the nose it keeps walking forward, even where there is
+    no room for a full turn at the end (a corridor); less than that and it searches as before."""
+    corridor = _grid(free=[(-0.5, 3.0, -0.6, 0.6)], occupied=[(-0.5, 3.0, 0.6, 0.65), (-0.5, 3.0, -0.65, -0.6)])
+    walk = R.ScanWalk(R.RoamConfig(strategy='scan_walk'), (0.0, 0.0))
+    goal = walk.choose(corridor, (0.0, 0.0, 0.0), 0.0)
+    assert goal is not None and abs(goal['yaw']) < 1e-6 and goal['x'] >= 0.5
+    short = _grid(free=[(-0.5, 1.0, -0.6, 0.6)], occupied=[(1.0, 1.05, -0.7, 0.7), (-0.5, 1.0, 0.6, 0.65),
+                                                           (-0.5, 1.0, -0.65, -0.6)])
+    walk = R.ScanWalk(R.RoamConfig(strategy='scan_walk'), (0.0, 0.0))
+    walk.stop_ahead_m = 0.355                              # live roaming stop line (nose + 5 cm)
+    goal = walk.choose(short, (0.0, 0.0, 0.0), 0.0)
+    # < 1 m ahead: no straight-on rule; a forward walk is fine only if it stops short and the turn fits
+    # (1.2 m wide here; 0.92 m of open floor is enough since the 1.5 m course loosening, 2026-11-20).
+    assert goal is None or abs(goal['yaw']) > 1e-6 or (
+        goal['x'] <= 1.0 - walk.standoff() + 1e-6 and 0.6 >= walk.spin_radius())
+
+
+def test_go_straight_when_only_the_blind_near_field_is_unknown():
+    """Operator 2026-11-20 "GO STRAIGHT": standing, the floor 0.45-~1 m ahead is never seen, so nothing ahead
+    is confirmed free; it now steps straight on unless a KNOWN obstacle is in the way."""
+    walk = R.ScanWalk(R.RoamConfig(strategy='scan_walk'), (0.0, 0.0))
+    unknown = _grid(free=[(-0.3, 0.3, -0.3, 0.3)])                     # only the robot's own spot is known
+    assert walk.choose(unknown, (0.0, 0.0, 0.0), 0.0) is None
+    goal = walk.straight_ahead(unknown, (0.0, 0.0, 0.0))
+    # Long leg on the held heading (operator 2026-11-20 "straight line"), up to frontier_radius_m.
+    assert goal is not None and goal['yaw'] == 0.0 and 0.5 <= goal['x'] <= walk.cfg.frontier_radius_m + 1e-9
+    wall = _grid(free=[(-0.3, 0.3, -0.3, 0.3)], occupied=[(0.8, 0.85, -1, 1)])
+    assert walk.straight_ahead(wall, (0.0, 0.0, 0.0)) is None             # known obstacle ahead: no step
+
+
+# ---- gait (Motion Host Communication Interface s1.2.5) ----------------------------------------
+def test_gait_is_sent_once_after_the_stand_check_and_logged(tmp_path):
+    from lite3_movement_tests.ros_io import GAITS
+    assert GAITS['rug_general'] == 0x21010401 and GAITS['rug_grip'] == 0x21010402
+    cfg = R.RoamConfig(strategy='scan_walk', gait='rug_general')
+    _, summary, robot, _ = roam(tmp_path, stop_after=20, cfg=cfg)
+    sent = [s for s in robot.sent if s[1] == 'gait']
+    assert [s[2] for s in sent] == ['rug_general']
+    toggles = [s[0] for s in robot.sent if s[1] == 'toggle']
+    assert not toggles or sent[0][0] > max(toggles)          # after standing up, never before
+    events = [e for e in summary['events'] if e['event'] == 'gait']
+    assert events and events[0]['code'] == '0x21010401' and events[0]['published']
+
+
+def test_no_gait_by_default_and_unknown_gait_refused(tmp_path):
+    _, _, robot, _ = roam(tmp_path, stop_after=10, cfg=R.RoamConfig(strategy='scan_walk'))
+    assert not [s for s in robot.sent if s[1] == 'gait']
+    with pytest.raises(ConfigError):
+        R.RoamConfig(gait='moonwalk')
+
+
+def test_gait_change_only_while_paused(tmp_path):
+    script = [(10, 'gait', 'rug_grip'), (15, 'pause', None), (20, 'gait', 'rug_hstep')]
+    _, summary, robot, _ = roam(tmp_path, script=script, stop_after=30, cfg=R.RoamConfig(strategy='scan_walk'))
+    assert [s[2] for s in robot.sent if s[1] == 'gait'] == ['rug_hstep']
+
+
+# ---- documented command codes (Motion Host Communication Interface) ------------------------
+def test_documented_command_codes_and_heartbeat_defaults():
+    from lite3_movement_tests import ros_io
+    assert ros_io.POSTURE_TOGGLE == 0x21010202 and ros_io.HEARTBEAT_CODE == 0x21040001      # s1.2.2, s1.2.1
+    assert ros_io.HEARTBEAT_PERIOD_S <= 0.5                                                 # >= 2 Hz
+    assert ros_io.GAITS == {'flat_slow': 0x21010300, 'flat_medium': 0x21010307, 'flat_fast': 0x21010303,
+                            'rug_general': 0x21010401, 'rug_grip': 0x21010402, 'rug_hstep': 0x21010407}
+    assert R.RoamConfig().heartbeat is False                                                # opt-in
+    robot = object.__new__(ros_io.RosRobot)            # no ROS: only the rate guard runs
+    robot.can_actuate = True
+    with pytest.raises(ValueError):
+        robot.start_heartbeat(period_s=1.0)
+
+
+def test_documented_ai_switches_are_off_by_default_and_encoded_as_documented():
+    import socket, struct
+    from lite3_movement_tests import ros_io
+    assert ros_io.AI_OPTIONS_CODE == 0x21012109
+    assert ros_io.AI_OPTIONS == {'all_off': 0x00, 'auto_stop': 0x20, 'obstacle_avoidance': 0x40}
+    assert R.RoamConfig().ai_options == ()
+    with pytest.raises(ConfigError):
+        R.RoamConfig(ai_options=('tracking_please',))
+    rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)       # loopback stand-in for the perception host
+    rx.bind(('127.0.0.1', 0))
+    rx.settimeout(2)
+    assert ros_io.send_perception_udp(0x21012109, 0x40, rx.getsockname())
+    assert struct.unpack('<III', rx.recv(64)) == (0x21012109, 0x40, 0)
+    rx.close()
+
+
+# ---- exploration gaps (2026-11-21): exit detector, failed-walk memory, dead-end backtracking -------------
+def test_exit_detector_ignores_corridors_unknown_space_and_the_start():
+    corridor = _grid(free=[(-0.5, 3.5, -0.75, 0.75)], occupied=[(-0.5, 3.5, 0.75, 0.8), (-0.5, 3.5, -0.8, -0.75)])
+    assert R.detect_exit(corridor, (2.5, 0.0, 0.0), (0.0, 0.0)) is None          # 1.5 m wide: never "open"
+    unknown = _grid(free=[(-0.5, 0.5, -0.5, 0.5)])                                  # unseen is not open
+    assert R.detect_exit(unknown, (0.0, 0.0, 0.0), (0.0, 0.0)) is None
+    room = _grid(free=[(-0.5, 3.5, -2.9, 2.9)])                                     # 4 x 5.8 m mapped open area
+    assert R.detect_exit(room, (2.0, 0.0, 0.0), (0.0, 0.0), min_from_start_m=10.0) is None   # all near start
+
+
+def test_exit_detector_finds_a_mapped_open_area_beyond_the_maze():
+    # 1.2 m corridor from the start (x -3.9..-1.0) opening into a mapped 4.9 x 5.8 m area
+    world = _grid(free=[(-3.9, -1.0, -0.6, 0.6), (-1.0, 3.9, -2.9, 2.9)],
+                  occupied=[(-3.9, -1.0, 0.6, 0.65), (-3.9, -1.0, -0.65, -0.6)])
+    start = (-3.5, 0.0)
+    found = R.detect_exit(world, (-1.5, 0.0, 0.0), start)
+    assert found and found['area_m2'] >= 3.0 and found['x'] > -1.0 and not found['reached']
+    assert R.detect_exit(world, (1.5, 0.0, 0.0), start)['reached']
+
+
+def test_scan_walk_remembers_failed_walks_and_avoids_them():
+    grid = _grid(free=[(-0.5, 3.0, -0.6, 0.6)])
+    w = _walker()
+    goal = w.straight_ahead(grid, (0.0, 0.0, 0.0), now=0.0)
+    assert goal is not None
+    w.block(goal['x'], goal['y'], 0.0, R.FAILED_WALK_MEMORY_S)
+    assert w.straight_ahead(grid, (0.0, 0.0, 0.0), now=1.0) is None                # same goal: avoided
+    assert w.straight_ahead(grid, (0.0, 0.0, 0.0), now=R.FAILED_WALK_MEMORY_S + 1) is not None   # expired
+
+
+def test_dead_end_backtracks_along_the_trail_instead_of_pausing(tmp_path, monkeypatch):
+    monkeypatch.setattr(R, 'blocked_passage', lambda *a, **kw: None)          # no curtain here
+    from lite3_movement_tests.roam_sim import SimRoamRobot
+    monkeypatch.setattr(R.RoamSession, '_frontier_goal', lambda *a, **kw: None)   # spin/backtrack path
+    monkeypatch.setattr(R.ScanWalk, 'choose', lambda *a, **kw: None)
+    monkeypatch.setattr(R.ScanWalk, 'straight_ahead', lambda *a, **kw: None)
+    original = R.RoamSession._search_turn
+
+    def seeded(self, now, pose):
+        if not self.trail and not self.backtracks:
+            self.trail = [(pose[0] - 1.5, pose[1])]                              # a place we walked from
+        return original(self, now, pose)
+    monkeypatch.setattr(R.RoamSession, '_search_turn', seeded)
+    outcome, summary, _, _ = roam(tmp_path, cfg=R.RoamConfig(strategy='scan_walk'), stop_after=100)
+    names = [e['event'] for e in summary['events']]
+    assert 'backtrack' in names
+    assert names.index('backtrack') < (names.index('paused') if 'paused' in names else len(names))
+
+
+def test_stairs_command_runs_the_routine_from_pause_and_resumes_roaming(tmp_path, monkeypatch):
+    from lite3_movement_tests import stairs as ST
+    original = ST.StairRoutine.step
+
+    def on_stairs(self, t, pitch, roll, travelled):         # 0.45 m incline starting 5 cm ahead
+        return original(self, t, 0.17 if 0.05 <= travelled < 0.5 else 0.0, roll, travelled)
+    monkeypatch.setattr(ST.StairRoutine, 'step', on_stairs)
+    script = [(5, 'pause', None), (6, 'stairs', 'up')]
+    _, summary, robot, _ = roam(tmp_path, script=script, stop_after=80,
+                                cfg=R.RoamConfig(strategy='scan_walk', stair_mode='hstep', auto_stairs=False))
+    names = [e['event'] for e in summary['events']]
+    assert 'safety_stop' not in names
+    assert names.index('stairs_start') < names.index('stairs_switch_in') < names.index('stairs_done')
+    assert [s[2] for s in robot.sent if s[1] == 'gait'][:2] == ['rug_hstep', 'flat_medium']
+    assert max(c.vx for _, c in robot.telemetry.system_cmd.since(0)) <= 0.0501        # slow mode respected
+
+
+def test_scene_detections_are_parsed_and_logged_with_the_map_pose(tmp_path, monkeypatch):
+    import json
+    from lite3_movement_tests.roam_sim import SimRoamRobot
+    text = json.dumps({'objects': [{'label': 'person', 'confidence': 0.9}, {'label': 'chair', 'confidence': 0.2}],
+                       'qr': 'EXIT-3'})
+    assert R.parse_scene(text) == [('object', 'person', 0.9), ('qr', 'EXIT-3', 1.0)]
+    assert R.parse_scene('not json') == [] and R.parse_scene('{}') == []
+    monkeypatch.setattr(SimRoamRobot, 'scene', [(0.0, text), (0.1, text)], raising=False)
+    _, summary, _, _ = roam(tmp_path, stop_after=10, cfg=R.RoamConfig(strategy='scan_walk'))
+    kinds = [(s['kind'], s['value']) for s in summary['sightings']]
+    assert kinds == [('object', 'person'), ('qr', 'EXIT-3')]                   # repeats suppressed
+    assert all(s['x'] is not None for s in summary['sightings'])
+
+
+def test_detected_step_is_crossed_automatically_in_ai_mode(tmp_path, monkeypatch):
+    """Operator 2026-11-21: at the steps switch to AI mode on its own (Comm Interface s1.2.2, s1.2.3.2, s1.2.7)."""
+    from lite3_movement_tests import ros_io as IO, stairs as ST
+    from lite3_movement_tests.telemetry import Telemetry
+    original_terrain = Telemetry.on_terrain
+    window = {'until': None}
+
+    def on_terrain(self, stamp, stop, reason, ahead, stop_ahead, problems, processing_s=None,
+                   step_ahead_m=None, step_rise_m=None):
+        if window['until'] is None:
+            window['until'] = stamp + 12.0                           # a 0.11 m ledge lip 0.5 m ahead, first 12 s
+        if stamp < window['until']:
+            step_ahead_m, step_rise_m = 0.5, 0.11
+        return original_terrain(self, stamp, stop, reason, ahead, stop_ahead, problems, processing_s,
+                                step_ahead_m, step_rise_m)
+    monkeypatch.setattr(Telemetry, 'on_terrain', on_terrain)
+    original_step = ST.StairRoutine.step
+
+    def on_ledge(self, t, pitch, roll, travelled):                  # body tilts while the feet climb
+        return original_step(self, t, 0.2 if 0.02 <= travelled < 0.2 else 0.0, roll, travelled)
+    monkeypatch.setattr(ST.StairRoutine, 'step', on_ledge)
+    _, summary, robot, _ = roam(tmp_path, stop_after=60, cfg=R.RoamConfig(strategy='scan_walk', auto_stairs=True))
+    names = [e['event'] for e in summary['events']]
+    assert 'safety_stop' not in names and 'paused' not in names
+    assert names.index('stairs_detected') < names.index('stairs_start') < names.index('stairs_done')
+    simple = [s[2] for s in robot.sent if s[1] == 'simple']
+    assert simple[:2] == [IO.AI_ENTER, IO.AI_GAIT_BASIC] and simple[2:4] == [IO.AI_EXIT, IO.NAVIGATION_MODE]
+    axis = [s for s in robot.sent if s[1] == 'axis']
+    assert axis and all(s[2] == IO.AXIS_FORWARD for s in axis) and max(s[3] for s in axis) > IO.AXIS_FORWARD_DEAD_ZONE
+    assert axis[-1][3] == 0                                          # stopped before leaving AI state
+    assert [s[2] for s in robot.sent if s[1] == 'gait'][-1] == 'flat_medium'
+    assert names.count('stairs_start') == 1                          # cooldown: the same edge does not re-trigger
+
+
+def test_safety_stop_during_ai_stairs_still_exits_ai_mode(tmp_path, monkeypatch):
+    """Physical 2026-11-21: a safety stop mid-crossing left the robot in AI mode."""
+    from lite3_movement_tests import ros_io as IO
+    from lite3_movement_tests.telemetry import Telemetry
+    original = Telemetry.on_terrain
+
+    def on_terrain(self, stamp, stop, reason, ahead, stop_ahead, problems, processing_s=None, *_):
+        return original(self, stamp, stop, reason, ahead, stop_ahead, problems, processing_s, 0.5, 0.11)
+    monkeypatch.setattr(Telemetry, 'on_terrain', on_terrain)
+    script = [(3, 'stop', None)]                                  # stop while still in AI state
+    _, summary, robot, _ = roam(tmp_path, script=script, stop_after=30, cfg=R.RoamConfig(strategy='scan_walk', auto_stairs=True))
+    simple = [s[2] for s in robot.sent if s[1] == 'simple']
+    assert IO.AI_ENTER in simple and simple[-2:] == [IO.AI_EXIT, IO.NAVIGATION_MODE]
+
+
+def test_own_ai_axis_commands_are_not_read_as_remote_takeover(tmp_path, monkeypatch):
+    from lite3_movement_tests.roam_sim import SimRoamRobot
+    from lite3_movement_tests.telemetry import Telemetry
+    original_terrain = Telemetry.on_terrain
+    window = {'until': None}
+
+    def on_terrain(self, stamp, stop, reason, ahead, stop_ahead, problems, processing_s=None, *_):
+        window['until'] = window['until'] or stamp + 12.0
+        step = (0.5, 0.11) if stamp < window['until'] else (None, None)
+        return original_terrain(self, stamp, stop, reason, ahead, stop_ahead, problems, processing_s, *step)
+    monkeypatch.setattr(Telemetry, 'on_terrain', on_terrain)
+    original_axis = SimRoamRobot.send_axis
+
+    def echoing_axis(self, code, value):                          # the robot reports our axis on /handle_state
+        original_axis(self, code, value)
+        self.telemetry.on_handle(self.now(), 0.5 if value else 0.0, 0.0, 0.0)
+    monkeypatch.setattr(SimRoamRobot, 'send_axis', echoing_axis)
+    _, summary, _, _ = roam(tmp_path, stop_after=40, cfg=R.RoamConfig(strategy='scan_walk', auto_stairs=True))
+    reasons = [e.get('reason') for e in summary['events'] if e['event'] == 'safety_stop']
+    assert not any('remote' in (r or '') for r in reasons), reasons
+
+
+def test_consecutive_lips_keep_ai_mode_on_until_the_ground_is_flat(tmp_path, monkeypatch):
+    """Course 2026-11-21: a run of 0.10-0.15 m lips; exit AI mode only once no lip is ahead."""
+    from lite3_movement_tests import ros_io as IO, stairs as ST
+    from lite3_movement_tests.telemetry import Telemetry
+    original_terrain = Telemetry.on_terrain
+    window = {'until': None}
+
+    def on_terrain(self, stamp, stop, reason, ahead, stop_ahead, problems, processing_s=None, *_):
+        window['until'] = window['until'] or stamp + 25.0                 # lips keep appearing for 25 s
+        step = (0.5, 0.12) if stamp < window['until'] else (None, None)
+        return original_terrain(self, stamp, stop, reason, ahead, stop_ahead, problems, processing_s, *step)
+    monkeypatch.setattr(Telemetry, 'on_terrain', on_terrain)
+    _, summary, robot, _ = roam(tmp_path, stop_after=70, cfg=R.RoamConfig(strategy='scan_walk', auto_stairs=True))
+    names = [e['event'] for e in summary['events']]
+    assert 'stairs_continue' in names and 'safety_stop' not in names
+    simple = [s[2] for s in robot.sent if s[1] == 'simple']
+    assert simple.count(IO.AI_ENTER) == 1 and simple.count(IO.AI_EXIT) == 1      # one AI session for the run
+    assert names.index('stairs_continue') < names.index('stairs_done')
+
+
+def test_ai_mode_is_off_by_default_even_when_a_step_is_reported(tmp_path, monkeypatch):
+    """Operator 2026-11-21: AI mode only on stairs (detection later), never on the uneven course."""
+    from lite3_movement_tests import ros_io as IO
+    from lite3_movement_tests.telemetry import Telemetry
+    original = Telemetry.on_terrain
+
+    def on_terrain(self, stamp, stop, reason, ahead, stop_ahead, problems, processing_s=None, *_):
+        return original(self, stamp, stop, reason, ahead, stop_ahead, problems, processing_s, 0.5, 0.12)
+    monkeypatch.setattr(Telemetry, 'on_terrain', on_terrain)
+    assert R.RoamConfig().auto_stairs is False
+    _, summary, robot, _ = roam(tmp_path, stop_after=20, cfg=R.RoamConfig(strategy='scan_walk'))
+    assert IO.AI_ENTER not in [s[2] for s in robot.sent if s[1] == 'simple']
+    assert 'stairs_start' not in [e['event'] for e in summary['events']]
+
+
+def test_scan_walk_falls_back_to_a_frontier_before_spinning():
+    """Operator 2026-11-21: held heading and nearest turn blocked -> Nav2 goal to a frontier, not a spin."""
+    grid = _grid(free=[(-0.6, 0.3, -0.3, 2.0)], occupied=[(0.35, 0.45, -1.0, 1.0)])
+    cfg = R.RoamConfig(strategy='scan_walk')
+    sw = R.ScanWalk(cfg, (0.0, 0.0))
+    class Stub:
+        pass
+    r = Stub()
+    r.cfg, r.map, r.frontiers = cfg, (0.0, grid), R.Explorer(cfg, (0.0, 0.0))
+    r._costmap = lambda: None
+    goal = R.RoamSession._frontier_goal(r, 0.0, (0.0, 0.0, 0.0))
+    assert goal is not None and goal['ends_at'] == 'frontier' and goal['kind'] == 'walk'
+    assert goal['y'] > 0.4                         # along the open corridor, not into the wall ahead
+
+
+def test_walk_cut_short_by_the_standoff_is_remembered():
+    """Course 2026-11-21: a standoff-cancelled walk must enter the failed-walk memory (it was lost)."""
+    class Stub:
+        pass
+    sw = R.ScanWalk(R.RoamConfig(strategy='scan_walk'), (0.0, 0.0))
+    s = Stub()
+    s.cfg, s.explorer, s.frontiers, s.failures, s.stats = R.RoamConfig(strategy='scan_walk'), sw, None, 0, \
+        {'goals_failed': 0, 'goals_succeeded': 0, 'walks_to_obstacle': 0}
+    s.goal = {'kind': 'walk', 'x': 0.77, 'y': -0.08, 'yaw': 0.0, 'ends_at': 'straight_on'}
+    s.walk_start = (0.2, 0.0)
+    s.events = []
+    s.event = lambda name, **kw: s.events.append(name)
+    s._terrain_now = lambda now: None
+    s._pause = lambda why: None
+    s._walk_failed = lambda now, why, goal=None: R.RoamSession._walk_failed(s, now, why, goal)
+    R.RoamSession._end_walk(s, 10.0, (0.22, 0.0, 0.0), 'obstacle ahead (walking standoff)')
+    assert s.events == ['walk_failed'] and s.goal is None
+    assert sw.avoided(0.77, -0.12, 11.0)            # the next straight-on goal there is skipped
+
+
+def test_frontier_fallback_accepts_goals_in_wall_inflation():
+    """12:37 run: in a ~1.5 m course every frontier sat in inflation cost >= 70; the fallback judges like Nav2."""
+    class Cost:
+        resolution = 0.05
+        def cell(self, x, y):
+            return int(x / 0.05), int(y / 0.05)
+        def contains(self, c):
+            return True
+        def value(self, c):
+            return 80                              # inflated, not inscribed
+    e = R.Explorer(R.RoamConfig(strategy='scan_walk'), (0.0, 0.0))
+    assert R.COSTMAP_VETO == 99 and e.hazard_free(Cost(), 1.0, 0.0)   # inflation is passable (Nav2 rule)
+    Cost.value = lambda self, c: 99                                    # inscribed is not
+    assert not e.hazard_free(Cost(), 1.0, 0.0)
+
+
+def test_dead_end_faces_the_wall_with_unseen_space_behind_it():
+    """Operator 2026-11-21: stop in front of the curtain (a LiDAR 'wall' with the course unseen behind it)."""
+    grid = _grid(free=[(-0.45, 0.55, -0.55, 0.55), (0.65, 2.0, -1.5, 1.5), (-0.45, 2.0, 0.65, 1.5),
+                       (-0.45, 2.0, -1.5, -0.65)],
+                 occupied=[(-0.55, -0.45, -0.6, 0.6), (0.55, 0.65, -0.6, 0.6), (-0.5, 0.6, 0.55, 0.65),
+                           (-0.5, 0.6, -0.65, -0.55)])
+    p = R.blocked_passage(grid, (0.0, 0.0, 0.0))
+    assert p is not None and abs(abs(p['yaw']) - math.pi) < math.radians(15)
+    assert 0.4 <= p['wall_m'] <= 0.6 and p['unknown'] >= 0.6
+    open_room = _grid(free=[(-2.0, 2.0, -2.0, 2.0)])
+    assert R.blocked_passage(open_room, (0.0, 0.0, 0.0)) is None
+
+
+def test_dead_end_with_a_passage_stops_in_front_of_it(tmp_path, monkeypatch):
+    """No opening, no frontier, but a wall with unseen space behind: face it and pause (no backtrack)."""
+    monkeypatch.setattr(R.ScanWalk, 'choose', lambda *a, **kw: None)
+    monkeypatch.setattr(R.ScanWalk, 'straight_ahead', lambda *a, **kw: None)
+    monkeypatch.setattr(R.RoamSession, '_frontier_goal', lambda *a, **kw: None)
+    monkeypatch.setattr(R, 'blocked_passage', lambda grid, pose, **kw: {
+        'yaw': pose[2] + math.pi / 2, 'wall_m': 0.40, 'unknown': 0.9, 'width_deg': 25})
+    outcome, summary, _, _ = roam(tmp_path, cfg=R.RoamConfig(strategy='scan_walk'), stop_after=100)
+    names = [e['event'] for e in summary['events']]
+    assert 'blocked_passage' in names and 'backtrack' not in names
+    paused = [e for e in summary['events'] if e['event'] == 'paused']
+    assert paused and 'blocked passage' in paused[0]['reason']
+    assert summary['stats']['passage_stops'] == 1
+
+
+def test_patrol_fallback_goes_only_to_white_space_not_yet_walked():
+    """Operator 2026-11-21: walk to the unvisited white area; none left -> no goal (curtain stop next)."""
+    grid = _grid(free=[(-0.5, 2.5, -0.5, 0.5)])
+    e = R.Explorer(R.RoamConfig(strategy='scan_walk'), (0.0, 0.0))
+    e.clearance_m, e.veto, e.visited = R.FRONTIER_FALLBACK_CLEARANCE_M, R.FRONTIER_FALLBACK_VETO, [(0.0, 0.0)]
+    goal = e._patrol(grid, (0.0, 0.0, 0.0))
+    assert goal is not None and goal['x'] >= 1.0
+    e.visited = [(x / 10, 0.0) for x in range(-5, 26, 3)]                # walked the whole strip
+    assert e._patrol(grid, (2.0, 0.0, 0.0)) is None

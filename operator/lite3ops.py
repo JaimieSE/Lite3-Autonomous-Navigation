@@ -12,6 +12,8 @@ Nothing here publishes velocity, posture or mode commands.
 """
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
+import struct
 import json
 import os
 from pathlib import Path
@@ -24,7 +26,7 @@ SYSTEM_DOMAIN = 64
 DRY_TOPIC = '/lite3_locomotion/dry_cmd_vel'
 # Nodes started by `navigation.launch.py` (university bringup + navigation + ours).
 WORKFLOW_NODES = {
-    'laser_mapping', 'odom_relay', 'pointcloud_to_laserscan', 'lite3_terrain_monitor',
+    'lite3_sensor_relay', 'lite3_livox_cloud', 'laser_mapping', 'odom_relay', 'pointcloud_to_laserscan', 'lite3_terrain_monitor',
     'twist_mux', 'nav2_container', 'slam_toolbox', 'controller_server', 'planner_server',
     'bt_navigator', 'velocity_smoother', 'behavior_server', 'smoother_server',
     'waypoint_follower', 'lifecycle_manager_navigation', 'lifecycle_manager_slam',
@@ -34,7 +36,7 @@ CALIBRATION_FILE = Path(__file__).resolve().parents[1] / 'log' / 'operator' / 'c
 NAV_LIFECYCLE = ('controller_server', 'planner_server', 'bt_navigator', 'velocity_smoother',
                  'behavior_server', 'smoother_server', 'collision_monitor')
 REQUIRED_PACKAGES = ('lite3_launcher', 'fast_lio', 'lite3_locomotion', 'twist_mux', 'nav2_bringup',
-                     'nav2_collision_monitor',
+                     'nav2_collision_monitor', 'lite3_livox_cloud',
                      'slam_toolbox', 'pointcloud_to_laserscan', 'livox_ros_driver2', 'nav2_msgs')
 ROBOT_TOPICS = ('/joint_states', '/imu/data', '/leg_odom2')
 CLOUD_TOPICS = ('/livox/points', '/livox/lidar')
@@ -144,12 +146,17 @@ class Ros:
         return out
 
     def stamp_ages(self, topic, seconds):
-        """Local clock minus header stamp for PointCloud2 messages (sensing delay incl. clock offset)."""
+        """Age on arrival for CDR messages beginning with std_msgs/Header."""
         from rclpy.qos import qos_profile_sensor_data
-        from sensor_msgs.msg import PointCloud2
         ages = []
-        sub = self.node.create_subscription(PointCloud2, topic, lambda m: ages.append(
-            time.time() - (m.header.stamp.sec + m.header.stamp.nanosec * 1e-9)), qos_profile_sensor_data)
+
+        def sample(raw):
+            if len(raw) >= 12 and raw[:2] in (bytes((0, 1)), bytes((0, 0))):
+                sec, nsec = struct.unpack_from('<iI' if raw[1] else '>iI', raw, 4)
+                ages.append(time.time() - (sec + nsec * 1e-9))
+
+        sub = self.node.create_subscription(msg_types()[topic][0], topic, sample,
+                                            qos_profile_sensor_data, raw=True)
         time.sleep(seconds)
         self.node.destroy_subscription(sub)
         return sorted(ages)
@@ -209,7 +216,6 @@ def check_environment(report):
 
 
 SYSTEM_DOMAIN = 64
-TERRAIN_INPUTS = ('/joint_states', '/imu/data')   # what terrain_monitor reads from domain 8
 TERRAIN_STALE_S = 0.5                             # terrain_monitor marks inputs stale after this
 
 
@@ -221,53 +227,41 @@ def check_network(report, ros, seconds, direct=False):
     types = msg_types()
     # Direct mode: the clouds are read in domain 64 by sensor_relay, so measure them there (pulling the
     # bridged copies here would only make the bridge send them again over the robot link).
-    rates = ros.measure({t: types[t] for t in ROBOT_TOPICS + (() if direct else CLOUD_TOPICS)}, seconds)
+    rates = {} if direct else ros.measure({t: types[t] for t in ROBOT_TOPICS + CLOUD_TOPICS}, seconds)
     if not direct:
         after = reasm_counters()
         memory_after = frag_memory()
-    for topic in ROBOT_TOPICS:
-        r = rates[topic]
-        if not direct:
+    if not direct:
+        for topic in ROBOT_TOPICS:
+            r = rates[topic]
             ok = r['hz'] >= 100 and (r['max_gap_s'] or 9) < 0.25
             report.add('OK' if ok else 'FAIL', f'robot telemetry {topic}',
                        f"{r['hz']} Hz, max gap {r['max_gap_s']} s",
-                       'robot bridge/telemetry not flowing: check robot is on and lab bridge is running')
-        elif topic in TERRAIN_INPUTS:
-            # Direct mode: the test runner reads telemetry in domain 64 (checked separately), and
-            # terrain_monitor reads it through lite3_locomotion/sensor_relay from domain 64 too
-            # (2026-11-19: the bridge relayed /joint_states at 4.8-23 Hz). The bridged copy is unused.
-            report.add('OK', f'bridged {topic}', f"{r['hz']} Hz (not used: terrain_monitor reads it via "
-                       'sensor_relay from domain 64, checked below)')
-        else:
-            report.add('OK', f'bridged {topic}', f"{r['hz']} Hz (not used in direct mode)")
+                       'check the robot and lab telemetry bridge')
     if direct:
         sys_ros = Ros(domain=SYSTEM_DOMAIN, name='lite3_operator_check_direct')
-        try:
-            time.sleep(2.5)
-            direct_rates = sys_ros.measure({t: types[t] for t in ROBOT_TOPICS}, seconds)
-        finally:
-            sys_ros.close()
-        # Clouds AFTER the telemetry, in their OWN participant and best effort, exactly as sensor_relay
-        # reads them. A reliable 400 KB stream in the telemetry's participant stalls its receive path on
-        # every lost fragment: 2026-11-19 preflight saw joints/IMU/odometry all gap 0.87-1.06 s at once,
-        # while a raw best-effort A/B in a separate participant showed max gap 0.12 s with clouds flowing.
         cloud_ros = Ros(domain=SYSTEM_DOMAIN, name='lite3_operator_check_clouds')
         try:
             time.sleep(2.5)
-            direct_rates.update(cloud_ros.measure({t: (types[t][0], False) for t in CLOUD_TOPICS}, seconds))
+            # Measure joints while native scans are also flowing, on separate participants.
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                telemetry = pool.submit(sys_ros.measure, {t: types[t] for t in ROBOT_TOPICS}, seconds)
+                direct_rates = cloud_ros.measure({'/livox/lidar': (types['/livox/lidar'][0], False)}, seconds)
+                direct_rates.update(telemetry.result())
             after = reasm_counters()
             memory_after = frag_memory()
-            ages = cloud_ros.stamp_ages('/livox/points', 3.0)
+            ages = cloud_ros.stamp_ages('/livox/lidar', 3.0)
         finally:
             cloud_ros.close()
+            sys_ros.close()
         for topic in ROBOT_TOPICS:
             r = direct_rates[topic]
             ok = r['hz'] >= 100 and (r['max_gap_s'] or 9) < 0.25
             report.add('OK' if ok else 'FAIL', f'robot telemetry {topic} (direct, domain 64)',
                        f"{r['hz']} Hz, max gap {r['max_gap_s']} s",
-                       'robot-side telemetry itself degraded: check the robot / system computer')
+                       'direct telemetry gap at group8: compare source and receiver during the same interval')
         rates = {**rates, **{f'{t}@64': r for t, r in direct_rates.items()}}
-    for topic in CLOUD_TOPICS:
+    for topic in (('/livox/lidar',) if direct else CLOUD_TOPICS):
         r = direct_rates[topic] if direct else rates[topic]
         level = 'OK' if r['hz'] >= 8 and (r['max_gap_s'] or 9) < 0.5 else \
             'WARN' if r['hz'] >= 5 else 'FAIL'
@@ -345,13 +339,14 @@ def cmd_wait_ready(args):
     print(f'{BOLD}Waiting for navigation stack (up to {args.timeout:.0f} s){RESET}')
     ros = Ros()
     deadline = time.monotonic() + args.timeout
+    lio_node = 'group8_lio_outputs_8' if os.environ.get('LITE3_LIO_SOURCE', 'system') == 'system' else 'laser_mapping'
     try:
         while True:
             states = {n: ros.lifecycle(n, 2.0) for n in NAV_LIFECYCLE}
             nodes = ros.nodes()
             done = all(s == 'active' for s in states.values()) and {
-                'slam_toolbox', 'twist_mux', 'lite3_terrain_monitor', 'laser_mapping',
-                'collision_monitor'} <= nodes
+                'slam_toolbox', 'twist_mux', 'lite3_terrain_monitor', lio_node,
+                'collision_monitor', 'lite3_livox_cloud', 'lite3_sensor_relay'} <= nodes
             if done or time.monotonic() > deadline:
                 break
             print(f'  ... {sum(s == "active" for s in states.values())}/{len(states)} Nav2 nodes active',
@@ -361,8 +356,9 @@ def cmd_wait_ready(args):
         for name, state in states.items():
             report.add('OK' if state == 'active' else 'FAIL', f'Nav2 {name}', state,
                        'see launch log; operator/README.md "Nav2 not active"')
-        for name in ('laser_mapping', 'odom_relay', 'pointcloud_to_laserscan', 'slam_toolbox',
-                     'lite3_terrain_monitor', 'twist_mux', 'collision_monitor'):
+        scan_nodes = () if lio_node == 'group8_lio_outputs_8' else ('pointcloud_to_laserscan',)
+        for name in (lio_node, 'odom_relay', *scan_nodes, 'slam_toolbox',
+                     'lite3_terrain_monitor', 'lite3_livox_cloud', 'lite3_sensor_relay', 'twist_mux', 'collision_monitor'):
             report.add('OK' if name in nodes else 'FAIL', f'node {name}',
                        'running' if name in nodes else 'missing', 'see launch log')
         check_flow(report, ros, 6.0)

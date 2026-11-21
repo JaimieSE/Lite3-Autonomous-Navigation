@@ -6,12 +6,18 @@
 #        domain-8 bridge instead: measured 2026-11-19 (stationary, 300 s) at 89 Hz with 29-31 gaps of
 #        0.25-0.50 s and 1-message seconds, vs 199.5 Hz / max gap 0.12 s at the source - enough to trip
 #        M2's 0.25 s freshness stop and the watchdog's 20 Hz readiness.
+#        --stop-layers docs|full (default docs, operator 2026-11-20): docs = obstacle avoidance by Nav2
+#            planning only, as the vendor navigation (Perception Development Guide s8.2); the remote STOP
+#            button is the emergency stop. full = also the collision_monitor stop zone and the terrain
+#            proximity lock (use for the supervised M-series tests).
+#        --no-depth-camera: do not fuse the RealSense depth near field (adds ~6 MB/s on the robot link)
+#        --max-step M (default 0.40): terrain monitor's highest walkable rise (stairs ~0.05, rubble)
 #        --clearance M (default 0.15): obstacle clearance the collision_monitor stop must leave
 #        --max-speed V (default 0.10): fastest speed that boundary must cover (<= 1.0 m/s; only <= 0.10 is
 #            validated. Above 0.10 the boundary grows fast: braking distance is taken as quadratic in speed)
 #        operator/start_navigation.sh --physical             ARMED: twist_mux -> /cmd_vel -> robot,
-#            behind the operator dead-man lock (robot stays locked until a supervised
-#            operator/run_physical.sh --physical test holds it). Asks you to type ARM.
+#            behind the operator dead-man lock (robot stays locked until operator/roam.sh
+#            holds it). Asks you to type ARM.
 set -eo pipefail
 source "$(dirname "$0")/env.sh"
 ACCEPT_DEGRADED=0
@@ -19,6 +25,7 @@ MODE=dry
 TELEMETRY=direct
 CLEARANCE=0.15
 MAX_SPEED=0.10
+STOP_LAYERS=docs
 PREFLIGHT_ARGS=(--direct-telemetry)
 LAUNCH_ARGS=()
 while [ $# -gt 0 ]; do
@@ -26,6 +33,10 @@ while [ $# -gt 0 ]; do
   case "$arg" in
     --clearance) CLEARANCE="$1"; shift ;;
     --max-speed) MAX_SPEED="$1"; shift ;;
+    --stop-layers) STOP_LAYERS="$1"; shift ;;
+    --max-step) LAUNCH_ARGS+=(max_step:="$1"); shift ;;
+    --no-depth-camera) LAUNCH_ARGS+=(depth_camera:=false) ;;
+    --full-stops) STOP_LAYERS=full ;;
     --accept-degraded) ACCEPT_DEGRADED=1 ;;
     --physical) MODE=physical ;;
     --direct-telemetry) TELEMETRY=direct; PREFLIGHT_ARGS=(--direct-telemetry) ;;
@@ -33,6 +44,7 @@ while [ $# -gt 0 ]; do
     *) echo "Unknown option: $arg (see the header of this script)"; exit 2 ;;
   esac
 done
+case "$STOP_LAYERS" in docs|full) ;; *) echo "--stop-layers must be docs or full"; exit 2 ;; esac
 CALIBRATION="$LOG_ROOT/calibration.json"
 if [ "$MODE" = physical ]; then
   if [ $ACCEPT_DEGRADED -eq 1 ]; then
@@ -40,12 +52,11 @@ if [ "$MODE" = physical ]; then
   fi
   if [ ! -t 0 ]; then echo "REFUSED: --physical needs an interactive terminal (typed ARM)."; exit 2; fi
   echo "PHYSICAL MODE: twist_mux output will be the robot's /cmd_vel."
-  echo "  The robot stays LOCKED (dead-man) until you run a supervised test with"
-  echo "  operator/run_physical.sh --physical, which asks for confirmation per test."
+  echo "  The robot stays LOCKED (dead-man) until operator/roam.sh holds it (you type ROAM)."
   echo "  Keep the handheld remote / e-stop in reach from now on."
   read -r -p "Type ARM to start navigation in physical mode (anything else cancels): " ANSWER
   if [ "$ANSWER" != "ARM" ]; then echo "Not armed. Nothing was started."; exit 1; fi
-  LAUNCH_ARGS=(mux_output:=/cmd_vel allow_robot_motion:=true)
+  LAUNCH_ARGS+=(mux_output:=/cmd_vel allow_robot_motion:=true)
 fi
 
 if nav_running; then
@@ -83,23 +94,33 @@ if [ $PRE -eq 2 ] && [ $ACCEPT_DEGRADED -eq 0 ]; then
   exit 1
 fi
 
+# docs: the stop polygon never triggers, so it is only sized (for 0.10 m/s) to stay readable; the speed
+# ceiling MAX_SPEED is then not limited by a braking distance (manufacturer limit 1.0 m/s still applies).
+CM_SPEED="$MAX_SPEED"
+[ "$STOP_LAYERS" = docs ] && CM_SPEED=0.10
 BOUNDARY_JSON=$(python3 -m lite3_locomotion.collision_profile --clearance "$CLEARANCE" \
-  --max-speed "$MAX_SPEED" --calibration "$CALIBRATION")
+  --max-speed "$CM_SPEED" --calibration "$CALIBRATION")
 BOUNDARY=$(echo "$BOUNDARY_JSON" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("boundary_m",""))')
 if [ -z "$BOUNDARY" ]; then
   echo "REFUSED: cannot compute the stop boundary: $BOUNDARY_JSON"; exit 2
 fi
-SLOW_BOUNDARY=$(echo "$BOUNDARY_JSON" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("slow_boundary_m",""))')
-SLOWDOWN_RATIO=$(echo "$BOUNDARY_JSON" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("slowdown_ratio",""))')
-if [ -n "$SLOW_BOUNDARY" ]; then
+APPROACH_S=$(echo "$BOUNDARY_JSON" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("approach_time_s",""))')
+if [ "$STOP_LAYERS" = docs ]; then
+  :
+elif [ -n "$APPROACH_S" ]; then
   echo "Collision stop boundary: $BOUNDARY m from the nose (clearance $CLEARANCE m at <= 0.10 m/s)"
-  echo "Collision SLOWDOWN boundary: $SLOW_BOUNDARY m from the nose (full stop from $MAX_SPEED m/s); inside it every"
-  echo "  command is scaled by $SLOWDOWN_RATIO (<= 0.10 m/s, turning scaled too). NOT validated above 0.10 m/s."
+  echo "Collision APPROACH: full speed unless a collision along the current command is predicted within"
+  echo "  $APPROACH_S s (then slowed so it reaches the stop zone at <= 0.10 m/s). Braking above 0.10 m/s is assumed."
 else
   echo "Collision stop boundary: $BOUNDARY m from the nose (clearance $CLEARANCE m at <= $MAX_SPEED m/s)"
 fi
 echo "  $BOUNDARY_JSON"
-LAUNCH_ARGS+=(clearance:="$CLEARANCE" max_speed:="$MAX_SPEED" calibration:="$CALIBRATION")
+LAUNCH_ARGS+=(clearance:="$CLEARANCE" max_speed:="$CM_SPEED" calibration:="$CALIBRATION" stop_layers:="$STOP_LAYERS")
+if [ "$STOP_LAYERS" = docs ]; then
+  echo "Stop layers: DOCS - Nav2 avoids obstacles (costmaps + planners) as in the vendor navigation;"
+  echo "  no collision_monitor stop zone, no terrain proximity lock. Remote STOP = emergency stop."
+  APPROACH_S=
+fi
 if [ "$MODE" = physical ]; then
   echo "== 2/3 Launching (PHYSICAL: twist_mux -> /cmd_vel, dead-man locked). Log: $RUN_DIR/launch.log"
 else
@@ -110,9 +131,9 @@ setsid bash -c 'echo $$ > "$1"; shift; exec ros2 launch lite3_locomotion navigat
   "$RUN_DIR/pgid" "${LAUNCH_ARGS[@]}" > "$RUN_DIR/launch.log" 2>&1 < /dev/null &
 sleep 1
 PGID=$(cat "$RUN_DIR/pgid")
-printf 'PGID=%s\nRUN_DIR=%s\nSTARTED=%s\nMODE=%s\nTELEMETRY=%s\nCLEARANCE=%s\nMAX_SPEED=%s\nBOUNDARY=%s\nSLOW_BOUNDARY=%s\nSLOWDOWN_RATIO=%s\n' \
+printf 'PGID=%s\nRUN_DIR=%s\nSTARTED=%s\nMODE=%s\nTELEMETRY=%s\nCLEARANCE=%s\nMAX_SPEED=%s\nBOUNDARY=%s\nAPPROACH_S=%s\nSTOP_LAYERS=%s\n' \
   "$PGID" "$RUN_DIR" "$(date '+%F %T')" "$MODE" "$TELEMETRY" "$CLEARANCE" "$MAX_SPEED" "$BOUNDARY" \
-  "$SLOW_BOUNDARY" "$SLOWDOWN_RATIO" > "$STATE_FILE"
+  "$APPROACH_S" "$STOP_LAYERS" > "$STATE_FILE"
 
 if [ "$MODE" = physical ]; then
   echo "== 3/3 Waiting for readiness and verifying twist_mux is the only, dead-man-locked command path"
@@ -134,9 +155,9 @@ if [ $READY -eq 1 ]; then
 fi
 echo
 if [ "$MODE" = physical ]; then
-  echo "NAVIGATION READY (PHYSICAL, dead-man LOCKED until a supervised test). Logs: $RUN_DIR"
-  echo "Next: operator/run_physical.sh --physical --phases M0    Stop: operator/stop_navigation.sh"
+  echo "NAVIGATION READY (PHYSICAL, dead-man LOCKED until roaming holds it). Logs: $RUN_DIR"
+  echo "Next: operator/roam.sh start --physical    Stop: operator/stop_navigation.sh"
 else
   echo "NAVIGATION READY (dry, non-actuating). Logs: $RUN_DIR"
-  echo "Next: operator/run_test4.sh    Status: operator/status.sh    Stop: operator/stop_navigation.sh"
+  echo "Next: operator/roam.sh start    Status: operator/status.sh    Stop: operator/stop_navigation.sh"
 fi

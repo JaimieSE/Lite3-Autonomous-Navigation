@@ -11,12 +11,12 @@ from lite3_movement_tests.telemetry import Telemetry, assess_stationary
 SPEED = 0.06805
 
 
-def fill(position_step=0.0, joint_wiggle=0.0, speed_jitter=0.0, gyro=0.005, seconds=2.0):
+def fill(position_step=0.0, joint_wiggle=0.0, speed_jitter=0.0, gyro=0.005, seconds=2.0, planar_speed=SPEED):
     t = Telemetry()
     for i in range(int(seconds * 200)):
         ts = i / 200
         ang = 0.3 + 0.01 * math.sin(i)                    # noisy heading re-rotates the vector
-        speed = SPEED + (speed_jitter if i % 2 else 0.0)
+        speed = planar_speed + (speed_jitter if i % 2 else 0.0)
         t.on_odom(ts, 3.1 + position_step * i, 8.4, 0.08, 0, 0, math.sin(ang / 2), math.cos(ang / 2),
                   speed * math.cos(ang), speed * math.sin(ang), 0.003 * math.sin(i))
         pose = list(LYING_POSE)
@@ -54,3 +54,39 @@ def test_varying_speed_magnitude_is_not_a_freeze():
 def test_gyro_motion_keeps_the_speed_criterion():
     still, detail = check(fill(gyro=0.3))
     assert not still and 'odometry speed above rest threshold' in detail['reasons']
+
+
+def test_frozen_high_velocity_is_not_runtime_overspeed():
+    from lite3_movement_tests.telemetry import sustained_planar_overspeed
+    t = fill(planar_speed=0.15)
+    assert not sustained_planar_overspeed(t, 2.0, 0.10)
+
+
+def test_runtime_overspeed_retains_independent_motion_checks():
+    from lite3_movement_tests.telemetry import sustained_planar_overspeed
+    cases = [
+        dict(position_step=1e-6),
+        dict(joint_wiggle=0.1),
+        dict(speed_jitter=1e-4),
+        dict(gyro=0.3),
+    ]
+    for changes in cases:
+        t = fill(planar_speed=0.15, **changes)
+        assert sustained_planar_overspeed(t, 2.0, 0.10), changes
+
+
+def test_frozen_velocity_with_missing_rest_evidence_still_trips():
+    from lite3_movement_tests.telemetry import Stream, sustained_planar_overspeed
+    for stream in ('joints', 'imu'):
+        t = fill(planar_speed=0.15)
+        setattr(t, stream, Stream())
+        assert sustained_planar_overspeed(t, 2.0, 0.10)
+
+
+def test_watchdog_uses_the_same_frozen_velocity_rule():
+    from lite3_movement_tests.roam import WatchdogLogic
+    for changes, trips in (({}, False), ({'joint_wiggle': 0.1}, True),
+                           ({'position_step': 1e-6}, True)):
+        t = fill(planar_speed=0.15, **changes)
+        reasons = WatchdogLogic(0.05, 3.0).evaluate(t, 2.0)
+        assert any('leg-odometry speed' in r for r in reasons) == trips

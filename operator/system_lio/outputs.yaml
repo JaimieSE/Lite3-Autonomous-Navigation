@@ -1,0 +1,16 @@
+name: group8_lio_outputs
+from_domain: 64
+to_domain: 8
+topics:
+  /group8_lio/odometry:
+    type: nav_msgs/msg/Odometry
+  /group8_lio/scan:
+    type: sensor_msgs/msg/LaserScan
+    qos:
+      reliability: best_effort
+      depth: 2
+  /group8_perception/rgb/image/compressed:
+    type: sensor_msgs/msg/CompressedImage
+    qos:
+      reliability: best_effort
+      depth: 1

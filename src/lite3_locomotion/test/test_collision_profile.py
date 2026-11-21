@@ -12,18 +12,18 @@ ROOT = Path(__file__).resolve().parents[1]
 def test_boundary_adds_measured_terms_and_never_goes_below_backup():
     cal = CP.Calibration(sensing_age_s=0.185, processing_s=0.023, coast_m=0.0342)
     b = CP.boundary(0.40, 0.05, cal)
-    assert b['required_m'] == pytest.approx(0.05 * (0.185 + 0.023 + 0.10) + 0.0342 + 0.05 + 0.40, abs=1e-3)
+    assert b['required_m'] == pytest.approx(0.05 * (0.185 + 0.023 + 0.10) + 0.0342 + 0.025 + 0.40, abs=1e-3)
     assert b['boundary_m'] >= b['required_m']
-    assert CP.boundary(0.05, 0.01, cal)['boundary_m'] == CP.MIN_BOUNDARY_M
+    assert CP.boundary(0.0, 0.01, cal)['boundary_m'] == CP.MIN_BOUNDARY_M
 
 
-def test_coast_scales_up_with_speed_never_down():
+def test_coast_scales_linearly_with_speed():
     cal = CP.Calibration(coast_m=0.04, coast_speed_m_s=0.05)
     assert CP.boundary(0.15, 0.10, cal)['coast_m'] == pytest.approx(0.08)
-    assert CP.boundary(0.15, 0.02, cal)['coast_m'] == pytest.approx(0.04)
+    assert CP.boundary(0.15, 0.02, cal)['coast_m'] == pytest.approx(0.04 * 0.02 / cal.coast_speed_m_s)   # linear below (2026-11-20)
 
 
-@pytest.mark.parametrize('clearance, speed', [(0.0, 0.05), (2.0, 0.05), (0.15, 1.1), (0.15, 0.0)])
+@pytest.mark.parametrize('clearance, speed', [(-0.01, 0.05), (2.0, 0.05), (0.15, 1.1), (0.15, 0.0)])
 def test_out_of_range_inputs_refused(clearance, speed):
     with pytest.raises(ValueError):
         CP.boundary(clearance, speed)
@@ -72,23 +72,25 @@ def test_launch_has_one_final_command_authority():
     assert "'node_names': ['collision_monitor']" in src
 
 
-def test_fast_stacks_get_a_small_stop_and_a_full_speed_slowdown_polygon():
+def test_fast_stacks_get_a_small_stop_and_a_collision_time_approach():
+    """Above 0.10 m/s: stop polygon sized for 0.10 m/s plus Nav2's approach action (no fixed slowdown
+    zone): T = stop boundary / 0.10 m/s, so approach (v = d / T) reaches the stop zone at <= 0.10 m/s."""
     cal = CP.Calibration(sensing_age_s=0.158, path_latency_s=0.195, coast_m=0.035, coast_speed_m_s=0.05)
     slow = CP.tiers(0.05, 0.10, cal)
-    assert slow['slow'] is None and slow['stop'] == CP.boundary(0.05, 0.10, cal)     # unchanged up to 0.10
-    fast = CP.tiers(0.05, 0.50, cal)
-    assert fast['stop'] == CP.boundary(0.05, 0.10, cal)                  # only locks turning near the nose
-    assert fast['slowdown_ratio'] == 0.2                                 # <= 0.10 m/s inside the slow zone
-    full = CP.boundary(0.05, 0.50, cal)
-    assert fast['slow']['boundary_m'] >= full['boundary_m'] + fast['stop']['reaction_travel_m']
-    ros = CP.collision_monitor_params(fast['stop']['boundary_m'], 'in', 'out', fast['slow']['boundary_m'],
-                                      fast['slowdown_ratio'])['collision_monitor']['ros__parameters']
-    assert ros['polygons'] == ['PolygonStop', 'PolygonSlow']
-    assert ros['PolygonSlow']['action_type'] == 'slowdown' and ros['PolygonSlow']['slowdown_ratio'] == 0.2
-    assert CP.polygon_boundary(ros['PolygonSlow']['points']) == fast['slow']['boundary_m']
-    assert CP.polygon_boundary(ros['PolygonStop']['points']) == fast['stop']['boundary_m']
-    with pytest.raises(ValueError):                                      # slow polygon inside stop
-        CP.collision_monitor_params(0.5, 'in', 'out', 0.4, 0.2)
+    assert slow['approach'] is None and slow['stop'] == CP.boundary(0.05, 0.10, cal)
+    fast = CP.tiers(0.0, 0.50, cal)
+    assert fast['stop']['boundary_m'] == CP.MIN_BOUNDARY_M
+    t = fast['approach']['time_before_collision_s']
+    v_at_line = fast['stop']['reaction_travel_m'] / fast['stop']['latency_s']
+    assert fast['stop']['required_m'] <= CP.MIN_BOUNDARY_M and fast['stop']['boundary_m'] / t <= v_at_line + 1e-6
+    ros = CP.collision_monitor_params(fast['stop']['boundary_m'], 'in', 'out', t)['collision_monitor']['ros__parameters']
+    assert ros['polygons'] == ['PolygonStop', 'FootprintApproach']
+    a = ros['FootprintApproach']
+    assert a['action_type'] == 'approach' and a['time_before_collision'] == t
+    assert a['footprint_topic'] == '/local_costmap/published_footprint' and a['simulation_time_step'] == 0.1
+    assert 'PolygonSlow' not in ros
+    with pytest.raises(ValueError):
+        CP.collision_monitor_params(0.24, 'in', 'out', 20.0)
 
 
 def test_hard_speed_ceiling_is_one_metre_per_second():
@@ -103,7 +105,7 @@ def test_one_metre_per_second_boundary_fits_and_is_inside_perception_reach():
         CP.boundary(0.15, 1.0)
     measured = CP.Calibration(sensing_age_s=0.17, path_latency_s=0.195, coast_m=0.035,
                               coast_speed_m_s=0.05)   # operator/calibration.json, 2026-11-18
-    assert CP.boundary(0.15, 1.0, measured)['boundary_m'] == pytest.approx(2.83)
+    assert CP.boundary(0.15, 1.0, measured)['boundary_m'] == pytest.approx(2.81)   # 2.5 cm margin (half cell)
     reach = TerrainParams().size_m / 2 - CP.NOSE_M          # terrain grid ahead of the nose
     assert CP.MAX_BOUNDARY_M < reach
     assert STOP_LIMITS['stop_ahead_m'][1] >= CP.MAX_BOUNDARY_M - 0.05 + CP.NOSE_M
@@ -126,3 +128,12 @@ def test_coast_measured_at_speed_replaces_the_assumption():
     measured = CP.Calibration(coast_m=0.30, coast_speed_m_s=0.30)
     assumed = CP.Calibration(coast_m=0.036, coast_speed_m_s=0.05)
     assert CP.boundary(0.15, 0.30, measured)['coast_m'] == pytest.approx(0.30)       # not inflated again
+
+
+def test_docs_only_collision_monitor_is_a_pass_through():
+    """Operator 2026-11-20 docs-only stops: polygon kept (readable) but never triggers, no approach."""
+    p = CP.collision_monitor_params(0.05, '/in', '/out', approach_s=2.7, docs_only=True)
+    ros = p['collision_monitor']['ros__parameters']
+    assert ros['polygons'] == ['PolygonStop'] and 'FootprintApproach' not in ros
+    assert ros['PolygonStop']['max_points'] == CP.DOCS_ONLY_MAX_POINTS
+    assert ros['cmd_vel_in_topic'] == '/in' and ros['cmd_vel_out_topic'] == '/out'

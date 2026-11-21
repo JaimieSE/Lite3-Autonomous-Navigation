@@ -1,0 +1,13 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>lite3_livox_cloud</name>
+  <version>0.1.0</version>
+  <description>Produce the Lite3 terrain point cloud from the local Livox scan.</description>
+  <maintainer email="user@example.invalid">Lite3 workspace developer</maintainer>
+  <license>Apache-2.0</license>
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>rclcpp</depend>
+  <depend>livox_ros_driver2</depend>
+  <depend>sensor_msgs</depend>
+  <export><build_type>ament_cmake</build_type></export>
+</package>

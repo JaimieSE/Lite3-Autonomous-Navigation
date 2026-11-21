@@ -17,14 +17,10 @@ setup(
     zip_safe=True,
     maintainer='Lite3 workspace developer',
     maintainer_email='user@example.invalid',
-    description='Autonomous frontier missions using the existing university Nav2 stack; preview by default.',
+    description='Lite3 navigation launch, terrain monitor and sensor relay used by roaming (M10).',
     license='Apache-2.0',
     entry_points={
         'console_scripts': [
-            'locomotion_controller = lite3_locomotion.controller_node:main',
-            'exploration_preview = lite3_locomotion.exploration_preview:main',
-            'exploration_coordinator = lite3_locomotion.exploration_coordinator:main',
-            'autonomy_control = lite3_locomotion.autonomy_control:main',
             'terrain_monitor = lite3_locomotion.terrain_monitor:main',
             'sensor_relay = lite3_locomotion.sensor_relay:main',
         ],
