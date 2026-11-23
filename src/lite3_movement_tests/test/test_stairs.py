@@ -113,3 +113,53 @@ def test_routine_can_start_at_the_step_and_crosses_small_steps_without_tilt():
     assert r.step(0.0, 0.0, 0.0, 0.0).switch == 'in'
     last, switches = drive(StairRoutine('up', start='switch_in'), lambda x: 0.0)   # 5 cm step: no body tilt
     assert last.done and switches == ['in', 'out']
+
+
+
+def _run(routine, profile, dt=0.1, speed=0.2, limit=120.0):
+    """Drive the routine through a pitch profile over distance; returns (actions, states visited)."""
+    t, x, states, actions = 0.0, 0.0, [], []
+    while t < limit:
+        a = routine.step(t, profile(x), 0.0, x)
+        actions.append(a)
+        if not states or states[-1] != routine.state:
+            states.append(routine.state)
+        if a.done or a.aborted:
+            break
+        x += a.vx * dt
+        t += dt
+    return actions, states
+
+
+def test_over_climbs_crosses_the_landing_and_descends_before_switching_out():
+    """Competition staircase: 3 up (nose up), a landing, 3 down (nose down), then level ground."""
+    from lite3_movement_tests.stairs import StairRoutine
+    def pitch(x):
+        if x < 0.3:
+            return 0.0                                     # approach, flat
+        if x < 1.2:
+            return -0.17                                   # climbing (nose up)
+        if x < 1.7:
+            return 0.0                                     # top landing
+        if x < 2.6:
+            return 0.17                                    # descending (nose down)
+        return 0.0
+    r = StairRoutine('up', over=True)
+    actions, states = _run(r, pitch)
+    assert actions[-1].done and not actions[-1].aborted
+    assert states == ['approach', 'switch_in', 'climb', 'landing', 'descend', 'switch_out', 'done']
+    assert [a.switch for a in actions if a.switch] == ['in', 'out']          # stair mode held over the top
+    assert r.direction == 'down'
+
+
+def test_over_with_no_way_down_switches_out_on_the_landing():
+    from lite3_movement_tests.stairs import StairRoutine
+    r = StairRoutine('up', over=True)
+    actions, states = _run(r, lambda x: -0.17 if 0.3 <= x < 1.2 else 0.0)
+    assert actions[-1].done and states[-3:] == ['landing', 'switch_out', 'done']
+
+
+def test_without_over_the_climb_ends_at_the_top_as_before():
+    from lite3_movement_tests.stairs import StairRoutine
+    _, states = _run(StairRoutine('up'), lambda x: -0.17 if 0.3 <= x < 1.2 else 0.0)
+    assert 'landing' not in states and states[-1] == 'done'

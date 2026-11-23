@@ -13,7 +13,7 @@
 #   operator/roam.sh plan [--max-speed V]  effective speed limits, stop zones, turning clearance (no motion)
 # Default strategy scan-walk: walk an observed open corridor; search left/right in short turns when no route is visible.
 # start options: --max-speed V (default 0.50)  --strategy scan-walk|frontier  --speed slow|normal|fast
-#   --speed-limit M/S  --modes "slow=0.04,fast=0.09"
+#   --speed-limit M/S  --modes "slow=0.04,fast=0.09"   (start mode default: normal)
 #   --geofence M (1-10, default 10)  --max-minutes N (<= 120)  --abort-clearance M  --frontier-radius M
 #   --max-map-age S  --max-sensor-age S  --min-lidar-hz HZ  --direct-telemetry
 #   --gait NAME (default rug_hstep, uneven course. Perception guide s7.3.2/s8.2.2 pairs even floors with the even slow/medium

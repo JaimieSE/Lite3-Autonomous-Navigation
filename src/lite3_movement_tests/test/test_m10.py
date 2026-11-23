@@ -468,7 +468,7 @@ def test_default_roam_speed_is_capped_by_session_and_fast_can_go_higher():
     assert R.session_modes('fast=0.3', 0.50)['fast'][0] == 0.3                # explicit --modes wins
     a = R.parse(['run', '--speed-limit', '0.5'])
     cfg = R.build_config(a, {'MAX_SPEED': '0.5'})
-    assert cfg.start_mode == 'slow' and cfg.mode_speed(cfg.start_mode)[0] == 0.05
+    assert cfg.start_mode == 'normal' and cfg.mode_speed(cfg.start_mode)[0] == 0.5   # operator 2026-11-23: regular speed
     assert R.session_modes('', 0.8)['normal'][0] == 0.5
     assert R.session_modes('', 0.8)['fast'][0] == 0.8
     assert R.session_modes('', 0.07)['normal'][0] == 0.07
@@ -919,3 +919,272 @@ def test_patrol_fallback_goes_only_to_white_space_not_yet_walked():
     assert goal is not None and goal['x'] >= 1.0
     e.visited = [(x / 10, 0.0) for x in range(-5, 26, 3)]                # walked the whole strip
     assert e._patrol(grid, (2.0, 0.0, 0.0)) is None
+
+
+def _advise(monkeypatch, after_s, **fields):
+    """Feed the advisory topic in the simulator from after_s on (set where roam reads scene input)."""
+    import json as _json
+    original = R.RoamSession._take_scene
+    data = {"obstacle": "stairs", "reason": "confirmed", "stamp_ns": 1, "distance_m": 0.7,
+            "distance_reference": "base_link_forward", "heading_correction_deg": 0.0}
+    data.update(fields)
+
+    def take(self, now, pose):
+        if self.t_roam is not None and now - self.t_roam >= after_s:
+            self.robot.advisory = (self.robot.now(), _json.dumps(data))
+        return original(self, now, pose)
+    monkeypatch.setattr(R.RoamSession, '_take_scene', take)
+
+
+def test_confirmed_stairs_nearby_start_the_stair_routine(tmp_path, monkeypatch):
+    _advise(monkeypatch, 3.0, distance_m=0.7, heading_correction_deg=2.0)
+    _, summary, robot, _ = roam(tmp_path, cfg=R.RoamConfig(strategy='scan_walk'), stop_after=40)
+    names = [e['event'] for e in summary['events']]
+    assert 'stairs_detected' in names and 'stairs_align' not in names
+    start = next(e for e in summary['events'] if e['event'] == 'stairs_start')
+    assert start['trigger'] == 'advisory' and start['direction'] == 'up'
+    # flat simulator: no incline within 1 m, so the routine aborts and roam pauses out of AI mode
+    assert 'stairs_aborted' in names and summary['rest_verified']
+
+
+def test_stairs_at_an_angle_are_faced_first(tmp_path, monkeypatch):
+    _advise(monkeypatch, 3.0, distance_m=0.7, heading_correction_deg=20.0)
+    _, summary, _, _ = roam(tmp_path, cfg=R.RoamConfig(strategy='scan_walk'), stop_after=40)
+    names = [e['event'] for e in summary['events']]
+    assert names.index('stairs_align') < names.index('stairs_start')
+    spin = [e for e in summary['events'] if e['event'] == 'spin'][-1]
+    assert spin['degrees'] == 20
+
+
+def test_far_stairs_are_walked_to_first(tmp_path, monkeypatch):
+    _advise(monkeypatch, 3.0, distance_m=1.8, heading_correction_deg=0.0)
+    _, summary, _, _ = roam(tmp_path, cfg=R.RoamConfig(strategy='scan_walk'), stop_after=25)
+    walk = next(e for e in summary['events'] if e['event'] == 'walk' and e['ends_at'] == 'stairs')
+    assert abs(walk['distance_m'] - (1.8 - R.ADVISORY_STAIRS_WALK_TO_M)) < 0.05
+
+
+def test_near_curtain_is_crossed_straight_then_costmaps_cleared(tmp_path, monkeypatch):
+    _advise(monkeypatch, 3.0, obstacle='curtain', distance_m=0.5, heading_correction_deg=None,
+            distance_reference='rgb_camera_optical_depth')
+    _, summary, robot, _ = roam(tmp_path, cfg=R.RoamConfig(strategy='scan_walk'), stop_after=40)
+    ev = summary['events']
+    start = next(e for e in ev if e['event'] == 'curtain_crossing')
+    assert abs(start['curtain_m'] - 0.75) < 0.01 and abs(start['length_m'] - (0.75 + R.CURTAIN_PAST_M)) < 0.01
+    done = next(e for e in ev if e['event'] == 'curtain_crossed')
+    assert done['travelled_m'] >= 0.75 + R.CURTAIN_PAST_M
+    assert any(e['event'] == 'costmap_cleared' and e['why'] == 'curtain crossed' for e in ev)
+    assert summary['stats']['curtain_crossings'] == 1
+
+
+def test_far_curtain_and_log_mode_do_not_take_over(tmp_path, monkeypatch):
+    _advise(monkeypatch, 3.0, obstacle='curtain', distance_m=2.0, heading_correction_deg=None,
+            distance_reference='rgb_camera_optical_depth')
+    _, summary, _, _ = roam(tmp_path, cfg=R.RoamConfig(strategy='scan_walk'), stop_after=20)
+    names = [e['event'] for e in summary['events']]
+    assert 'advisory' in names and 'curtain_crossing' not in names
+
+
+def test_log_mode_only_logs(tmp_path, monkeypatch):
+    _advise(monkeypatch, 3.0, distance_m=0.7)
+    _, summary, _, _ = roam(tmp_path, cfg=R.RoamConfig(strategy='scan_walk', advisory='log'), stop_after=20)
+    names = [e['event'] for e in summary['events']]
+    assert 'advisory' in names and 'stairs_start' not in names
+
+
+def test_blocked_curtain_stops_and_pauses(tmp_path, monkeypatch):
+    """A 'curtain' that does not give way (a wall): no progress -> stop and pause, never push on."""
+    from lite3_movement_tests.sim_model import SimLite3
+    _advise(monkeypatch, 3.0, obstacle='curtain', distance_m=0.5, heading_correction_deg=None,
+            distance_reference='rgb_camera_optical_depth')
+    original = R.RoamSession._crossing_tick
+
+    def stuck(self, now):
+        if self.crossing is not None:
+            self.crossing['origin'] = (self.robot.telemetry.odom.latest()[1].x,
+                                       self.robot.telemetry.odom.latest()[1].y)   # never gets anywhere
+        return original(self, now)
+    monkeypatch.setattr(R.RoamSession, '_crossing_tick', stuck)
+    _, summary, _, _ = roam(tmp_path, cfg=R.RoamConfig(strategy='scan_walk'), stop_after=30)
+    failed = next(e for e in summary['events'] if e['event'] == 'curtain_crossing_failed')
+    assert 'no progress' in failed['reason']
+    assert any(e['event'] == 'paused' and 'curtain crossing stopped' in e['reason'] for e in summary['events'])
+
+
+def test_blocked_passage_that_is_a_curtain_is_crossed_not_paused_at(tmp_path, monkeypatch):
+    import json as _json
+    monkeypatch.setattr(R.ScanWalk, 'choose', lambda *a, **kw: None)
+    monkeypatch.setattr(R.ScanWalk, 'straight_ahead', lambda *a, **kw: None)
+    monkeypatch.setattr(R.RoamSession, '_frontier_goal', lambda *a, **kw: None)
+    monkeypatch.setattr(R, 'blocked_passage', lambda grid, pose, **kw: {
+        'yaw': pose[2] + math.pi / 2, 'wall_m': 0.40, 'unknown': 0.9, 'width_deg': 25})
+    original = R.RoamSession._take_scene
+
+    def take(self, now, pose):
+        if self.passage is not None and 'wait_until' in self.passage:       # detector confirms while waiting
+            self.robot.advisory = (self.robot.now(), _json.dumps({
+                "obstacle": "curtain", "reason": "confirmed", "distance_m": 0.12,
+                "distance_reference": "rgb_camera_optical_depth", "heading_correction_deg": None}))
+        return original(self, now, pose)
+    monkeypatch.setattr(R.RoamSession, '_take_scene', take)
+    _, summary, _, _ = roam(tmp_path, cfg=R.RoamConfig(strategy='scan_walk'), stop_after=120)
+    names = [e['event'] for e in summary['events']]
+    assert names.index('passage_waiting') < names.index('curtain_crossing') < names.index('curtain_crossed')
+    crossed = names.index('curtain_crossed')
+    assert not any(e['event'] == 'paused' for e in summary['events'][:crossed])   # crossed, not stopped at
+
+
+
+def test_advisory_stairs_go_up_over_the_landing_and_down_then_roam_on(tmp_path, monkeypatch):
+    """Operator 2026-11-23: after the climb it comes back down the other side; it does not stay on top."""
+    from lite3_movement_tests import ros_io as IO, stairs as ST
+    _advise(monkeypatch, 3.0, distance_m=0.7)
+    original_step = ST.StairRoutine.step
+
+    def staircase(self, t, pitch, roll, travelled):
+        p = 0.0
+        if 0.1 <= travelled < 0.5:
+            p = -0.17                                   # up
+        elif 0.75 <= travelled < 1.15:
+            p = 0.17                                    # down
+        return original_step(self, t, p, roll, travelled)
+    monkeypatch.setattr(ST.StairRoutine, 'step', staircase)
+    _, summary, robot, _ = roam(tmp_path, cfg=R.RoamConfig(strategy='scan_walk'), stop_after=90)
+    names = [e['event'] for e in summary['events']]
+    assert next(e for e in summary['events'] if e['event'] == 'stairs_start')['over'] is True
+    assert names.index('stairs_start') < names.index('stairs_landing') < names.index('stairs_descend') \
+        < names.index('stairs_done')
+    first = names[:names.index('stairs_done') + 1]          # (the fake keeps reporting stairs: later re-climbs)
+    assert first.count('stairs_switch_in') == 1 and first.count('stairs_switch_out') == 1   # AI held over the top
+    assert 'paused' not in first
+    simple = [s[2] for s in robot.sent if s[1] == 'simple']
+    assert simple[:4] == [IO.AI_ENTER, IO.AI_GAIT_BASIC, IO.AI_EXIT, IO.NAVIGATION_MODE]
+
+
+def test_mission_events_are_logged_once_and_do_not_change_movement(tmp_path, monkeypatch):
+    import json as _json
+    original = R.RoamSession._take_scene
+    sent = {'n': 0}
+
+    def take(self, now, pose):
+        if self.t_roam is not None and now - self.t_roam >= 3.0 and sent['n'] < 3:
+            sent['n'] += 1                                   # same event three times: logged once
+            self.robot.mission = [(self.robot.now(), _json.dumps({
+                "event_id": "f9-object-0", "type": "observation",
+                "data": {"label": "person", "confidence": 0.9,
+                         "location": {"frame_id": "map", "x": 2.0, "y": 1.0, "z": 0.2}}}))]
+        return original(self, now, pose)
+    monkeypatch.setattr(R.RoamSession, '_take_scene', take)
+    _, summary, _, _ = roam(tmp_path, cfg=R.RoamConfig(strategy='scan_walk'), stop_after=20)
+    logged = [e for e in summary['events'] if e['event'] == 'mission']
+    assert len(logged) == 1 and logged[0]['value'] == 'person' and logged[0]['at'] == [2.0, 1.0]
+    assert summary['stats']['mission_events'] == 1
+    assert any(s.get('kind') == 'mission_observation' for s in summary['sightings'])
+    assert 'paused' not in [e['event'] for e in summary['events']]
+
+
+def _lane_with_side_room():
+    """Big course 2026-11-21 in miniature: a 1.4 m lane along x (y -0.7..0.7) from x -0.5 to 3.0, closed at
+    both ends, with a 1.4 m opening on its left at x 1.0..2.4 into an unexplored room (y up to 2.5)."""
+    return _grid(free=[(-0.5, 3.0, -0.7, 0.7), (1.0, 2.4, 0.7, 2.5)],
+                 occupied=[(-0.6, -0.5, -0.8, 0.8), (3.0, 3.1, -0.8, 0.8), (-0.6, 3.1, -0.8, -0.7),
+                           (-0.6, 1.0, 0.7, 0.8), (2.4, 3.1, 0.7, 0.8)])
+
+
+def test_novelty_marks_walked_lanes():
+    w = R.ScanWalk(R.RoamConfig(strategy='scan_walk'), (0.0, 0.0))
+    assert w.novelty((0, 0, 0), 0.0, 2.0) == 1.0                         # no memory: everything new
+    w.visited = [(x / 10, 0.0) for x in range(0, 31, 3)]
+    assert w.novelty((0.0, 0.0, 0.0), 0.0, 2.5) == 0.0
+    assert w.novelty((1.7, 0.0, 0.0), math.pi / 2, 2.0) > 0.5
+
+
+def test_walked_lane_is_not_walked_again_while_a_new_opening_exists():
+    """Operator 2026-11-23 coverage: at the far end of a lane already walked both ways, turn into the side
+    room, not back down the lane (the big-course pacing)."""
+    grid = _lane_with_side_room()
+    w = R.ScanWalk(R.RoamConfig(strategy='scan_walk', geofence_m=6.0), (0.0, 0.0))
+    w.visited = [(x / 10, 0.0) for x in range(0, 26, 3)]                 # lane walked to x 2.5 and back
+    w.heading_ref = math.pi                                               # last walked back towards x 0
+    pose = (1.7, 0.0, math.pi)
+    assert w.straight_ahead(grid, pose, None, 0.0) is None and w.last_status == 'walked_lane'
+    goal = w.choose(grid, pose, 0.0)
+    assert goal is not None and goal['y'] > 0.5                           # into the side room
+    assert abs(math.atan2(math.sin(goal['yaw'] - math.pi / 2), math.cos(goal['yaw'] - math.pi / 2))) < 0.6
+
+
+def test_fully_walked_area_still_offers_a_walk_as_last_resort():
+    grid = _grid(free=[(-0.5, 3.0, -0.7, 0.7)], occupied=[(3.0, 3.1, -1, 1), (-0.6, -0.5, -1, 1)])
+    w = R.ScanWalk(R.RoamConfig(strategy='scan_walk', geofence_m=6.0), (0.0, 0.0))
+    w.visited = [(x / 10, y / 10) for x in range(-5, 31, 3) for y in (-5, 0, 5)]
+    assert w.choose(grid, (1.0, 0.0, 0.0), 0.0) is None and w.last_status == 'no_new_direction'
+    assert w.choose(grid, (1.0, 0.0, 0.0), 0.0, allow_visited=True) is not None
+
+
+
+def test_roam_shares_one_walked_path_for_coverage_and_patrol(tmp_path, monkeypatch):
+    seen = []
+    original = R.RoamSession._scan_walk
+
+    def check(self, now, pose):
+        seen.append(self.explorer.visited is self.frontiers.visited and len(self.frontiers.visited) >= 1)
+        return original(self, now, pose)
+    monkeypatch.setattr(R.RoamSession, '_scan_walk', check)
+    roam(tmp_path, cfg=R.RoamConfig(strategy='scan_walk'), stop_after=15)
+    assert seen and all(seen)
+
+
+def test_goes_back_past_walked_lanes_to_find_unexplored_space():
+    """Operator 2026-11-23: "it should be able to backtrack to find things if needed". At the dead end of a
+    lane already walked, an unvisited room near the START is still a goal (Nav2 routes back down the lane)."""
+    grid = _grid(free=[(-0.5, 3.0, -0.7, 0.7), (-0.5, 0.9, 0.7, 2.5)],          # room off the lane's start
+                 occupied=[(3.0, 3.1, -0.8, 0.8), (-0.6, -0.5, -0.8, 2.6), (0.9, 3.1, 0.7, 0.8),
+                           (-0.6, 3.1, -0.8, -0.7)])
+    cfg = R.RoamConfig(strategy='scan_walk', geofence_m=6.0)
+    walked = [(x / 10, 0.0) for x in range(0, 26, 3)]                    # walked the lane out to x 2.5
+    w = R.ScanWalk(cfg, (0.0, 0.0))
+    w.visited, w.heading_ref = walked, 0.0
+    pose = (2.5, 0.0, 0.0)
+    assert w.straight_ahead(grid, pose, None, 0.0) is None                # dead end ahead
+    e = R.Explorer(cfg, (0.0, 0.0))
+    e.clearance_m, e.veto, e.visited = R.FRONTIER_FALLBACK_CLEARANCE_M, R.FRONTIER_FALLBACK_VETO, walked
+    goal = e.choose(grid, pose, 0.0)
+    assert goal is not None and goal['x'] < 1.0 and goal['y'] > 0.7     # back near the start, in the room
+
+
+def test_patrol_skips_floor_the_camera_has_seen():
+    from lite3_movement_tests.coverage import CameraCoverage
+    g = _grid(free=[(-0.5, 2.5, -0.5, 0.5)])
+    e = R.Explorer(R.RoamConfig(strategy='scan_walk'), (0.0, 0.0))
+    e.clearance_m, e.veto = R.FRONTIER_FALLBACK_CLEARANCE_M, R.FRONTIER_FALLBACK_VETO
+    e.seen = CameraCoverage((0.0, 0.0), 4.0)
+    assert e._patrol(g, (0.0, 0.0, 0.0)) is not None
+    e.seen.seen[:] = True                                    # camera has looked everywhere
+    assert e._patrol(g, (0.0, 0.0, 0.0)) is None
+
+
+def test_look_around_after_walks_only_where_unseen_and_never_twice_in_one_spot(tmp_path):
+    _, summary, _, _ = roam(tmp_path, cfg=R.RoamConfig(strategy='scan_walk', stop_at_exit=False), stop_after=120)
+    ev = summary['events']
+    assert [e['event'] for e in ev].count('exit_reached') <= 2      # once per arrival, not every check
+    looks = [e for e in ev if e['event'] == 'look_around']
+    assert looks, 'the simulator room has unseen sides after the first walk'
+    for e in looks:
+        assert e['turns_deg'] in ([90.0], [-90.0], [90.0, -180.0])
+        assert (e['left_unseen_m2'] >= R.LOOK_MIN_SIDE_M2) == (90.0 in e['turns_deg'])
+    names = [e['event'] for e in ev]
+    first = names.index('look_around')
+    assert 'walk_end' in names[:first] or 'walk_failed' in names[:first]   # only after a walk
+    assert summary['stats']['camera_seen_m2'] > 0
+    assert summary['stats']['look_arounds'] == len(looks)
+
+
+def test_look_around_turns_are_not_cut_short_by_an_opening(tmp_path, monkeypatch):
+    monkeypatch.setattr(R.RoamSession, '_walk_candidate',
+                        lambda self, now, pose, allow_visited=False: {'kind': 'walk', 'x': pose[0] + 1, 'y': pose[1],
+                                                                       'yaw': pose[2], 'score': 1.0, 'free_m': 1.0,
+                                                                       'ends_at': 'obstacle'})
+    _, summary, _, _ = roam(tmp_path, cfg=R.RoamConfig(strategy='scan_walk', stop_at_exit=False), stop_after=90)
+    names = [e['event'] for e in summary['events']]
+    if 'look_around' in names:
+        after = names[names.index('look_around') + 1:]
+        assert after[0] == 'spin' and after[1] in ('spin_done', 'spin_incomplete')   # not 'spin_opening'

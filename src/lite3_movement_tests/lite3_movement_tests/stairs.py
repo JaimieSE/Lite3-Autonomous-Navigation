@@ -32,6 +32,7 @@ class StairConfig:
     max_retries: int = 1                 # extra attempts after a timed-out climb
     approach_max_s: float = 8.0          # approach also gives up after this long (blocked feet)
     flat_cross_m: float = 0.6            # a step too small to tilt the body: crossed after this far, level
+    landing_max_m: float = 1.2           # over: walk the top landing this far looking for the way down
 
     def __post_init__(self):
         if not 0 < self.level_pitch_rad < self.incline_pitch_rad < self.max_pitch_rad:
@@ -53,15 +54,19 @@ class Action:
 
 class StairRoutine:
     """approach -> switch_in -> climb -> switch_out -> done. Abort on pitch/roll limits; bounded retries.
+    over=True (competition staircase: 3 up then 3 down, operator 2026-11-23): after the top, stay in the stair
+    mode on the landing until the body tilts nose-down, descend to level ground, then switch out; no way
+    down within landing_max_m = a plain top, switch out there.
     step() is called every tick with the robot's pitch/roll (rad) and the distance travelled (m)."""
 
-    def __init__(self, direction, cfg=StairConfig(), start='approach'):
+    def __init__(self, direction, cfg=StairConfig(), start='approach', over=False):
         if direction not in ('up', 'down'):
             raise ValueError("direction must be 'up' or 'down'")
         if start not in ('approach', 'switch_in'):
             raise ValueError("start must be 'approach' or 'switch_in'")
         self.direction = direction
         self.cfg = cfg
+        self.over = bool(over) and direction == 'up'
         self.state = start            # 'switch_in': already at the step (automatic trigger)
         self.switch_sent = False
         self.t_state = None
@@ -112,6 +117,9 @@ class StairRoutine:
             elif self.inclined and abs(pitch) < c.level_pitch_rad and travelled - self.d_state >= c.min_climb_m:
                 self.level_since = t if self.level_since is None else self.level_since
                 if t - self.level_since >= c.level_hold_s:        # level again after the incline: top
+                    if self.over and self.direction == 'up':
+                        self._enter('landing', t, travelled)
+                        return Action(vx=c.climb_speed_m_s)
                     self._enter('switch_out', t, travelled)
                     return Action(switch='out')
             elif not self.inclined and abs(pitch) < c.level_pitch_rad and travelled - self.d_state >= c.flat_cross_m:
@@ -126,6 +134,29 @@ class StairRoutine:
                 self.retries += 1
                 self._enter('climb', t, travelled)
                 return Action()
+            return Action(vx=c.climb_speed_m_s)
+        if self.state == 'landing':
+            if abs(pitch) >= c.incline_pitch_rad:                 # front feet over the first step down
+                self.direction = 'down'
+                self._enter('descend', t, travelled)
+                self.inclined, self.level_since = True, None
+                return Action(vx=c.climb_speed_m_s)
+            if travelled - self.d_state > c.landing_max_m:       # no way down: a plain top
+                self._enter('switch_out', t, travelled)
+                return Action(switch='out')
+            return Action(vx=c.climb_speed_m_s)
+        if self.state == 'descend':
+            if abs(pitch) >= c.incline_pitch_rad:
+                self.inclined, self.level_since = True, None
+            elif abs(pitch) < c.level_pitch_rad and travelled - self.d_state >= c.min_climb_m:
+                self.level_since = t if self.level_since is None else self.level_since
+                if t - self.level_since >= c.level_hold_s:        # level at the bottom
+                    self._enter('switch_out', t, travelled)
+                    return Action(switch='out')
+            else:
+                self.level_since = None
+            if t - self.t_state > c.max_climb_s:
+                return self._abort(f'no bottom within {c.max_climb_s:.0f} s of the way down')
             return Action(vx=c.climb_speed_m_s)
         if self.state == 'switch_out':
             if t - self.t_state < c.switch_settle_s:

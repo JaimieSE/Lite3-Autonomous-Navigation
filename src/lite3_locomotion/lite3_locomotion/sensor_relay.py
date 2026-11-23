@@ -50,6 +50,10 @@ def _node(domain, name):
 
 
 DEPTH_SOURCE, DEPTH_INFO, DEPTH_OUTPUT = '/camera/depth/image_raw', '/camera/depth/camera_info', '/lite3/depth_points'
+# The same raw depth frames, unchanged, for other programs on this PC (teammates' stair/curtain detector and
+# mission recorder). Each consumer of the robot's /camera/depth/image_raw costs its own ~2.6 MB/s on the robot
+# link (three copies, 2026-11-23 audit); these local copies cost none. Operator 2026-11-23: "share depth".
+SHARED_DEPTH_IMAGE, SHARED_DEPTH_INFO = '/lite3/camera/depth/image_raw', '/lite3/camera/depth/camera_info'
 
 
 def _depth_relay(src, out, counts, windows, previous_arrival):
@@ -60,12 +64,18 @@ def _depth_relay(src, out, counts, windows, previous_arrival):
     intrinsics = {}
     pub = out.create_publisher(PointCloud2, DEPTH_OUTPUT, QoSProfile(depth=2, reliability=ReliabilityPolicy.RELIABLE))
     qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST)
+    # Local copies: best effort, keep last 2 - a slow consumer drops frames instead of holding the relay up.
+    shared_qos = QoSProfile(depth=2, reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST)
+    shared_image = out.create_publisher(Image, SHARED_DEPTH_IMAGE, shared_qos)
+    shared_info = out.create_publisher(CameraInfo, SHARED_DEPTH_INFO, shared_qos)
     counts[DEPTH_SOURCE] = 0
 
     def on_info(msg):
         intrinsics['k'] = (msg.k[0], msg.k[4], msg.k[2], msg.k[5])
+        shared_info.publish(msg)
 
     def on_depth(msg):
+        shared_image.publish(msg)                  # unchanged, before our own processing
         if 'k' not in intrinsics or msg.encoding not in ('16UC1', 'mono16'):
             return
         arrived = time.monotonic()
@@ -85,7 +95,8 @@ def _depth_relay(src, out, counts, windows, previous_arrival):
 
     src.create_subscription(CameraInfo, DEPTH_INFO, on_info, qos)
     src.create_subscription(Image, DEPTH_SOURCE, on_depth, qos)
-    out.get_logger().info(f'depth camera: {DEPTH_SOURCE} (domain {SOURCE_DOMAIN}) -> {DEPTH_OUTPUT} (domain {OUTPUT_DOMAIN})')
+    out.get_logger().info(f'depth camera: {DEPTH_SOURCE} (domain {SOURCE_DOMAIN}) -> {DEPTH_OUTPUT} and '
+                          f'{SHARED_DEPTH_IMAGE} (domain {OUTPUT_DOMAIN})')
 
 
 def main():

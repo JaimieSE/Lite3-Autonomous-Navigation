@@ -69,6 +69,17 @@ class Report:
 
 
 # ---------------------------------------------------------------- kernel / network
+
+# Robot telemetry may not pause longer than this (was a fixed 0.25 s). Operator 2026-11-23: 0.35 s allowed
+# for the stair test on a link with ~0.3 s dropouts, per command (LITE3_TELEMETRY_MAX_GAP_S); never above 0.35.
+TELEMETRY_MAX_GAP_DEFAULT_S = 0.25
+TELEMETRY_MAX_GAP_CAP_S = 0.35
+try:
+    TELEMETRY_MAX_GAP_S = min(max(float(os.environ.get('LITE3_TELEMETRY_MAX_GAP_S',
+                                                        TELEMETRY_MAX_GAP_DEFAULT_S)), 0.1), TELEMETRY_MAX_GAP_CAP_S)
+except ValueError:
+    TELEMETRY_MAX_GAP_S = TELEMETRY_MAX_GAP_DEFAULT_S
+
 def read_sysctl(name):
     try:
         return int(Path('/proc/sys/' + name.replace('.', '/')).read_text().split()[0])
@@ -234,7 +245,7 @@ def check_network(report, ros, seconds, direct=False):
     if not direct:
         for topic in ROBOT_TOPICS:
             r = rates[topic]
-            ok = r['hz'] >= 100 and (r['max_gap_s'] or 9) < 0.25
+            ok = r['hz'] >= 100 and (r['max_gap_s'] or 9) < TELEMETRY_MAX_GAP_S
             report.add('OK' if ok else 'FAIL', f'robot telemetry {topic}',
                        f"{r['hz']} Hz, max gap {r['max_gap_s']} s",
                        'check the robot and lab telemetry bridge')
@@ -256,7 +267,7 @@ def check_network(report, ros, seconds, direct=False):
             sys_ros.close()
         for topic in ROBOT_TOPICS:
             r = direct_rates[topic]
-            ok = r['hz'] >= 100 and (r['max_gap_s'] or 9) < 0.25
+            ok = r['hz'] >= 100 and (r['max_gap_s'] or 9) < TELEMETRY_MAX_GAP_S
             report.add('OK' if ok else 'FAIL', f'robot telemetry {topic} (direct, domain 64)',
                        f"{r['hz']} Hz, max gap {r['max_gap_s']} s",
                        'direct telemetry gap at group8: compare source and receiver during the same interval')

@@ -69,6 +69,16 @@ class RoamRobot(NavRobot):
         from std_msgs.msg import String
         self.scene = []
         node.create_subscription(String, SCENE_TOPIC, lambda m: self.scene.append((time.monotonic(), m.data)), 10)
+        # Mission events (teammate's ~/live_mission recorder, --publish-mission-events): logged only
+        from .mission_events import MISSION_EVENTS_TOPIC
+        self.mission = []
+        node.create_subscription(String, MISSION_EVENTS_TOPIC,
+                                 lambda m: self.mission.append((time.monotonic(), m.data)), 50)
+        # Stair / curtain advisory (teammate's ~/stair_curtain detector): latest message, stamped on arrival
+        from .advisory import ADVISORY_TOPIC
+        self.advisory = None
+        node.create_subscription(String, ADVISORY_TOPIC,
+                                 lambda m: setattr(self, 'advisory', (time.monotonic(), m.data)), 10)
         # sensor_relay's domain-64 copy: subscribing the bridged /livox/points would make the bridge
         # send every cloud again over the robot link (and it arrives ~0.8 s later)
         node.create_subscription(PointCloud2, '/lite3/livox_points', lambda raw: t.raw_cloud.add(
