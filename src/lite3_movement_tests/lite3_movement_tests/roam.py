@@ -85,6 +85,9 @@ COVERAGE_PERIOD_S = 0.3                # camera coverage update interval (covera
 LOOK_RADIUS_M = 2.5                    # look-around: unseen mapped floor within this of the robot ...
 LOOK_SIDE_HALF_DEG = 60.0              # ... in the sector +-60 deg around 90 deg left / right ...
 LOOK_MIN_SIDE_M2 = 0.6                 # ... at least this much on a side: turn 90 deg to look at it
+LOOK_STEP_DEG = 45.0                   # look-arounds turn in steps this size (overlapping 80 deg views) ...
+LOOK_DWELL_S = 1.2                     # ... and stand still this long facing each step (YOLO ~1 frame/s)
+COVER_MAX_YAW_RATE = 0.5               # rad/s: count camera coverage only while turning slower (no blur, frames)
 LOOK_SPACING_M = 1.2                   # no new look-around within this of an earlier one
 COVER_RADIUS_M = 0.7                   # coverage: a spot this close to the walked path counts as covered
 COVER_SAMPLE_M = 0.2                   # sample spacing along a candidate walk
@@ -896,6 +899,10 @@ ROAM_TELEMETRY_AGE_S = 1.0      # joints/IMU/leg odometry silence that stops roa
                                 # streams gapped 0.3-0.75 s at once) aborted the stand at 0.5 s.
 ROAM_MAX_ODOM_LAG_S = 1.0       # LiDAR odometry lag accepted at readiness (was 0.5)
 ROAM_RAW_LIDAR_STALE_S = 1.0    # single raw-cloud gap that ends roaming (was max_sensor_age_s, 0.5)
+HAZARD_STALE_S = 0.5                   # full stop layers: hazard cloud older than this = clearance unknown
+HAZARD_STALE_DOCS_S = 1.0              # docs-only stops (was 0.5, as above): match the terrain-status limit.
+                                       # 2026-11-23 14:33 and 14:43 safety stops were 0.64-0.66 s LiDAR
+                                       # gaps on the robot link, inside the 1.0 s the terrain status allows
 TERRAIN_FLOOR_MAX_AGE_S = 1.0   # terrain grid used as "seen free" floor only while this fresh
 ROAM_LIDAR_RATE_WINDOW_S = 5.0  # >= 8 Hz averaged over this (was 2 s: 15 of 20 clouds, so ~0.6 s silence
                                 # already read as "7 Hz" and stopped the 10:16 run)
@@ -1071,7 +1078,7 @@ class RoamSession:
             return 'LiDAR/terrain status stale'
         if item[1].problems:
             return f'terrain inputs invalid: {list(item[1].problems)}'
-        if t.clearance.age(now) > 0.5:
+        if t.clearance.age(now) > self._hazard_max_age():
             return 'hazard cloud stale: obstacle clearance unknown'
         clearance = t.clearance.latest()[1]
         self.stats['min_clearance_m'] = min(self.stats['min_clearance_m'], clearance)
@@ -1172,9 +1179,10 @@ class RoamSession:
         self.event('spin_' + how, turned_deg=_r(math.degrees(spun or 0.0), 0))
         if how == 'done':
             self.stats['spins_completed'] += 1
+        looking = bool(self.goal and self.goal.get('look'))
         self.goal = None
         self._spin_ended = now
-        self.choose_after = now if how == 'opening' else now + MAP_SETTLE_S
+        self.choose_after = now if how == 'opening' else now + (LOOK_DWELL_S if looking and self.look else MAP_SETTLE_S)
 
     def _floor_lookup(self, now, pose):
         """(x, y) -> observed floor, from the latest terrain_monitor grid (level base_link frame, centred
@@ -1357,11 +1365,12 @@ class RoamSession:
         grid, half = self.map[1], math.radians(LOOK_SIDE_HALF_DEG)
         left = self.coverage.unseen_free_m2(grid, pose[:2], LOOK_RADIUS_M, pose[2] + math.pi / 2, half)
         right = self.coverage.unseen_free_m2(grid, pose[:2], LOOK_RADIUS_M, pose[2] - math.pi / 2, half)
-        turns = []
+        turns = []                                       # 45 deg steps, a pause after each (operator 2026-11-23)
+        steps = int(round(90.0 / LOOK_STEP_DEG))
         if left >= LOOK_MIN_SIDE_M2:
-            turns.append(90.0)
+            turns += [LOOK_STEP_DEG] * steps
         if right >= LOOK_MIN_SIDE_M2:
-            turns.append(-180.0 if turns else -90.0)
+            turns += [-LOOK_STEP_DEG] * (steps * (2 if turns else 1))
         if not turns:
             return False
         self.look_spots.append((pose[0], pose[1]))
@@ -1457,8 +1466,15 @@ class RoamSession:
     def _scan_walk(self, now, pose):
         """Walk on the first usable map; search both sides only while a corridor is missing."""
         if self.coverage is not None and self.map is not None and now - self._coverage_t >= COVERAGE_PERIOD_S:
-            self._coverage_t = now
-            self.coverage.update(pose, self.map[1])
+            last = getattr(self, '_coverage_pose', None)
+            dt = now - self._coverage_t
+            self._coverage_t, self._coverage_pose = now, pose
+            yaw_rate = abs(math.atan2(math.sin(pose[2] - last[2]), math.cos(pose[2] - last[2]))) / dt \
+                if last is not None and dt > 0 else 0.0
+            # Operator 2026-11-23: only views the detector could use count as seen - a fast swing past
+            # (look-around turns ran 1.25-1.5 rad/s, YOLO ~1 frame/s) does not.
+            if yaw_rate <= COVER_MAX_YAW_RATE:
+                self.coverage.update(pose, self.map[1])
             self.stats['camera_seen_m2'] = _r(self.coverage.seen_m2(), 1)
         if self.frontiers is not None and self.frontiers.visited is not None and \
                 math.hypot(pose[0] - self.frontiers.visited[-1][0], pose[1] - self.frontiers.visited[-1][1]) >= 0.3:
@@ -1593,6 +1609,9 @@ class RoamSession:
         # docs-only stops: terrain is a costmap input only (Nav2 tolerates a late update), so a single
         # link hiccup up to ROAM_RAW_LIDAR_STALE_S no longer ends the session (two stops 2026-11-20).
         return ROAM_RAW_LIDAR_STALE_S if self.cfg.docs_stops else self.cfg.max_sensor_age_s
+
+    def _hazard_max_age(self):
+        return HAZARD_STALE_DOCS_S if self.cfg.docs_stops else HAZARD_STALE_S
 
     def _terrain_now(self, now):
         item = self.robot.telemetry.terrain.latest()

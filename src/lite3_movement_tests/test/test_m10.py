@@ -1169,8 +1169,8 @@ def test_look_around_after_walks_only_where_unseen_and_never_twice_in_one_spot(t
     looks = [e for e in ev if e['event'] == 'look_around']
     assert looks, 'the simulator room has unseen sides after the first walk'
     for e in looks:
-        assert e['turns_deg'] in ([90.0], [-90.0], [90.0, -180.0])
-        assert (e['left_unseen_m2'] >= R.LOOK_MIN_SIDE_M2) == (90.0 in e['turns_deg'])
+        assert e['turns_deg'] in ([45.0, 45.0], [-45.0, -45.0], [45.0, 45.0, -45.0, -45.0, -45.0, -45.0])
+        assert (e['left_unseen_m2'] >= R.LOOK_MIN_SIDE_M2) == (45.0 in e['turns_deg'])
     names = [e['event'] for e in ev]
     first = names.index('look_around')
     assert 'walk_end' in names[:first] or 'walk_failed' in names[:first]   # only after a walk
@@ -1188,3 +1188,50 @@ def test_look_around_turns_are_not_cut_short_by_an_opening(tmp_path, monkeypatch
     if 'look_around' in names:
         after = names[names.index('look_around') + 1:]
         assert after[0] == 'spin' and after[1] in ('spin_done', 'spin_incomplete')   # not 'spin_opening'
+
+
+
+def test_look_steps_pause_briefly_and_the_last_step_waits_for_the_map(tmp_path):
+    _, summary, _, _ = roam(tmp_path, cfg=R.RoamConfig(strategy='scan_walk', stop_at_exit=False), stop_after=120)
+    ev = summary['events']
+    i = next(k for k, e in enumerate(ev) if e['event'] == 'look_around')
+    steps = len(ev[i]['turns_deg'])
+    spins = [e for e in ev[i + 1:] if e['event'] == 'spin'][:steps]
+    assert [s['degrees'] for s in spins] == ev[i]['turns_deg']           # every 45 deg step taken
+    gaps = [b['t_s'] - a['t_s'] for a, b in zip(spins, spins[1:])]
+    assert all(g >= R.LOOK_DWELL_S for g in gaps)                         # stood still facing each step
+
+
+def test_fast_turns_do_not_count_as_seen(tmp_path, monkeypatch):
+    """Coverage only while turning slower than COVER_MAX_YAW_RATE."""
+    marked = []
+    from lite3_movement_tests import coverage as C
+    real = C.CameraCoverage.update
+
+    def spy(self, pose, grid, *a, **k):
+        marked.append(pose)
+        return real(self, pose, grid, *a, **k)
+    monkeypatch.setattr(C.CameraCoverage, 'update', spy)
+    monkeypatch.setattr(R, 'COVER_MAX_YAW_RATE', -1.0)                    # nothing is slow enough
+    _, summary, _, _ = roam(tmp_path, cfg=R.RoamConfig(strategy='scan_walk', stop_at_exit=False), stop_after=20)
+    assert marked == [] and summary['stats'].get('camera_seen_m2', 0.0) == 0.0
+
+
+def test_hazard_staleness_matches_terrain_limit_in_docs_mode():
+    """2026-11-23 14:33 / 14:43: 0.64-0.66 s link dropouts tripped the 0.5 s hazard limit; docs mode allows 1.0 s
+    like the terrain status. Full stop layers keep 0.5 s."""
+    class Stub:
+        pass
+    s = Stub()
+    s.cfg = R.RoamConfig(strategy='scan_walk', docs_stops=True)
+    assert R.RoamSession._hazard_max_age(s) == R.HAZARD_STALE_DOCS_S == R.ROAM_RAW_LIDAR_STALE_S == 1.0
+    s.cfg = R.RoamConfig(strategy='scan_walk')
+    assert R.RoamSession._hazard_max_age(s) == R.HAZARD_STALE_S == 0.5
+
+
+def test_a_hazard_cloud_that_stops_for_good_still_stops_roaming_in_docs_mode(tmp_path):
+    outcome, summary, _, _ = roam(tmp_path, stop_after=120, nav_fault='hazard_stale',
+                                  cfg=R.RoamConfig(docs_stops=True))
+    assert outcome == 'SAFETY_STOP' and 'hazard cloud stale' in summary['stop_reason'] or \
+        'stale' in summary['stop_reason'], summary['stop_reason']
+    assert summary['rest_verified'] is True
