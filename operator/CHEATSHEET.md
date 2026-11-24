@@ -1,7 +1,7 @@
 # Lite3 roaming cheat sheet (remote / STOP in hand whenever the robot is armed)
 
 ```bash
-cd ~/lite3_ws && export LITE3_LIO_SOURCE=local
+cd ~/lite3_ws                                     # FAST-LIO runs locally by default (LITE3_LIO_SOURCE=system for the system host)
 operator/build.sh                                  # after code changes
 operator/roam.sh start --sim                       # rehearse, no robot
 operator/roam.sh start --physical --max-speed 0.9  # type ARM (navigation), then ROAM

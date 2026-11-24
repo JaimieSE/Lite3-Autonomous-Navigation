@@ -11,7 +11,7 @@
 #            button is the emergency stop. full = also the collision_monitor stop zone and the terrain
 #            proximity lock (use for the supervised M-series tests).
 #        --no-depth-camera: do not fuse the RealSense depth near field (adds ~6 MB/s on the robot link)
-#        --max-step M (default 0.40): terrain monitor's highest walkable rise (stairs ~0.05, rubble)
+#        --max-step M (default 0.35): terrain monitor's highest walkable rise (stairs ~0.05, rubble)
 #        --clearance M (default 0.15): obstacle clearance the collision_monitor stop must leave
 #        --max-speed V (default 0.10): fastest speed that boundary must cover (<= 1.0 m/s; only <= 0.10 is
 #            validated. Above 0.10 the boundary grows fast: braking distance is taken as quadratic in speed)

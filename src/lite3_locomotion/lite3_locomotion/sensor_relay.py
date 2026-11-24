@@ -104,7 +104,7 @@ def main():
     src_ctx, src_node, src_exec = _node(SOURCE_DOMAIN, 'lite3_sensor_relay_src')
     cloud_ctx, cloud_node, cloud_exec = _node(SOURCE_DOMAIN, 'lite3_sensor_relay_clouds')
     # In system mode FAST-LIO reads the Livox IMU on .64 itself.
-    relays = [r for r in RELAYS if r[1] != '/livox/imu' or os.environ.get('LITE3_LIO_SOURCE', 'system') == 'local']
+    relays = [r for r in RELAYS if r[1] != '/livox/imu' or os.environ.get('LITE3_LIO_SOURCE', 'local') == 'local']
     sources = {'telemetry': src_node, 'clouds': cloud_node}
     # Best effort in: never back-pressure the drivers. Reliable out: the consumers are local and
     # Fast-LIO subscribes reliable (best-effort readers match a reliable writer too).
@@ -139,7 +139,7 @@ def main():
 
         sources[group].create_subscription(msg_type, source, relay, in_qos, raw=True)
         out_node.get_logger().info(f'relaying {source} (domain {SOURCE_DOMAIN}) -> {output} (domain {OUTPUT_DOMAIN})')
-    if os.environ.get('LITE3_LIO_SOURCE', 'system') == 'system':
+    if os.environ.get('LITE3_LIO_SOURCE', 'local') == 'system':
         # Expose the bridged scan only in system mode so local FAST-LIO can own /scan.
         scan_qos = QoSProfile(depth=2, reliability=ReliabilityPolicy.BEST_EFFORT)
         scan_pub = out_node.create_publisher(LaserScan, '/scan', scan_qos)

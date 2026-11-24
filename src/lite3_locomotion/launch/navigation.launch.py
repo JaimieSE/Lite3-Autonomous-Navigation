@@ -40,7 +40,7 @@ LIDAR_SOURCE, LIDAR_DIRECT = '/livox/lidar', '/lite3/livox_lidar'      # sensor_
 POINTS_SOURCE, POINTS_DIRECT = '/livox/points', '/lite3/livox_points'
 
 
-TERRAIN_MAX_STEP_M = 0.40   # was 0.30, 0.18; = lite3_locomotion.terrain.TerrainParams.max_step_m default
+TERRAIN_MAX_STEP_M = 0.35   # was 0.40, 0.30, 0.18; = lite3_locomotion.terrain.TerrainParams.max_step_m default
 
 def _setup(context):
     share = get_package_share_directory('lite3_locomotion')
@@ -89,7 +89,7 @@ def _setup(context):
                   os.path.join(share, 'params', 'twist_mux_locks.yaml')]
     if allow:   # dead-man lock + supervised test/stop inputs; see params/twist_mux_physical.yaml
         mux_params.append(os.path.join(share, 'params', 'twist_mux_physical.yaml'))
-    source = os.environ.get('LITE3_LIO_SOURCE', 'system')
+    source = os.environ.get('LITE3_LIO_SOURCE', 'local')
     if source not in ('system', 'local'):
         raise ValueError('LITE3_LIO_SOURCE must be system or local')
     if source == 'system':

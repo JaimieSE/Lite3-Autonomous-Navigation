@@ -74,6 +74,31 @@ class RoamRobot(NavRobot):
         self.mission = []
         node.create_subscription(String, MISSION_EVENTS_TOPIC,
                                  lambda m: self.mission.append((time.monotonic(), m.data)), 50)
+        # Exploration record (exploration_record.py): inspection requests and usable-camera confirmations in,
+        # RViz overlay out. Transient-local overlay: an RViz started later still gets the latest state.
+        from visualization_msgs.msg import MarkerArray
+        from .exploration_ros import (CAMERA_CONFIRMATIONS_TOPIC, INSPECTION_REQUESTS_TOPIC,
+                                      STATUS_MARKERS_TOPIC, markers_to_msg)
+        self.inspection_requests, self.camera_confirmations = [], []
+        node.create_subscription(String, INSPECTION_REQUESTS_TOPIC,
+                                 lambda m: self.inspection_requests.append((time.monotonic(), m.data)), 20)
+        node.create_subscription(String, CAMERA_CONFIRMATIONS_TOPIC,
+                                 lambda m: self.camera_confirmations.append((time.monotonic(), m.data)), 50)
+        overlay_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
+                                 durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        marker_pub = node.create_publisher(MarkerArray, STATUS_MARKERS_TOPIC, overlay_qos)
+        self.publish_status_markers = lambda specs: marker_pub.publish(
+            markers_to_msg(specs, node.get_clock().now().to_msg()))
+        # Scene understanding on the Pi (all camera modules, group8pi) for roam's stuck ladder: request out,
+        # the next Pi detections/scenes in (scene_hints.py). Best effort, as the Pi publishes; last few kept.
+        from collections import deque
+        from .scene_hints import PI_DETECTIONS_TOPIC, PI_SCENES_TOPIC, SCENE_REQUEST_TOPIC
+        self.pi_scene_messages = deque(maxlen=30)
+        for topic in (PI_DETECTIONS_TOPIC, PI_SCENES_TOPIC):
+            node.create_subscription(String, topic, lambda m: self.pi_scene_messages.append(
+                (time.monotonic(), m.data)), qos_profile_sensor_data)
+        scene_pub = node.create_publisher(String, SCENE_REQUEST_TOPIC, 10)
+        self.publish_scene_request = lambda text: scene_pub.publish(String(data=text))
         # Stair / curtain advisory (teammate's ~/stair_curtain detector): latest message, stamped on arrival
         from .advisory import ADVISORY_TOPIC
         self.advisory = None
@@ -83,7 +108,7 @@ class RoamRobot(NavRobot):
         # send every cloud again over the robot link (and it arrives ~0.8 s later)
         node.create_subscription(PointCloud2, '/lite3/livox_points', lambda raw: t.raw_cloud.add(
             time.monotonic(), len(raw)), qos_profile_sensor_data, raw=True)
-        if os.environ.get('LITE3_LIO_SOURCE', 'system') == 'system':
+        if os.environ.get('LITE3_LIO_SOURCE', 'local') == 'system':
             lio_type, lio_topic = LaserScan, '/scan'
         else:
             lio_type, lio_topic = PointCloud2, '/cloud_registered_body'

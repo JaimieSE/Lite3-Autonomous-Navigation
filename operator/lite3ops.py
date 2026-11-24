@@ -350,7 +350,7 @@ def cmd_wait_ready(args):
     print(f'{BOLD}Waiting for navigation stack (up to {args.timeout:.0f} s){RESET}')
     ros = Ros()
     deadline = time.monotonic() + args.timeout
-    lio_node = 'group8_lio_outputs_8' if os.environ.get('LITE3_LIO_SOURCE', 'system') == 'system' else 'laser_mapping'
+    lio_node = 'group8_lio_outputs_8' if os.environ.get('LITE3_LIO_SOURCE', 'local') == 'system' else 'laser_mapping'
     try:
         while True:
             states = {n: ros.lifecycle(n, 2.0) for n in NAV_LIFECYCLE}

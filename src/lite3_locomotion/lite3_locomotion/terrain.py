@@ -43,7 +43,7 @@ class TerrainParams:
     # Rise still walkable (not an obstacle). No vendor guide gives a climbable height (Motion Development
     # Guide s1.2 lists dimensions only). Competition: ~5 cm stairs + rubble; RUG H-Step is the documented
     # high-lift gait (Comm Interface s1.2.5). Set per run: start_navigation.sh --max-step M.
-    max_step_m: float = 0.40            # was 0.30 (operator: smaller hazard cloud; /scan covers >= ~0.43 m), 0.18 (course 12:33: stacked/unseen-top lips marked as walls
+    max_step_m: float = 0.35            # operator 2026-11-23: default after the 20 cm-block course ran well at 0.35; was 0.40, 0.30 (operator: smaller hazard cloud; /scan covers >= ~0.43 m), 0.18 (course 12:33: stacked/unseen-top lips marked as walls
                                         # boxed the robot in at the start); before that 0.10, 0.12, 0.15; course lips are 0.10-0.15 m (operator 2026-11-21),
                                         # judged as the jump to the lowest neighbouring cell (see build_grid)
     max_drop_m: float = 0.18            # deeper than this = drop-off; was 0.10, 0.15 (stepping off a 0.10-0.15 m

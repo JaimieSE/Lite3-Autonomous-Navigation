@@ -48,6 +48,11 @@ import yaml
 from .ros_io import AI_OPTIONS, GAITS
 from .advisory import parse_advisory
 from .coverage import CameraCoverage
+from .course_grid import CourseGrid
+from . import goal_selection as GS
+from .scene_hints import parse_scene_hints, scene_request
+from .exploration_record import (ExplorationRecord, INSPECTION_ARRIVE_M, INSPECTION_WAIT_S,
+                                 INSPECTION_YAW_TOL_DEG, build_markers, classify_failure)
 from .mission_events import parse_mission_event
 from .stairs import Action, AiModeStairs, HStepGaitStairs, StairConfig, StairRoutine
 from .config import (ConfigError, HARD_MAX_NAV_GEOFENCE_M, HARD_MAX_SPEED_M_S,
@@ -73,7 +78,7 @@ HARD_MAX_SENSOR_AGE_S = 0.5            # = terrain_stop lock timeout
 HARD_MIN_LIDAR_HZ = 6.0               # was 8.0; course 12:37 safety stop at 7.4 Hz (terrain_monitor 7-9 Hz
                                        # walking the course; LiDAR raw 10 Hz)
 HARD_MAX_WATCHDOG_S = 3.0
-HARD_MAX_GOAL_S = 240.0
+HARD_MAX_GOAL_S = 300.0                # was 240 (operator 2026-11-23: longer to think before giving up)
 DEFAULT_ROAM_SPEED = 0.50
 MODE_NAMES = ('slow', 'normal', 'fast')
 SEARCH_CLEARANCE_M = 0.25             # frontier search (robot start + BFS): footprint half-width 0.185 + margin
@@ -81,6 +86,8 @@ COSTMAP_CLEAR_COOLDOWN_S = 20.0        # Nav2 ClearEntireCostmap at start and be
 COSTMAP_REFILL_S = 2.0                 # let live LiDAR/terrain re-mark real obstacles before choosing again
 FRONTIER_FALLBACK_CLEARANCE_M = 0.05   # goal cell + neighbours (was 0.25: 12:41 run, the one exit gap sat 0.25 m from
                                        # inscribed cost; Nav2 checks the footprint along its own path)
+OVERLAY_PERIOD_S = 1.0                 # RViz status overlay: at least this often ...
+OVERLAY_MIN_PERIOD_S = 0.2             # ... and on change, at most this often
 COVERAGE_PERIOD_S = 0.3                # camera coverage update interval (coverage.py)
 LOOK_RADIUS_M = 2.5                    # look-around: unseen mapped floor within this of the robot ...
 LOOK_SIDE_HALF_DEG = 60.0              # ... in the sector +-60 deg around 90 deg left / right ...
@@ -88,6 +95,12 @@ LOOK_MIN_SIDE_M2 = 0.6                 # ... at least this much on a side: turn 
 LOOK_STEP_DEG = 45.0                   # look-arounds turn in steps this size (overlapping 80 deg views) ...
 LOOK_DWELL_S = 1.2                     # ... and stand still this long facing each step (YOLO ~1 frame/s)
 COVER_MAX_YAW_RATE = 0.5               # rad/s: count camera coverage only while turning slower (no blur, frames)
+SPIN_DRIFT_RETURN_M = 0.10             # after a turn, ended this far BEHIND where it started: step forward again
+NUDGE_SPEED_M_S = 0.15                 # ... at this speed (own odometry), at most NUDGE_MAX_M / NUDGE_MAX_S
+NUDGE_MAX_M = 0.40
+NUDGE_MAX_S = 4.0
+NUDGE_CLEAR_M = 0.30                   # only with nothing (terrain monitor) within the nudge + this ahead
+LOOK_ABANDON_AFTER = 2                 # look-around steps in a row reaching < half their angle: give up the rest
 LOOK_SPACING_M = 1.2                   # no new look-around within this of an earlier one
 COVER_RADIUS_M = 0.7                   # coverage: a spot this close to the walked path counts as covered
 COVER_SAMPLE_M = 0.2                   # sample spacing along a candidate walk
@@ -110,6 +123,7 @@ TRAIL_SPACING_M = 0.5                 # breadcrumbs (walk start points) at least
 EXIT_CHECK_PERIOD_S = 2.0
 # Automatic stairs (operator 2026-11-21: "at the steps it should switch to AI mode, on its own"). Course ledge
 # lip ~0.10-0.12 m; competition stairs ~0.05 m. Triggered from terrain_monitor's nearest step in the corridor.
+STEP_PAST_M = 0.45                     # step crossing: walked this far = past the step (wall check)
 STAIR_TRIGGER_M = 0.6                  # nearest step this close to base_link (nose ~0.3 m from it) ...
 STAIR_MIN_RISE_M = 0.04                # ... and between these heights (up or down)
 STAIR_MAX_RISE_M = 0.18                # = terrain max_step_m / max_drop_m (course lips 0.10-0.15 m)
@@ -131,7 +145,8 @@ CURTAIN_STALL_S = 3.0                  # no CURTAIN_STALL_M of progress this lon
 CURTAIN_STALL_M = 0.05
 CURTAIN_MAX_TILT_RAD = 0.35
 CURTAIN_COOLDOWN_S = 20.0
-PASSAGE_ADVISORY_WAIT_S = 3.0          # at a blocked passage: wait this long for a curtain confirmation
+PASSAGE_ADVISORY_WAIT_S = 10.0         # default for --passage-wait (was 3): at a blocked passage, wait for a
+                                       # curtain confirmation or for the map to open a way on before pausing
 # Uneven course (physical 2026-11-21, operator-authorised loosening): balance steps on lips read 0.15 m/s of
 # leg odometry while idle in slow mode (limit was 0.10) and stopped 5 sessions at start; a 0.15 m lip tilts
 # the 0.35 m hip base ~0.44 rad (limit was 0.35). The robot's own fall-down protection stays the last resort.
@@ -158,11 +173,26 @@ SCAN_STEPS = (1, 1, -1, -1, -1, -1)
 # up to its max_rotational_vel = 0.2 rad/s = the validated turn rate. While spinning the robot-side
 # yaw check therefore allows this instead of the selected mode's yaw rate.
 SPIN_WZ_RAD_S = NAV2_MAX_YAW_RATE_RAD_S   # behavior_server max_rotational_vel (1.5 rad/s)
-SPIN_STALL_S = 12.0                    # no turn progress (lock / collision_monitor holding) -> give up
+SPIN_STALL_S = 25.0                    # default for --spin-stall (was 12): no turn progress -> give up
 TERRAIN_BODY_MARGIN_M = 0.05           # lite3_locomotion.terrain.StopParams.body_margin_m (default)
 BODY_HALF_WIDTH_M = 0.185              # Nav2 footprint half width
 BODY_TURN_RADIUS_M = 0.357             # footprint corner radius: swept by an in-place turn
 MAP_SETTLE_S = 2.5                     # slam_toolbox map_update_interval 2 s: let the spin's scans land
+# One goal-selection system (operator 2026-11-24): course grid memory + one evaluator + stuck ladder.
+COURSE_PERIOD_S = 2.0                  # course grid memory refresh (only on a new map; ~0.2 s on a 40 x 40 m map)
+RESELECT_PERIOD_S = 3.0                # while walking, look for a clearly better goal this often
+SLOW_TICK_S = 0.7                      # log a loop pass slower than this (watchdog heartbeat limit 2 s)
+STUCK_MIN_MOVE_M = 0.5                 # stuck: moved less than this ...
+STUCK_MIN_GAIN_M2 = 0.5                # ... and mapped / looked at less new area than this in --stuck-window
+GRID_RETURN_MAX = 4                    # "come back" candidates offered per decision (nearest unfinished cells)
+GRID_RETURN_MIN_M = 0.8
+INFO_RADIUS_M = 1.5                    # unknown area this close to a goal counts as information gain
+CAMERA_GAIN_RADIUS_M = 2.0
+SCENE_TURN_MIN_DEG = 10.0
+PROTECTED_ENDS = ('inspection', 'passage', 'stairs', 'scene', 'exit', 'backtrack')   # never reselected
+LADDER = ('look', 'scene', 'grid_return', 'clear_costmaps', 'backtrack', 'pause')
+AUTO_RESUME_MAX_S = 60.0
+AUTO_RESUME_RETRY_S = 5.0
 WALK_PROGRESS_M = 0.3                  # a walk that got this far is a success even if Nav2 aborted
 STATES = ('READY', 'ROAMING', 'PAUSED', 'STOPPING', 'STOPPED', 'SAFETY_STOP')
 EXIT = {'STOPPED': 0, 'SAFETY_STOP': 1, 'INTERVENTION_REQUIRED': 2, 'REFUSED': 3}
@@ -184,12 +214,18 @@ class RoamConfig:
 
     def __init__(self, speed_limit=0.10, modes=None, start_mode='slow', geofence_m=3.0,
                  max_minutes=HARD_MAX_ROAM_MINUTES, abort_clearance_m=0.03, frontier_radius_m=3.0,
-                 frontier_clearance_m=0.40, stuck_s=20.0, max_map_age_s=15.0, max_sensor_age_s=0.5,
+                 frontier_clearance_m=0.40, stuck_s=40.0, max_map_age_s=15.0, max_sensor_age_s=0.5,
                  min_lidar_hz=HARD_MIN_LIDAR_HZ, watchdog_timeout_s=2.0, max_goal_failures=5,
                  stack_max_speed=0.10, strategy='frontier', gait=None, docs_stops=False, heartbeat=False,
                  rough_gait=ROUGH_GAIT, ai_options=(), exit_open_radius_m=1.0, exit_min_area_m2=3.0,
                  exit_min_from_start_m=2.0, stop_at_exit=True, stair_mode='ai', auto_stairs=False,
-                 ai_axis_forward=12000, advisory='act'):
+                 ai_axis_forward=12000, advisory='act', map_session=None,
+                 step_crossing=True, step_min_rise_m=0.12, step_max_rise_m=0.25, step_trigger_m=0.6,
+                 step_speed_m_s=0.20, goal_time_factor=5.0, goal_time_base_s=60.0,
+                 spin_stall_s=SPIN_STALL_S, passage_wait_s=PASSAGE_ADVISORY_WAIT_S,
+                 decision='sequence', weights=None, min_score=GS.MIN_SCORE, grid_cell_m=1.0, grid_origin=None,
+                 grid_heading_deg=None, stuck_window_s=60.0, scene_max=6, scene_interval_s=60.0,
+                 scene_timeout_s=20.0, auto_resume_s=0.0, reselect=True, auto_mode=False):
         self.speed_limit = _finite(speed_limit, 'speed_limit', 0.02, min(HARD_MAX_SPEED_M_S, stack_max_speed))
         modes = {**DEFAULT_MODES, **(modes or {})}         # unspecified modes keep their defaults
         self.modes = {}
@@ -236,13 +272,59 @@ class RoamConfig:
         if advisory not in ADVISORY_MODES:
             raise ConfigError(f'advisory must be one of {ADVISORY_MODES}')
         self.advisory = advisory
+        self.map_session = map_session     # navigation run (RUN_DIR) the exploration record belongs to
+        # Terrain step crossing (operator 2026-11-23: a 20 cm block to cross, AI mode only for stairs, nothing
+        # hard-coded): a detected step of step_min..max_rise within step_trigger of base_link is crossed straight
+        # on in the high-step gait, outside Nav2, before the robot is close enough for the LiDAR blind zone.
+        self.step_crossing = bool(step_crossing)
+        self.step_min_rise_m = _finite(step_min_rise_m, 'step_min_rise', 0.02, 0.30)
+        self.step_max_rise_m = _finite(step_max_rise_m, 'step_max_rise', 0.05, 0.30)
+        if self.step_min_rise_m >= self.step_max_rise_m:
+            raise ConfigError('step_min_rise must be below step_max_rise')
+        self.step_trigger_m = _finite(step_trigger_m, 'step_trigger', 0.35, 1.2)
+        self.step_speed_m_s = _finite(step_speed_m_s, 'step_speed', 0.05, 0.5)
         # Navigation started with --stop-layers docs: no stop zone acts, so walk/turn planning is not
         # sized around one (only the body + STANDOFF_M / BODY_TURN_RADIUS_M margins).
         self.docs_stops = bool(docs_stops)
         self.heartbeat = bool(heartbeat)   # Comm Interface s1.2.1 heartbeat at 2 Hz (opt-in, unverified)
         self.frontier_radius_m = _finite(frontier_radius_m, 'frontier_radius', 1.0, 5.0)
         self.frontier_clearance_m = _finite(frontier_clearance_m, 'frontier_clearance', 0.30, 1.0)
-        self.stuck_s = _finite(stuck_s, 'stuck_s', 5.0, 60.0)
+        # Operator 2026-11-23: "a longer time to think before giving up on the goal". Defaults raised from
+        # stuck 20 s, goal time x3 + 30 s, spin stall 12 s, passage wait 3 s; all set per run on the command line.
+        self.stuck_s = _finite(stuck_s, 'stuck_s', 5.0, 120.0)
+        self.goal_time_factor = _finite(goal_time_factor, 'goal_time_factor', 1.5, 10.0)
+        self.goal_time_base_s = _finite(goal_time_base_s, 'goal_time_base', 10.0, 180.0)
+        self.spin_stall_s = _finite(spin_stall_s, 'spin_stall', 5.0, 60.0)
+        self.passage_wait_s = _finite(passage_wait_s, 'passage_wait', 0.0, 60.0)
+        # One goal-selection system (operator 2026-11-24). 'unified': every source proposes, one evaluator decides,
+        # course grid as memory, stuck ladder (look around -> scene understanding -> unfinished cell). 'sequence':
+        # the earlier fixed order (kept for comparison and the older tests).
+        if decision not in ('unified', 'sequence'):
+            raise ConfigError(f'unknown decision {decision!r} (unified, sequence)')
+        self.decision = decision
+        try:
+            self.weights = GS.parse_weights(weights) if isinstance(weights, str) or weights is None else \
+                {**GS.DEFAULT_WEIGHTS, **dict(weights)}
+        except ValueError as exc:
+            raise ConfigError(str(exc)) from None
+        self.min_score = _finite(min_score, 'min_score', -10.0, 10.0)
+        self.grid_cell_m = _finite(grid_cell_m, 'grid_cell', 0.5, 2.0)
+        self.grid_origin = None if grid_origin is None else tuple(_finite(v, 'grid_origin', -1e4, 1e4)
+                                                                  for v in grid_origin)
+        self.grid_heading_deg = None if grid_heading_deg is None else _finite(grid_heading_deg, 'grid_heading',
+                                                                              -360.0, 360.0)
+        self.stuck_window_s = _finite(stuck_window_s, 'stuck_window', 20.0, 300.0)
+        self.scene_max = int(_finite(scene_max, 'scene_max', 0, 50))
+        self.scene_interval_s = _finite(scene_interval_s, 'scene_interval', 10.0, 600.0)
+        self.scene_timeout_s = _finite(scene_timeout_s, 'scene_timeout', 3.0, 60.0)
+        # Operator 2026-11-24: "when it pauses, it has to know to resume because I won't be able to start it up".
+        # Pauses roam makes itself resume after this (backing off to AUTO_RESUME_MAX_S); 0 = wait for the operator.
+        # An operator pause (roam.sh pause) always waits; safety stops end the session as before.
+        self.auto_resume_s = _finite(auto_resume_s, 'auto_resume', 0.0, AUTO_RESUME_MAX_S)
+        self.reselect = bool(reselect)
+        # Operator 2026-11-24: every competition start puts the robot in navigation (auto) mode itself
+        # (0x21010C03, Comm Interface s1.2.7; the same command the stair routine sends on leaving AI mode).
+        self.auto_mode = bool(auto_mode)
         self.max_map_age_s = _finite(max_map_age_s, 'max_map_age', 3.0, HARD_MAX_MAP_AGE_S)
         self.max_sensor_age_s = _finite(max_sensor_age_s, 'max_sensor_age', 0.1, HARD_MAX_SENSOR_AGE_S)
         self.min_lidar_hz = _finite(min_lidar_hz, 'min_lidar_hz', HARD_MIN_LIDAR_HZ, 20.0)
@@ -254,6 +336,10 @@ class RoamConfig:
 
     def mode_speed(self, mode):
         return self.modes[mode]
+
+    def goal_time_s(self, distance_m, speed_m_s):
+        """How long a walk goal may take before roam gives up on it (capped at HARD_MAX_GOAL_S)."""
+        return min(HARD_MAX_GOAL_S, distance_m / speed_m_s * self.goal_time_factor + self.goal_time_base_s)
 
     def as_dict(self):
         return {k: v for k, v in vars(self).items()}
@@ -342,6 +428,8 @@ class Explorer:
         self.veto = COSTMAP_VETO
         self.visited = None            # [(x, y)] walked through; set -> patrol only goes somewhere new
         self.seen = None               # CameraCoverage; set -> patrol only to floor the camera has not seen
+        self.record = None             # ExplorationRecord: failed destinations
+        self._now = None
 
     @staticmethod
     def key(x, y):
@@ -377,6 +465,7 @@ class Explorer:
 
     def choose(self, grid, pose, now, costmap=None):
         self.costmap = costmap
+        self._now = now
         self.blocked = {k: t for k, t in self.blocked.items() if t > now}
         # Search with a footprint-sized clearance (the robot may start next to something; Nav2 plans
         # the real path), then require the full goal clearance around the GOAL on the map and costmap.
@@ -385,7 +474,8 @@ class Explorer:
         self.last_status = result.status
         for c in result.candidates:
             if self.inside(c.x, c.y) and math.hypot(c.x - pose[0], c.y - pose[1]) >= 0.5 and \
-                    self.key(c.x, c.y) not in self.blocked:
+                    self.key(c.x, c.y) not in self.blocked and \
+                    not (self.record is not None and self.record.avoided(c.x, c.y, now)):
                 if not self.map_clear(grid, c.x, c.y):
                     continue
                 if not self.hazard_free(costmap, c.x, c.y):
@@ -408,6 +498,8 @@ class Explorer:
                 wx, wy = grid.world((x, y))
                 d_robot = math.hypot(wx - pose[0], wy - pose[1])
                 if d_robot < 0.8 or not self.inside(wx, wy) or self.key(wx, wy) in self.blocked:
+                    continue
+                if self.record is not None and self._now is not None and self.record.avoided(wx, wy, self._now):
                     continue
                 if any(not 0 <= grid.value((x + i, y + j)) <= 20
                        for i in range(-pad, pad + 1) for j in range(-pad, pad + 1)):
@@ -483,6 +575,8 @@ class ScanWalk:
         # free space along /scan beams that hit something in the 0.43-0.83 m band, so open directions
         # stayed unknown and every scan found "no open direction" (physical 2026-11-20). Set per choose.
         self.floor_free = None
+        self.record = None             # ExplorationRecord: failed destinations, junction branch states
+        self.open_headings = []        # directions with a usable walk at the last choose (junction detection)
         # Coverage (operator 2026-11-23 "coverage exploration": missions in any order, the whole arena must
         # be seen). [(x, y)] walked through, shared with the frontier/patrol explorer; None = no memory.
         # Big course 2026-11-21: with no such memory roam paced one lane both ways for 45 s.
@@ -540,6 +634,8 @@ class ScanWalk:
         self.failed = [f for f in self.failed if f[2] > now] + [(x, y, now + seconds)]
 
     def avoided(self, x, y, now):
+        if now is not None and self.record is not None and self.record.avoided(x, y, now):
+            return True
         return now is not None and any(until > now and math.hypot(x - fx, y - fy) < FAILED_WALK_RADIUS_M
                                        for fx, fy, until in self.failed)
 
@@ -611,11 +707,15 @@ class ScanWalk:
         if self.novelty(pose, heading, walk) < COVER_MIN_NOVELTY:
             self.last_status = 'walked_lane'               # straight on only into space not yet covered
             return None
+        if self.record is not None and self.record.branch_factor(pose, heading) == 0.0:
+            self.last_status = 'exhausted_branch'
+            return None
         return {'kind': 'walk', 'x': pose[0] + walk * math.cos(heading), 'y': pose[1] + walk * math.sin(heading),
                 'yaw': heading, 'score': _r(walk), 'free_m': _r(free, 2), 'ends_at': 'straight_on'}
 
     def choose(self, grid, pose, now, costmap=None, forward_blocked=False, allow_visited=False):
         rays = []
+        self.open_headings = []
         reach = min(self.cfg.frontier_radius_m, self.cfg.geofence_m * 2) + self.spin_radius()
         obstacles = self.known_obstacles(grid, costmap, pose[:2], reach)
         self.spin_blocked = 0
@@ -645,10 +745,14 @@ class ScanWalk:
             gx, gy = pose[0] + walk * math.cos(heading), pose[1] + walk * math.sin(heading)
             if self.avoided(gx, gy, now):
                 continue
+            self.open_headings.append(heading)
+            branch = self.record.branch_factor(pose, heading) if self.record is not None else 1.0
+            if branch == 0.0 and not allow_visited:
+                continue                                   # exhausted branch (INSPECTED / BLOCKED)
             nov = self.novelty(pose, heading, walk)
             if not allow_visited and nov < COVER_MIN_NOVELTY:
                 continue                                   # already walked: frontier/patrol first
-            score = walk * (COVER_MIN_WEIGHT + (1.0 - COVER_MIN_WEIGHT) * nov)
+            score = walk * (COVER_MIN_WEIGHT + (1.0 - COVER_MIN_WEIGHT) * nov) * max(branch, COVER_MIN_WEIGHT)
             if self.came_from is not None and abs(math.atan2(
                     math.sin(heading - self.came_from - math.pi), math.cos(heading - self.came_from - math.pi))) < math.pi / 3:
                 score *= self.BACKTRACK_FACTOR
@@ -971,11 +1075,31 @@ class RoamSession:
         self.passages_done = []                  # (x, y) of passages already stopped at
         self.adv_task = None                     # advisory step in progress (turning to face stairs)
         self.mission_seen = set()                # mission event ids already logged
+        self.record = None                       # ExplorationRecord (scan-walk): shared state + RViz overlay
         self.coverage = None                     # CameraCoverage (scan-walk)
+        self.course = None                       # CourseGrid: memory of unexplored cells (unified decision)
+        self.reselector = GS.Reselection()
+        self.last_decision = None                # GS.Decision of the last goal choice (overlay, report)
+        self.ladder = None                       # stuck ladder state {'step', 'why', ...}
+        self.ladder_pending = None               # reason: start the ladder at the next decision
+        self.scene_wait = None                   # scene request awaiting Pi hints
+        self.scene_task = None                   # acting on a scene hint (face it, then cross / walk)
+        self.scene_requests = []                 # times of scene requests (bounded per run)
+        self.stuck_window = []                   # [(t, x, y, area)] for the no-progress check
+        self._reselect_t = -math.inf
+        self._heavy_tick = None                  # robot time of the pass that already did heavy work
+        self._tick_times = {}                    # heavy step -> seconds in this pass (slow-tick log)
+        self._operator_pause = False
+        self.pause_auto = False
+        self.auto_resume_at = None
+        self.auto_pauses = []                    # times of self-initiated pauses (back-off)
+        self.out_dir = None                      # run report folder (mission_events.json)
+        self.mission_log = []
         self._coverage_t = -math.inf
         self.look = []                           # pending look-around turns (rad)
         self.look_spots = []                     # where look-arounds happened
         self.look_check = False                  # a walk just ended: consider a look-around
+        self.nudge = None                        # step forward after sliding back during a turn
         self.adv_last = None                     # last logged advisory (kind, distance bucket)
         self.crossing = None                     # curtain crossing in progress
         self.curtain_until = -math.inf           # no new curtain crossing before this (cooldown)
@@ -1149,7 +1273,7 @@ class RoamSession:
         self.goal = goal
         self.goal_sent_at = now
         d = math.hypot(goal['x'] - pose[0], goal['y'] - pose[1])
-        self.goal_timeout = min(HARD_MAX_GOAL_S, d / self.cfg.mode_speed(self.speed_mode)[0] * 3 + 30)
+        self.goal_timeout = self.cfg.goal_time_s(d, self.cfg.mode_speed(self.speed_mode)[0])
         self.progress = (now, pose[0], pose[1])
         self.stats['goals_sent'] += 1
         self.stats[f'{goal["kind"]}_goals'] += 1
@@ -1162,13 +1286,16 @@ class RoamSession:
             return True
         return now - getattr(self, '_spin_ended', -math.inf) < 1.0
 
-    def _start_spin(self, now, pose, angle):
+    def _start_spin(self, now, pose, angle, reason='search turn'):
         # behavior_server min_rotational_vel 0.1 rad/s; the approach action never slows turning in place
         allowance = abs(angle) / 0.1 + 20.0
         if not self.robot.nav_spin(angle, allowance):
             self._walk_failed(now, 'Nav2 rejected the spin')
             return
-        self.goal = {'kind': 'spin', 'x': pose[0], 'y': pose[1], 'yaw': pose[2]}
+        self.goal = {'kind': 'spin', 'x': pose[0], 'y': pose[1], 'yaw': pose[2], 'angle': angle}
+        if self.record is not None:
+            self.record.set_destination(now, {'kind': 'spin', 'x': pose[0], 'y': pose[1], 'yaw': pose[2] + angle},
+                                        f'turn {math.degrees(angle):+.0f} deg', reason)
         self.scan_map_time = self.map[0]
         self.goal_sent_at = now
         self.spin_progress = (now, 0.0)
@@ -1180,9 +1307,71 @@ class RoamSession:
         if how == 'done':
             self.stats['spins_completed'] += 1
         looking = bool(self.goal and self.goal.get('look'))
+        spin = self.goal or {}
         self.goal = None
         self._spin_ended = now
+        if looking and spin.get('angle'):                # look-around that keeps failing: stop shuffling
+            short = abs(spun or 0.0) < 0.5 * abs(spin['angle'])
+            self.look_short = getattr(self, 'look_short', 0) + 1 if short else 0
+            if self.look_short >= LOOK_ABANDON_AFTER and self.look:
+                self.event('look_abandoned', remaining=len(self.look), reason='turns cut short near obstacles')
+                self.look, self.look_short = [], 0
+        self._drift_check(now, spin)
         self.choose_after = now if how == 'opening' else now + (LOOK_DWELL_S if looking and self.look else MAP_SETTLE_S)
+
+    def _drift_check(self, now, spin):
+        """Operator 2026-11-23: in-place turns on uneven ground slide the robot backwards (0.3 m over one look-around
+        on the new course). Ended more than SPIN_DRIFT_RETURN_M behind the turn's start: step forward that far."""
+        pose = self._pose()
+        if pose is None or 'x' not in spin or not self.robot.can_actuate:
+            return
+        dx, dy = pose[0] - spin['x'], pose[1] - spin['y']
+        back = -(dx * math.cos(pose[2]) + dy * math.sin(pose[2]))      # distance behind, along the current heading
+        if back < SPIN_DRIFT_RETURN_M:
+            return
+        length = min(back, NUDGE_MAX_M)
+        sample = self._terrain_now(now)
+        if sample is not None and sample.obstacle_ahead_m is not None and \
+                sample.obstacle_ahead_m < length + NUDGE_CLEAR_M:
+            self.event('drift_not_corrected', drifted_m=_r(back, 2), obstacle_ahead_m=_r(sample.obstacle_ahead_m, 2))
+            return
+        odom = self.robot.telemetry.odom.latest()
+        if odom is None:
+            return
+        self.nudge = {'origin': (odom[1].x, odom[1].y), 't': now, 'length': length, 'progress': (now, 0.0)}
+        self.stats['drift_corrections'] = self.stats.get('drift_corrections', 0) + 1
+        self.event('drift_correction', drifted_m=_r(back, 2), forward_m=_r(length, 2))
+        if self.record is not None:
+            self.record.set_destination(now, {'kind': 'walk', 'x': spin['x'], 'y': spin['y'], 'yaw': pose[2]},
+                                        'step forward', f'slid back {back:.2f} m while turning')
+
+    def _nudge_tick(self, now):
+        n = self.nudge
+        odom = self.robot.telemetry.odom.latest()
+        done = None
+        if odom is None:
+            done = 'no odometry'
+        else:
+            moved = math.hypot(odom[1].x - n['origin'][0], odom[1].y - n['origin'][1])
+            if moved >= n['length']:
+                done = 'done'
+            elif now - n['t'] > NUDGE_MAX_S:
+                done = 'timeout'
+            elif moved > n['progress'][1] + 0.03:
+                n['progress'] = (now, moved)
+            elif now - n['progress'][0] > 1.5:
+                done = 'no progress'
+        sample = self._terrain_now(now)
+        if done is None and sample is not None and sample.obstacle_ahead_m is not None and \
+                sample.obstacle_ahead_m < NUDGE_CLEAR_M:
+            done = 'obstacle ahead'
+        if done is None:
+            self.robot.send_velocity(min(NUDGE_SPEED_M_S, self.cfg.mode_speed(self.speed_mode)[0]), 0.0)
+            return
+        self.robot.send_velocity(0.0, 0.0)
+        self.nudge = None
+        self.choose_after = now + 0.5
+        self.event('drift_correction_end', how=done)
 
     def _floor_lookup(self, now, pose):
         """(x, y) -> observed floor, from the latest terrain_monitor grid (level base_link frame, centred
@@ -1211,7 +1400,10 @@ class RoamSession:
             self.explorer.stop_ahead_m = sample.stop_ahead_m
         near = (sample is not None and sample.obstacle_ahead_m is not None
                 and sample.obstacle_ahead_m <= self.explorer.standoff())
-        return self._choose(self.map[1], now, pose, forward_blocked=near, allow_visited=allow_visited)
+        goal = self._choose(self.map[1], now, pose, forward_blocked=near, allow_visited=allow_visited)
+        if self.record is not None and getattr(self.explorer, 'open_headings', None):
+            self.record.note_decision(pose, self.explorer.open_headings)
+        return goal
 
     def _backtrack(self, now, pose):
         """Dead end: walk back along the breadcrumb trail (known reachable) and avoid this spot."""
@@ -1251,6 +1443,7 @@ class RoamSession:
             self.sightings.append(sighting)
             self.stats['mission_events'] = self.stats.get('mission_events', 0) + 1
             self.event('mission', **sighting)
+            self._log_mission(ev, sighting, text)
 
     def _take_scene(self, now, pose):
         """Hook: detections from the teammate's scene node, tagged with the robot's map pose."""
@@ -1342,11 +1535,25 @@ class RoamSession:
             p['turned'] = True
             self._start_spin(now, pose, err)
             return
-        if self.cfg.advisory == 'act' and 'wait_until' not in p:
-            p['wait_until'] = now + PASSAGE_ADVISORY_WAIT_S   # a curtain confirmation here crosses it instead
-            self.event('passage_waiting', for_s=PASSAGE_ADVISORY_WAIT_S)
-            return
-        if now < p.get('wait_until', 0.0):
+        if 'wait_until' not in p:
+            # Think before pausing (operator 2026-11-23): a curtain confirmation here crosses it instead, and a
+            # map update that opens a way on (the wall was a gap seen late, or the unseen space behind it filled
+            # in) goes back to exploring.
+            p['wait_until'] = now + self.cfg.passage_wait_s
+            p['map_time'] = self.map[0] if self.map is not None else None
+            self.event('passage_waiting', for_s=_r(self.cfg.passage_wait_s, 1))
+        if now < p['wait_until']:
+            if self.map is not None and self.map[0] != p['map_time']:
+                p['map_time'] = self.map[0]
+                again = blocked_passage(self.map[1], pose)
+                still = again is not None and math.hypot(
+                    pose[0] + again['wall_m'] * math.cos(again['yaw']) - p['x'],
+                    pose[1] + again['wall_m'] * math.sin(again['yaw']) - p['y']) < 0.5
+                if not still or self._walk_candidate(now, pose) is not None:
+                    self.passages_done.append((p['x'], p['y']))
+                    self.passage = None
+                    self.scan_index = 0
+                    self.event('passage_cleared', reason='no longer blocked' if not still else 'a way on opened')
             return
         ahead = math.hypot(p['x'] - pose[0], p['y'] - pose[1])
         self.passages_done.append((p['x'], p['y']))
@@ -1379,7 +1586,613 @@ class RoamSession:
         self.event('look_around', left_unseen_m2=_r(left, 1), right_unseen_m2=_r(right, 1), turns_deg=turns)
         return True
 
+    # -------------------------------------------------------------- exploration record (shared state + overlay)
+    WALK_REASONS = {'straight_on': 'straight on: lane ahead not yet walked', 'obstacle': 'turn into new space',
+                    'unseen': 'turn into new space', 'range': 'turn into new space',
+                    'frontier': 'frontier: nearest unexplored edge', 'patrol': 'patrol: floor the camera has not seen',
+                    'backtrack': 'backtrack: dead end', 'exit': 'exit: open area outside the maze',
+                    'passage': 'blocked passage (curtain?)', 'stairs': 'stairs ahead (advisory)',
+                    'grid_return': 'come back: unexplored cell', 'scene': 'scene understanding hint'}
+
+    def _reachable(self, x, y):
+        """Inspection viewpoint usable: inside the geofence, mapped free floor, no lethal/inscribed cost."""
+        if self.map is None or not self.explorer.inside(x, y):
+            return False
+        grid = self.map[1]
+        cell = grid.cell(x, y)
+        if not grid.contains(cell) or not 0 <= grid.value(cell) <= 20:
+            return False
+        cost = self._costmap()
+        if cost is not None:
+            c = cost.cell(x, y)
+            if cost.contains(c) and cost.value(c) >= COSTMAP_VETO:
+                return False
+        return True
+
+    def _take_exploration_inputs(self, now):
+        """Inspection requests and usable-camera confirmations (exploration_record.py interfaces)."""
+        import json
+        for name in ('inspection_requests', 'camera_confirmations'):
+            inbox = getattr(self.robot, name, None)
+            if not inbox:
+                continue
+            items, inbox[:] = list(inbox), []
+            for _, text in items:
+                try:
+                    msg = json.loads(text)
+                except (TypeError, ValueError):
+                    self.event('exploration_input_rejected', topic=name, reason='not JSON')
+                    continue
+                if name == 'inspection_requests':
+                    result, rid = self.record.add_inspection(now, msg)
+                    self.event('inspection_request', request_id=rid, result=result,
+                               mission_ids=msg.get('mission_ids') if isinstance(msg, dict) else None)
+                else:
+                    affected = self.record.confirm(now, msg)
+                    self.event('camera_confirmation', usable=msg.get('usable') if isinstance(msg, dict) else None,
+                               request_id=msg.get('request_id') if isinstance(msg, dict) else None,
+                               applied_to=affected)
+
+    def _start_inspection(self, now, pose, insp):
+        self.record.activate_inspection(now, insp['id'])
+        self.event('inspection_start', request_id=insp['id'], number=insp['number'], mission_ids=insp['mission_ids'],
+                   priority=insp['priority'], x=_r(insp['x'], 2), y=_r(insp['y'], 2))
+        if math.hypot(insp['x'] - pose[0], insp['y'] - pose[1]) >= INSPECTION_ARRIVE_M:
+            self._start_walk(now, pose, {'kind': 'walk', 'x': insp['x'], 'y': insp['y'], 'yaw': insp['yaw'],
+                                         'score': insp['priority'], 'free_m': None, 'ends_at': 'inspection',
+                                         'reason': f'inspection #{insp["number"]} {",".join(insp["mission_ids"])}'})
+
+    def _inspection_tick(self, now, pose):
+        """At the viewpoint: face the viewing yaw once, then wait for a usable-camera confirmation (arrives via
+        _take_exploration_inputs) up to INSPECTION_WAIT_S; resume ordinary exploration either way."""
+        rec = self.record
+        insp = rec.inspections.get(rec.active_inspection)
+        if insp is None:
+            return
+        if math.hypot(insp['x'] - pose[0], insp['y'] - pose[1]) > INSPECTION_ARRIVE_M + 0.15:
+            done = rec.finish_inspection(now, 'UNVISITED', 'did not reach the viewpoint')
+            self.event('inspection_end', request_id=insp['id'], state=done['state'], reason=done['reason'])
+            return
+        err = math.atan2(math.sin(insp['yaw'] - pose[2]), math.cos(insp['yaw'] - pose[2]))
+        if abs(err) > math.radians(INSPECTION_YAW_TOL_DEG) and not insp.get('faced'):
+            insp['faced'] = True
+            self._start_spin(now, pose, err, reason=f'face inspection #{insp["number"]} viewpoint')
+            return
+        if insp['arrived'] is None:
+            rec.arrived_at_viewpoint(now)
+            rec.set_destination(now, {'kind': 'look', 'x': insp['x'], 'y': insp['y'], 'yaw': insp['yaw']}, 'inspect',
+                                f'#{insp["number"]} {",".join(insp["mission_ids"])}: waiting for camera')
+            self.event('inspection_arrived', request_id=insp['id'])
+        elif now - insp['arrived'] > INSPECTION_WAIT_S:
+            done = rec.finish_inspection(now, 'DEFERRED', f'no usable-camera confirmation in {INSPECTION_WAIT_S:.0f} s')
+            self.event('inspection_end', request_id=insp['id'], state=done['state'], reason=done['reason'])
+
+    def _note_map(self, now):
+        """New SLAM map: a reset/new session invalidates the record and the position-based memories."""
+        if self.record is None or self.map is None or self.map[0] == getattr(self, '_record_map_t', None):
+            return
+        self._record_map_t = self.map[0]
+        why = self.record.observe_map(known_area_m2(self.map[1]), now,
+                                      session=getattr(self.robot, 'map_session', None))
+        if why:
+            self.coverage = CameraCoverage(self.anchor, self.cfg.geofence_m + 1.0) if self.coverage else None
+            if self.frontiers is not None:
+                self.frontiers.seen, self.frontiers.blocked = self.coverage, {}
+            if hasattr(self.explorer, 'failed'):
+                self.explorer.failed = []
+            self.trail, self.look_spots, self.passages_done = [], [], []
+            if self.course is not None:
+                self.course.reset(self.record.session)
+                self.stuck_window, self.ladder, self.scene_task = [], None, None
+            self.stats['map_resets'] = self.stats.get('map_resets', 0) + 1
+            self.event('map_reset', reason=why)
+
+    def _publish_overlay(self, now, force=False):
+        publish = getattr(self.robot, 'publish_status_markers', None)
+        if self.record is None or publish is None:
+            return
+        due = now - getattr(self, '_overlay_t', -math.inf)
+        if force or (self.record.revision != getattr(self, '_overlay_rev', None) and due >= OVERLAY_MIN_PERIOD_S) \
+                or due >= OVERLAY_PERIOD_S:
+            self._overlay_t, self._overlay_rev = now, self.record.revision
+            try:
+                specs = build_markers(self.record, labels={'1': True, '0': False}.get(
+                    os.environ.get('LITE3_OVERLAY_LABELS'), 'tags'))     # 1 long text, 0 shapes only
+                pose = self.last_pose
+                if self.course is not None:
+                    specs += self.course.markers(now, pose[:2] if pose else None)
+                specs += self._decision_markers(pose)
+                publish(specs)
+            except Exception as exc:  # noqa: BLE001 - the overlay must never stop roaming
+                if not getattr(self, '_overlay_error', None):
+                    self._overlay_error = str(exc)
+                    self.event('overlay_error', error=str(exc))
+
+    # -------------------------------------------------------------- one goal-selection system (unified decision)
+    # Operator 2026-11-24: grid search, frontiers, scan-walk, camera coverage and scene understanding contribute to
+    # ONE decision; roam stays the only thing that moves the robot. Sources only propose candidates; goal_selection
+    # merges and scores them (configurable weights, logged breakdown); the course grid is memory ("this cell still
+    # looks unexplored: come back"); when stuck: look around -> scene understanding -> unfinished cell.
+    def _update_course(self, now):
+        if self.course is None or self.map is None or now - getattr(self, '_course_t', -math.inf) < COURSE_PERIOD_S \
+                or self.map[0] == getattr(self, '_course_map_t', None):
+            return
+        self._course_t, self._course_map_t = now, self.map[0]
+        t0 = time.monotonic()
+        try:
+            self.course.update(self.map[1], self.coverage, self.record.breadcrumbs, now)
+        except Exception as exc:  # noqa: BLE001 - the grid is memory only: it must never stop roaming
+            self._grid_error(exc)
+        self._timed('course_update', t0)
+
+    def _grid_error(self, exc):
+        if not getattr(self, '_grid_error_logged', None):
+            self._grid_error_logged = str(exc)
+            self.event('grid_error', error=f'{type(exc).__name__}: {exc}')
+
+    def _slam_np(self):
+        import numpy as np
+        if getattr(self, '_slam_key', None) != self.map[0]:
+            g = self.map[1]
+            self._slam_key = self.map[0]
+            self._slam_cache = (np.asarray(g.data, dtype=np.int16).reshape(g.height, g.width), g.resolution,
+                                g.origin_x, g.origin_y)
+        return self._slam_cache
+
+    def _unknown_near(self, x, y, radius):
+        """Unknown SLAM area (m2) within radius of (x, y): what walking there could reveal."""
+        import numpy as np
+        data, res, gx, gy = self._slam_np()
+        i0, i1 = max(0, int((x - radius - gx) / res)), min(data.shape[1], int((x + radius - gx) / res) + 1)
+        j0, j1 = max(0, int((y - radius - gy) / res)), min(data.shape[0], int((y + radius - gy) / res) + 1)
+        area = math.pi * radius * radius
+        if i0 >= i1 or j0 >= j1:
+            return area                                               # off the map: all unknown
+        jj, ii = np.mgrid[j0:j1, i0:i1]
+        inside = (gx + (ii + 0.5) * res - x) ** 2 + (gy + (jj + 0.5) * res - y) ** 2 <= radius * radius
+        known = float((inside & (data[j0:j1, i0:i1] >= 0)).sum()) * res * res
+        return max(0.0, area - known)
+
+    def _route_unknown(self, pose, x, y):
+        """Fraction of the straight line to (x, y) over unknown (unmapped) floor: terrain uncertainty."""
+        data, res, gx, gy = self._slam_np()
+        d = math.hypot(x - pose[0], y - pose[1])
+        n = max(1, int(d / 0.1))
+        unknown = 0
+        for k in range(1, n + 1):
+            px, py = pose[0] + (x - pose[0]) * k / n, pose[1] + (y - pose[1]) * k / n
+            i, j = int(math.floor((px - gx) / res)), int(math.floor((py - gy) / res))
+            if not (0 <= i < data.shape[1] and 0 <= j < data.shape[0]) or data[j, i] < 0:
+                unknown += 1
+        return unknown / n
+
+    def _terms(self, now, pose, goal, source):
+        x, y, yaw = goal['x'], goal['y'], goal['yaw']
+        d = math.hypot(x - pose[0], y - pose[1])
+        head = math.atan2(y - pose[1], x - pose[0]) if d > 0.1 else yaw
+        t = {'travel': d * (1.0 if source in ('straight_on', 'corridor', 'corridor_walked') else 1.3),
+             'turn': abs(math.atan2(math.sin(head - pose[2]), math.cos(head - pose[2]))),
+             'info': self._unknown_near(x, y, INFO_RADIUS_M), 'terrain': self._route_unknown(pose, x, y)}
+        if self.coverage is not None:
+            t['camera'] = self.coverage.unseen_free_m2(self.map[1], (x, y), CAMERA_GAIN_RADIUS_M, yaw,
+                                                       math.radians(40))
+        if self.course is not None:
+            t['grid'], t['revisit'] = self.course.pull(x, y, now), self.course.revisit(x, y)
+        if source == 'straight_on':
+            t['continue'] = 1.0
+        if source == 'scene':
+            t['scene'] = 1.0
+        if self.record is not None:
+            t['fail'] = float(sum(f['attempts'] for f in self.record.failures.values()
+                                  if math.hypot(f['x'] - x, f['y'] - y) < 0.6))
+        return t
+
+    def _candidate(self, now, pose, goal, source, reason):
+        goal = dict(goal)
+        goal.setdefault('reason', reason)
+        goal['source'] = source
+        return GS.Candidate(goal['x'], goal['y'], goal['yaw'], source, goal['reason'],
+                            terms=self._terms(now, pose, goal, source), goal=goal)
+
+    def _grid_returns(self, now, pose, relaxed=False):
+        """'Come back' goals: a free point (off-centre if need be) in the nearest unfinished cells."""
+        if self.course is None or not self.course.cells:
+            return []
+        here = self.course.cell(*pose[:2])
+        cells = sorted((c for c in self.course.unfinished_cells(now) if c != here),
+                       key=lambda c: math.dist(self.course.centre(*c), pose[:2]))
+        out, limit = [], GRID_RETURN_MAX * (2 if relaxed else 1)
+        for c in cells[:3 * limit]:
+            p = self.course.return_point(c, ok=lambda x, y: self._reachable(x, y) and not (
+                self.record is not None and self.record.avoided(x, y, now)))   # free, below the inscribed cost
+            if p is None or math.dist(p, pose[:2]) < GRID_RETURN_MIN_M:
+                continue
+            out.append({'kind': 'walk', 'x': p[0], 'y': p[1], 'yaw': math.atan2(p[1] - pose[1], p[0] - pose[0]),
+                        'score': 0.0, 'free_m': None, 'ends_at': 'grid_return', 'cell': list(c),
+                        'reason': f'come back: unexplored cell {c[0]},{c[1]}'})
+            if len(out) >= limit:
+                break
+        return out
+
+    def _timed(self, name, t0):
+        """Heavy step done: note its time (slow-tick log), keep the status heartbeat fresh, mark the pass busy."""
+        self._tick_times[name] = round(self._tick_times.get(name, 0.0) + time.monotonic() - t0, 3)
+        self._heavy_tick = self.robot.now()
+        self._beat()
+
+    def _evaluate(self, now, pose, note=True):
+        t0 = time.monotonic()
+        try:
+            return self._evaluate_now(now, pose, note)
+        finally:
+            self._timed('evaluate', t0)
+
+    def _evaluate_now(self, now, pose, note=True):
+        grid, costmap = self.map[1], self._costmap()
+        sample = self._terrain_now(now)
+        if sample is not None and sample.stop_ahead_m and not self.cfg.docs_stops:
+            self.explorer.stop_ahead_m = sample.stop_ahead_m
+        near = (sample is not None and sample.obstacle_ahead_m is not None
+                and sample.obstacle_ahead_m <= self.explorer.standoff())
+        cands = []
+
+        def add(goal, source, reason):
+            if goal is not None and not self._goal_invalid(goal):    # endpoint: geofence, costmap, SLAM
+                cands.append(self._candidate(now, pose, goal, source, reason))
+        if not near and hasattr(self.explorer, 'straight_ahead'):
+            add(self.explorer.straight_ahead(grid, pose, costmap, now), 'straight_on', self.WALK_REASONS['straight_on'])
+        corridor = self._choose(grid, now, pose, forward_blocked=near)
+        if note and self.record is not None and getattr(self.explorer, 'open_headings', None):
+            self.record.note_decision(pose, self.explorer.open_headings)
+        if corridor is not None:
+            add(corridor, 'corridor', self.WALK_REASONS.get(corridor.get('ends_at'), 'turn into new space'))
+        front = self._frontier_goal(now, pose)
+        if front is not None:
+            add(front, front['ends_at'], self.WALK_REASONS.get(front['ends_at'], front['ends_at']))
+        if corridor is None:
+            add(self._choose(grid, now, pose, forward_blocked=near, allow_visited=True), 'corridor_walked',
+                'walk on through walked space')
+        for goal in self._grid_returns(now, pose):
+            add(goal, 'grid_return', goal['reason'])
+        return GS.evaluate(cands, self.cfg.weights, self.cfg.min_score)
+
+    def _take_decision(self, now, pose, decision):
+        c = decision.chosen
+        goal = dict(c.goal)
+        goal['reason'] = (' + '.join(c.reasons) or goal.get('reason') or c.source)[:90]
+        goal['sources'] = list(c.sources)
+        goal['decision_score'] = _r(decision.score, 2)
+        self.last_decision = decision
+        self.stats['decisions'] = self.stats.get('decisions', 0) + 1
+        self.event('decision', **decision.summary())
+        self._start_walk(now, pose, goal)
+
+    def _decide(self, now, pose):
+        if self._heavy_tick == now and self.scene_wait is None:
+            return                                          # the grid was refreshed this pass: decide next pass
+        if self.scene_task is not None:
+            self._scene_task_tick(now, pose)
+            return
+        if self.ladder_pending and self.ladder is None:
+            self._start_ladder(now, self.ladder_pending)
+        self.ladder_pending = None
+        if self.ladder is not None:
+            if self.ladder.get('recheck'):
+                self.ladder['recheck'] = False
+                d = self._evaluate(now, pose)
+                if d.chosen is not None:
+                    self._take_decision(now, pose, d)
+                    return
+            self._ladder_tick(now, pose)
+            return
+        d = self._evaluate(now, pose)
+        if d.chosen is not None:
+            self._take_decision(now, pose, d)
+        elif self.scan_index < len(SCAN_STEPS):
+            self._search_turn(now, pose)                       # look around first
+        else:
+            self._start_ladder(now, 'no worthwhile goal after looking around')
+            self._ladder_tick(now, pose)
+
+    # ---- reselection while walking (hysteresis: goal_selection.Reselection)
+    def _goal_invalid(self, goal):
+        if not self.explorer.inside(goal['x'], goal['y'], margin=0.0):
+            return True
+        cost = self._costmap()
+        if cost is not None:
+            c = cost.cell(goal['x'], goal['y'])
+            if cost.contains(c) and cost.value(c) >= COSTMAP_VETO:
+                return True
+        grid = self.map[1]
+        c = grid.cell(goal['x'], goal['y'])
+        return grid.contains(c) and grid.value(c) > 50
+
+    def _maybe_reselect(self, now, pose):
+        goal = self.goal
+        if goal is None or goal.get('kind') != 'walk' or self.map is None:
+            return
+        invalid = self._goal_invalid(goal)
+        d = self._evaluate(now, pose, note=False)
+        if d.chosen is None and not invalid:
+            return
+        if d.chosen is not None and math.hypot(d.chosen.x - goal['x'], d.chosen.y - goal['y']) < GS.MERGE_M:
+            return                                              # the best goal is the one being walked
+        src = (goal.get('sources') or [goal.get('source') or 'corridor'])[0]
+        current = GS.score(GS.Candidate(goal['x'], goal['y'], goal['yaw'], src,
+                                        terms=self._terms(now, pose, goal, src)), self.cfg.weights)[0]
+        best = d.score if d.chosen is not None else -math.inf
+        ok, why = self.reselector.should_switch(now, current, best, self.goal_sent_at,
+                                                math.hypot(goal['x'] - pose[0], goal['y'] - pose[1]), invalid)
+        if not ok:
+            return
+        self.reselector.switched(now)
+        self.stats['reselections'] = self.stats.get('reselections', 0) + 1
+        self.event('reselect', reason=why, current_score=_r(current, 2),
+                   new=d.summary(0)['chosen'] if d.chosen is not None else None)
+        self._cancel_scan_walk(now, f'reselect: {why}')
+
+    def _end_reselected(self, now, pose, reason):
+        walked = math.hypot(pose[0] - self.walk_start[0], pose[1] - self.walk_start[1])
+        self.goal = None
+        if self.record is not None:
+            self.record.end_branch('walked', None)
+            self.record.clear_destination(now, reason)
+        self.choose_after = now
+        self.event('walk_end', how='reselected', walked_m=_r(walked, 2))
+
+    # ---- stuck: detection and the recovery ladder (look around -> scene -> unfinished cell -> ...)
+    def _stuck_check(self, now, pose):
+        busy = (self.stairs or self.crossing or self.nudge or self.scene_wait or self.scene_task or self.ladder
+                or self.ladder_pending or self.hold_since is not None or self.passage is not None
+                or (self.record is not None and self.record.active_inspection))
+        if busy or self.map is None:
+            self.stuck_window = []
+            return
+        w = self.stuck_window
+        if w and now - w[-1][0] < 1.0:
+            return
+        area = known_area_m2(self.map[1]) + (self.coverage.seen_m2() if self.coverage is not None else 0.0)
+        w.append((now, pose[0], pose[1], area))
+        while len(w) > 2 and now - w[1][0] >= self.cfg.stuck_window_s:
+            w.pop(0)
+        if now - w[0][0] < self.cfg.stuck_window_s:
+            return
+        moved, gained = math.hypot(pose[0] - w[0][1], pose[1] - w[0][2]), area - w[0][3]
+        if moved >= STUCK_MIN_MOVE_M or gained >= STUCK_MIN_GAIN_M2:
+            return
+        self.stuck_window = []
+        self.event('stuck_detected', window_s=_r(self.cfg.stuck_window_s, 0), moved_m=_r(moved, 2),
+                   gained_m2=_r(gained, 2))
+        self.ladder_pending = f'no progress in {self.cfg.stuck_window_s:.0f} s'
+        if self.goal is not None and self.cancel_request is None:
+            self._cancel_scan_walk(now, 'stuck: no progress')
+
+    def _start_ladder(self, now, why):
+        self.ladder = {'step': 0, 'name': LADDER[0], 'why': why, 't': now}
+        self.stats['stuck'] = self.stats.get('stuck', 0) + 1
+        self.event('stuck', reason=why)
+
+    def _ladder_tick(self, now, pose):
+        lad = self.ladder
+        while lad['step'] < len(LADDER):
+            name = lad['name'] = LADDER[lad['step']]
+            if name == 'look':
+                if self.scan_index < len(SCAN_STEPS):
+                    lad['recheck'] = True
+                    self._search_turn(now, pose)
+                    return
+            elif name == 'scene':
+                if self.scene_wait is not None:
+                    self._scene_tick(now, pose)
+                    return
+                if self._scene_request(now, pose, lad['why']):
+                    return
+            elif name == 'grid_return':
+                cands = [self._candidate(now, pose, g, 'grid_return', g['reason'])
+                         for g in self._grid_returns(now, pose, relaxed=True)]
+                d = GS.evaluate(cands, self.cfg.weights, min_score=-math.inf)
+                if d.chosen is not None:
+                    lad['step'] += 1
+                    self.event('stuck_step', step=name, cell=d.chosen.goal.get('cell'))
+                    self._take_decision(now, pose, d)
+                    return
+            elif name == 'clear_costmaps':
+                lad['step'] += 1
+                if self._clear_costmaps(now, f'stuck: {lad["why"]}'):
+                    lad['recheck'] = True
+                    self.choose_after = now + COSTMAP_REFILL_S
+                    return
+                continue
+            elif name == 'backtrack':
+                lad['step'] += 1
+                if self._backtrack(now, pose):
+                    lad['recheck'] = True
+                    return
+                continue
+            elif name == 'pause':
+                self.ladder = None
+                self.scan_index = 0
+                self._pause(f'stuck ({lad["why"]}): looked around, asked the scene, no unfinished cell reachable')
+                return
+            lad['step'] += 1
+            self.event('stuck_step', step=name, result='skipped')
+
+    # ---- scene understanding (Pi) when stuck
+    def _scene_request(self, now, pose, why):
+        if getattr(self.robot, 'pi_scene_messages', None) is None:
+            return False                                      # no Pi link in this mode
+        if len(self.scene_requests) >= self.cfg.scene_max:
+            self.event('scene_skipped', reason=f'{self.cfg.scene_max} requests this run')
+            return False
+        if self.scene_requests and now - self.scene_requests[-1] < self.cfg.scene_interval_s:
+            self.event('scene_skipped', reason=f'last request {now - self.scene_requests[-1]:.0f} s ago')
+            return False
+        rid = f'scene-{len(self.scene_requests) + 1}'
+        self.scene_requests.append(now)
+        self.stats['scene_requests'] = self.stats.get('scene_requests', 0) + 1
+        publish = getattr(self.robot, 'publish_scene_request', None)
+        if publish is not None:
+            publish(scene_request(rid, why, pose, self.record.session if self.record else None, now))
+        self.scene_wait = {'id': rid, 't': now, 'pose': pose}
+        if self.record is not None:
+            self.record.set_destination(now, {'kind': 'look', 'x': pose[0], 'y': pose[1], 'yaw': pose[2]},
+                                        'ask', 'stuck: asking scene understanding')
+        self.event('scene_request', request_id=rid, reason=why)
+        return True
+
+    def _scene_tick(self, now, pose):
+        w = self.scene_wait
+        hints = []
+        for t, text in list(getattr(self.robot, 'pi_scene_messages', None) or []):
+            if t >= w['t']:
+                hints += parse_scene_hints(text)
+        if hints:
+            self.scene_wait = None
+            self.stats['scene_hints'] = self.stats.get('scene_hints', 0) + 1
+            self.event('scene_hint', request_id=w['id'], hints=hints[:3])
+            self.ladder['step'] += 1
+            self._act_on_hint(now, pose, hints[0], w['pose'])
+        elif now - w['t'] > self.cfg.scene_timeout_s:
+            self.scene_wait = None
+            self.event('scene_no_hint', request_id=w['id'], waited_s=_r(now - w['t'], 1))
+            self.ladder['step'] += 1
+
+    def _act_on_hint(self, now, pose, hint, at_pose):
+        yaw = at_pose[2] + math.radians(hint['bearing_deg'])
+        turn = math.atan2(math.sin(yaw - pose[2]), math.cos(yaw - pose[2]))
+        self.scene_task = {'kind': hint['kind'], 'yaw': yaw, 'distance_m': hint.get('distance_m'), 'walked': False}
+        if abs(turn) > math.radians(SCENE_TURN_MIN_DEG):
+            self._start_spin(now, pose, turn, reason=f'face scene hint: {hint["kind"]}')
+            return
+        self._scene_task_tick(now, pose)
+
+    def _scene_task_tick(self, now, pose):
+        task = self.scene_task
+        free, end, obstacle = self.explorer.ray(self.map[1], self._costmap(), pose, task['yaw'])
+        if task['kind'] == 'stairs':
+            # Face them; the stair advisory confirms and starts the stairs routine (AI mode only on stairs).
+            self.scene_task = None
+            self.choose_after = now + 5.0
+            self.event('scene_stairs', heading_deg=_r(math.degrees(task['yaw']), 0))
+            return
+        if task['kind'] == 'curtain':
+            wall = task['distance_m'] if task['distance_m'] is not None and not task['walked'] else obstacle
+            odom = self.robot.telemetry.odom.latest()
+            if wall is not None and wall <= CURTAIN_TRIGGER_M + 0.3 and odom is not None:
+                self.scene_task, self.ladder = None, None
+                self.crossing = {'origin': (odom[1].x, odom[1].y), 't': now, 'length': wall + CURTAIN_PAST_M,
+                                 'progress': (now, 0.0)}
+                self.event('curtain_crossing', curtain_m=_r(wall, 2), length_m=_r(self.crossing['length'], 2),
+                           source='scene')
+                return
+            walk = (wall or 0.0) - self.explorer.standoff()
+            if not task['walked'] and wall is not None and 0.15 <= walk <= 4.0:
+                task['walked'] = True
+                self._start_walk(now, pose, {'kind': 'walk', 'x': pose[0] + walk * math.cos(task['yaw']),
+                                             'y': pose[1] + walk * math.sin(task['yaw']), 'yaw': task['yaw'],
+                                             'score': 0.0, 'free_m': None, 'ends_at': 'scene',
+                                             'reason': 'scene: curtain ahead'})
+                return
+        else:                                                     # gap / passage: walk into it
+            walk = min(self.cfg.frontier_radius_m,
+                       free - (0.0 if end == 'obstacle' else self.explorer.UNSEEN_STANDOFF_M),
+                       obstacle - self.explorer.standoff())
+            if walk >= self.explorer.MIN_WALK_M:
+                self.scene_task = None
+                self._start_walk(now, pose, {'kind': 'walk', 'x': pose[0] + walk * math.cos(task['yaw']),
+                                             'y': pose[1] + walk * math.sin(task['yaw']), 'yaw': task['yaw'],
+                                             'score': 0.0, 'free_m': _r(free, 2), 'ends_at': 'scene',
+                                             'reason': f'scene: {task["kind"]}'})
+                return
+        self.scene_task = None
+        self.event('scene_hint_unusable', kind=task['kind'], open_m=_r(free, 2), obstacle_m=_r(obstacle, 2))
+
+    # ---- pauses resume by themselves (operator 2026-11-24: "I won't be able to start it up")
+    def _auto_resume_tick(self, now):
+        if self.state != 'PAUSED':
+            return
+        if self.record is not None:
+            self._publish_overlay(now)
+        if not self.pause_auto or self.auto_resume_at is None or now < self.auto_resume_at:
+            return
+        result = self._resume()
+        if result is None:
+            self.stats['auto_resumes'] = self.stats.get('auto_resumes', 0) + 1
+            self.event('auto_resumed')
+            self._auto_refused = None
+        else:
+            self.auto_resume_at = now + AUTO_RESUME_RETRY_S
+            if result != getattr(self, '_auto_refused', None):
+                self.event('auto_resume_refused', reason=result, retry_s=AUTO_RESUME_RETRY_S)
+            self._auto_refused = result
+
+    # ---- mission events as a JSON file (operator 2026-11-24)
+    def _log_mission(self, ev, sighting, text):
+        self.mission_log.append({'t_s': _r(self.robot.now() - (self.t_roam or self.robot.now()), 2),
+                                 'utc': dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds'),
+                                 'robot': {'x': sighting['x'], 'y': sighting['y']}, 'event': ev,
+                                 'raw': text if isinstance(text, str) else None})
+        if self.out_dir is None:
+            return
+        try:
+            (Path(self.out_dir) / 'mission_events.json').write_text(json.dumps(self.mission_log, indent=1,
+                                                                               default=str))
+        except OSError as exc:
+            if not getattr(self, '_mission_log_error', None):
+                self._mission_log_error = str(exc)
+                self.event('mission_log_error', error=str(exc))
+
+    # ---- RViz: alternatives of the last decision and a status banner over the robot
+    def _status_text(self):
+        now = self.robot.now()
+        if self.state == 'PAUSED':
+            return f'PAUSED: resume {max(0.0, self.auto_resume_at - now):.0f}s' if self.auto_resume_at \
+                else 'PAUSED (operator)'
+        if self.state != 'ROAMING':
+            return self.state
+        if self.stairs:
+            return 'STEP CROSSING' if getattr(self, 'stairs_kind', None) == 'step' else 'STAIRS'
+        if self.crossing:
+            return 'CURTAIN CROSSING'
+        if self.nudge:
+            return 'DRIFT FIX'
+        if self.hold_since is not None:
+            return 'HOLD'
+        if self.scene_wait is not None:
+            return 'STUCK: asking scene'
+        if self.scene_task is not None:
+            return f'SCENE: {self.scene_task["kind"]}'
+        if self.ladder is not None:
+            return f'STUCK: {self.ladder["name"]}'
+        if self.record is not None and self.record.active_inspection:
+            return 'INSPECTING'
+        if self.goal is not None:
+            if self.goal.get('kind') == 'spin':
+                return 'LOOKING' if self.goal.get('look') else 'TURNING'
+            return f'GOAL: {(self.goal.get("sources") or [self.goal.get("ends_at")])[0]}'[:24]
+        return 'ROAMING'
+
+    def _decision_markers(self, pose):
+        from .exploration_record import _m
+        out = []
+        d = self.last_decision
+        if d is not None:
+            for n, (sc, c, _) in enumerate(d.ranked[1:5]):
+                out.append(_m('alternatives', n, 'sphere', c.x, c.y, 0.1, scale=(0.12, 0.12, 0.12),
+                              rgb=(0.75, 0.75, 0.75), alpha=0.7))
+                out.append(_m('alternatives_tags', n, 'text', c.x, c.y, 0.28, scale=(0, 0, 0.06), alpha=0.9,
+                              text=f'{c.source[:12]} {sc:.1f}'))
+        if pose is not None:
+            text = self._status_text()
+            rgb = (1.0, 0.6, 0.1) if text.startswith(('STUCK', 'PAUSED', 'HOLD')) else (0.4, 1.0, 0.5)
+            out.append(_m('status', 0, 'text', pose[0], pose[1], 0.9, scale=(0, 0, 0.1), rgb=rgb, alpha=0.95,
+                          text=text))
+        return out
+
     def _search_turn(self, now, pose):
+        if self.scan_index >= len(SCAN_STEPS) and self.cfg.decision == 'unified':
+            self.ladder_pending = self.ladder_pending or 'no way on after looking around'
+            return
         if self.scan_index >= len(SCAN_STEPS):
             if self.passage is None and self._find_passage(now, pose):
                 return
@@ -1400,14 +2213,19 @@ class RoamSession:
 
     def _start_walk(self, now, pose, goal):
         if not self.robot.nav_send_goal(goal['x'], goal['y'], goal['yaw']):
-            self._walk_failed(now, 'Nav2 rejected the walk goal')
+            self._walk_failed(now, 'Nav2 rejected the walk goal', goal)
             return
         self.robot.set_speed_limit(self.cfg.mode_speed(self.speed_mode)[0])   # after the MPPI reset
         self.explorer.sent(goal)
         self.goal = goal
+        if self.record is not None:
+            reason = goal.get('reason') or self.WALK_REASONS.get(goal.get('ends_at'), str(goal.get('ends_at')))
+            self.record.set_destination(now, goal, 'walk', reason)
+            if goal.get('ends_at') != 'inspection':
+                self.record.start_branch(pose, goal['yaw'])
         self.goal_sent_at = now
         d = math.hypot(goal['x'] - pose[0], goal['y'] - pose[1])
-        self.goal_timeout = min(HARD_MAX_GOAL_S, d / self.cfg.mode_speed(self.speed_mode)[0] * 3 + 30)
+        self.goal_timeout = self.cfg.goal_time_s(d, self.cfg.mode_speed(self.speed_mode)[0])
         self.progress = (now, pose[0], pose[1])
         self.scan_index = 0
         self.walk_start = (pose[0], pose[1])
@@ -1431,7 +2249,14 @@ class RoamSession:
         if goal and goal.get('ends_at') in ('frontier', 'patrol') and self.frontiers is not None:
             self.frontiers.block(goal['x'], goal['y'], now, 60)
         if how == 'reached' or walked >= WALK_PROGRESS_M:
+            if self.record is not None and goal:
+                self.record.succeeded(goal['x'], goal['y'])
+                self.record.end_branch('walked', None)
+                self.record.clear_destination(now, f'walk {how} ({walked:.2f} m)')
             self.failures = 0
+            if goal and goal.get('ends_at') != 'backtrack' and self.ladder is not None:
+                self.event('stuck_resolved', step=self.ladder['name'], by=goal.get('ends_at'))
+                self.ladder = None
             self.stats['goals_succeeded'] += 1
             if how != 'reached':
                 self.stats['walks_to_obstacle'] += 1
@@ -1443,10 +2268,23 @@ class RoamSession:
         # goal: _end_walk clears self.goal first. Course 2026-11-21 12:25: that lost the failed spot, so
         # roam re-picked the same terrain-blocked heading after every search round (3 x, 0.02-0.06 m each).
         failed = goal or self.goal
+        if self.record is not None:
+            category = classify_failure(why)
+            if failed and failed.get('kind') == 'walk':
+                f = self.record.fail(now, failed['x'], failed['y'], why, category)
+                self.event('destination_failed', category=category, attempts=f['attempts'], retry=f['retry'])
+            self.record.end_branch('failed', category)
+            self.record.clear_destination(now, f'failed: {why}')
         if failed and failed.get('kind') == 'walk' and hasattr(self.explorer, 'avoided'):
             self.explorer.block(failed['x'], failed['y'], now, FAILED_WALK_MEMORY_S)
         if failed and failed.get('ends_at') in ('frontier', 'patrol') and self.frontiers is not None:
             self.frontiers.block(failed['x'], failed['y'], now, 90)
+        if getattr(self, 'course', None) is not None and failed and failed.get('kind') == 'walk' \
+                and getattr(self, 'walk_start', None) is not None:
+            try:
+                self.course.note_failure(now, self.walk_start, (failed['x'], failed['y']), classify_failure(why))
+            except Exception as exc:  # noqa: BLE001 - memory only
+                self._grid_error(exc)
         self.stats['goals_failed'] += 1
         self.failures += 1
         self.goal = None
@@ -1456,6 +2294,10 @@ class RoamSession:
                                              'step_ahead_m': getattr(sample, 'step_ahead_m', None),
                                              'step_rise_m': getattr(sample, 'step_rise_m', None)}
         self.event('walk_failed', reason=why, consecutive=self.failures, **terrain)
+        if self.failures >= self.cfg.max_goal_failures and self.cfg.decision == 'unified':
+            self.failures = 0
+            self.ladder_pending = f'{self.cfg.max_goal_failures} consecutive walks failed'
+            return
         if self.failures >= self.cfg.max_goal_failures:
             sample = self._terrain_now(now)
             held = f' (terrain proximity stop holding: {sample.reason}; move the robot or the object)' \
@@ -1476,10 +2318,15 @@ class RoamSession:
             if yaw_rate <= COVER_MAX_YAW_RATE:
                 self.coverage.update(pose, self.map[1])
             self.stats['camera_seen_m2'] = _r(self.coverage.seen_m2(), 1)
-        if self.frontiers is not None and self.frontiers.visited is not None and \
-                math.hypot(pose[0] - self.frontiers.visited[-1][0], pose[1] - self.frontiers.visited[-1][1]) >= 0.3:
-            self.frontiers.visited.append((pose[0], pose[1]))
+        if self.record is not None:
+            self.record.add_breadcrumb(pose[0], pose[1])
+            self._note_map(now)
+            self._take_exploration_inputs(now)
+            self._update_course(now)
+            self._publish_overlay(now)
         sample = self._terrain_now(now)
+        if self.course is not None and sample is not None and not sample.stop:
+            self._stuck_check(now, pose)
         if sample is None:
             self._pause('LiDAR/terrain status stale; check the sensors before resuming')
             return
@@ -1518,8 +2365,18 @@ class RoamSession:
                 if now >= self.choose_after:
                     self._passage_tick(now, pose)
                 return
+            if self.record is not None and now >= self.choose_after:
+                if self.record.active_inspection:
+                    self._inspection_tick(now, pose)
+                    if self.record.active_inspection or self.goal is not None:
+                        return
+                insp = self.record.next_inspection(pose, now, self._reachable)
+                if insp is not None:
+                    self._start_inspection(now, pose, insp)
+                    if self.goal is not None or self.record.active_inspection:
+                        return
             if now >= self.choose_after and (self.look or (self.look_check and self._plan_look(pose))):
-                self._start_spin(now, pose, self.look.pop(0))
+                self._start_spin(now, pose, self.look.pop(0), reason='look-around: unseen floor to the side')
                 if self.goal is not None:
                     self.goal['look'] = True
                 return
@@ -1534,6 +2391,9 @@ class RoamSession:
                             'score': 0.0, 'free_m': None, 'ends_at': 'exit'}
                 if sample.stop_ahead_m and not self.cfg.docs_stops:
                     self.explorer.stop_ahead_m = sample.stop_ahead_m
+                if goal is None and self.cfg.decision == 'unified':
+                    self._decide(now, pose)               # every source proposes, one evaluator decides
+                    return
                 near = sample.obstacle_ahead_m is not None and sample.obstacle_ahead_m <= self.explorer.standoff()
                 if goal is None and hasattr(self.explorer, 'straight_ahead') and not near:   # held heading
                     goal = self.explorer.straight_ahead(self.map[1], pose, self._costmap(), now)
@@ -1558,6 +2418,8 @@ class RoamSession:
                     self._end_spin(now, reason, status.get('spun_rad'))
                 elif reason in ('obstacle ahead (walking standoff)', TERRAIN_HOLD_REASON):
                     self._end_walk(now, pose, reason)
+                elif reason.startswith('reselect'):
+                    self._end_reselected(now, pose, reason)
                 else:
                     self._walk_failed(now, reason)
             elif now - requested_at > 3.0:
@@ -1568,7 +2430,12 @@ class RoamSession:
             if not result and self.passage is None and self.adv_task is None and not self.goal.get('look') \
                     and self.map is not None and self.map[0] != self.scan_map_time:
                 self.scan_map_time = self.map[0]
-                if self._walk_candidate(now, pose) is not None:
+                if self.cfg.decision == 'unified' and self._heavy_tick == now:
+                    self.scan_map_time = None                     # busy pass: check this map next pass
+                    return
+                opened = self._evaluate(now, pose, note=False).chosen is not None \
+                    if self.cfg.decision == 'unified' else self._walk_candidate(now, pose) is not None
+                if opened:
                     self._cancel_scan_walk(now, 'opening')
                     return
             if spun > self.spin_progress[1] + 0.1:
@@ -1577,13 +2444,22 @@ class RoamSession:
                 self._end_spin(now, 'done', spun)
             elif result:
                 self._end_spin(now, 'incomplete', spun)       # partial scans still help: walk anyway
-            elif now - self.spin_progress[0] > SPIN_STALL_S:
+            elif now - self.spin_progress[0] > self.cfg.spin_stall_s:
                 self.event('spin_stalled', turned_deg=_r(math.degrees(spun), 0))
-                self._pause('scan made no angular progress')
+                if self.cfg.decision == 'unified':
+                    # Cannot turn here (wedged / held): no more looking around; go on down the stuck ladder.
+                    self.scan_index, self.look = len(SCAN_STEPS), []
+                    if self.ladder is not None and LADDER[self.ladder['step']] == 'look':
+                        self.ladder['step'] += 1
+                    elif self.ladder is None:
+                        self.ladder_pending = 'cannot turn here'
+                    self._cancel_scan_walk(now, 'spin stalled')
+                else:
+                    self._pause('scan made no angular progress')
             return
         # End an approach while there is still room to replan before the proximity lock.
         heading_error = math.atan2(math.sin(self.goal['yaw'] - pose[2]), math.cos(self.goal['yaw'] - pose[2]))
-        approaching = (self.goal.get('ends_at') not in ('frontier', 'patrol', 'stairs')   # Nav2 plans those
+        approaching = (self.goal.get('ends_at') not in ('frontier', 'patrol', 'stairs', 'inspection')
                        and abs(heading_error) <= SCAN_STEP_RAD and sample.obstacle_ahead_m is not None
                        and sample.obstacle_ahead_m <= self.explorer.standoff())
         if math.hypot(pose[0] - self.progress[1], pose[1] - self.progress[2]) >= 0.10:
@@ -1598,6 +2474,11 @@ class RoamSession:
             self._cancel_scan_walk(now, 'timeout')
         elif now - self.progress[0] > self.cfg.stuck_s:
             self._cancel_scan_walk(now, f'no progress for {self.cfg.stuck_s:.0f} s')
+        elif self.cfg.decision == 'unified' and self.cfg.reselect and now - self._reselect_t >= RESELECT_PERIOD_S \
+                and self.goal.get('ends_at') not in PROTECTED_ENDS and self.passage is None \
+                and self.scene_task is None and self._heavy_tick != now:
+            self._reselect_t = now
+            self._maybe_reselect(now, pose)
 
     def _cancel_scan_walk(self, now, reason):
         if self.robot.nav_cancel():
@@ -1671,7 +2552,12 @@ class RoamSession:
 
     def _pause(self, why):
         self._leave_stairs(f'pause: {why}')
-        self.crossing, self.adv_task, self.look = None, None, []
+        self.crossing, self.adv_task, self.look, self.nudge = None, None, [], None
+        if self.record is not None:
+            if self.record.active_inspection:
+                self.record.finish_inspection(self.robot.now(), 'UNVISITED', f'paused: {why}')
+            self.record.clear_destination(self.robot.now(), f'paused: {why}')
+            self._publish_overlay(self.robot.now(), force=True)
         if self.state != 'ROAMING':
             return
         # Keep the heartbeat alive through the pause: cancel + 1.5 s of zeros used to block the loop for
@@ -1685,7 +2571,17 @@ class RoamSession:
         self.state = 'PAUSED'
         self.stats['pauses'] += 1
         self.reason = why
-        self.event('paused', reason=why)
+        now = self.robot.now()
+        self.pause_auto = self.cfg.auto_resume_s > 0 and not self._operator_pause
+        self.ladder, self.ladder_pending, self.scene_wait, self.scene_task = None, None, None, None
+        if self.pause_auto:
+            self.auto_pauses = [t for t in self.auto_pauses if now - t < 300.0] + [now]
+            delay = min(AUTO_RESUME_MAX_S, self.cfg.auto_resume_s * 2 ** (len(self.auto_pauses) - 1))
+            self.auto_resume_at = now + delay
+            self.event('paused', reason=why, auto_resume_s=_r(delay, 1))
+        else:
+            self.auto_resume_at = None
+            self.event('paused', reason=why)
         self._beat()
         if self.robot.can_actuate:
             for _ in range(3):
@@ -1720,6 +2616,9 @@ class RoamSession:
         self.state = 'ROAMING'
         self.reason = None
         self.runner.nav_active_until = math.inf
+        self.auto_resume_at, self.pause_auto = None, False
+        self.ladder, self.ladder_pending = None, None
+        self.stuck_window = []
         self.event('resumed', speed_mode=self.speed_mode)
         return None
 
@@ -1880,20 +2779,25 @@ class RoamSession:
         self._begin_stairs(direction, 'approach', 'operator')
         return None
 
-    def _begin_stairs(self, direction, start, why, over=False):
+    def _begin_stairs(self, direction, start, why, over=False, mode=None, climb_speed=None):
         normal = self.cfg.gait or FLAT_GAIT
-        iface = AiModeStairs(self.robot, self.cfg.ai_axis_forward, normal) if self.cfg.stair_mode == 'ai' \
+        mode = mode or self.cfg.stair_mode
+        iface = AiModeStairs(self.robot, self.cfg.ai_axis_forward, normal) if mode == 'ai' \
             else HStepGaitStairs(self.robot, self.cfg.rough_gait, normal)
         iface.relax_stops()
         odom = self.robot.telemetry.odom.latest()
         origin = (odom[1].x, odom[1].y) if odom else (0.0, 0.0)
-        routine = StairRoutine(direction, StairConfig(switch_settle_s=iface.settle_s), start=start, over=over)
+        kw = {'climb_speed_m_s': climb_speed} if climb_speed else {}
+        routine = StairRoutine(direction, StairConfig(switch_settle_s=iface.settle_s, **kw), start=start, over=over)
         self.stairs = (routine, iface, origin)
         self.stairs_began = self.robot.now()
-        self.event('stairs_start', direction=direction, mode=self.cfg.stair_mode, trigger=why, over=over)
+        self.stairs_kind = 'step' if why == 'terrain step' else 'stairs'
+        self.event('stairs_start', direction=direction, mode=mode, trigger=why, over=over)
 
     def _auto_stairs(self, now, sample):
         """Terrain sees a step (up or down) of stair height right ahead: cross it without the operator."""
+        if self._step_crossing(now, sample):
+            return True
         if not (self.cfg.auto_stairs and self.robot.can_actuate and hasattr(self.robot, 'send_gait')):
             return False
         if sample.step_ahead_m is None or sample.step_rise_m is None or now < self.stairs_until:
@@ -1907,12 +2811,45 @@ class RoamSession:
         self._begin_stairs('up' if sample.step_rise_m > 0 else 'down', 'switch_in', 'terrain')
         return True
 
+    def _step_crossing(self, now, sample):
+        """A step of cfg.step_min..max_rise within cfg.step_trigger: cross it straight on in the high-step gait
+        (never AI mode). Generic: triggered by what the terrain monitor sees, nothing course-specific."""
+        c = self.cfg
+        if not (c.step_crossing and self.robot.can_actuate and hasattr(self.robot, 'send_gait')):
+            return False
+        if sample.step_ahead_m is None or sample.step_rise_m is None or now < self.stairs_until:
+            return False
+        if sample.step_ahead_m > c.step_trigger_m or not c.step_min_rise_m <= abs(sample.step_rise_m) <= c.step_max_rise_m:
+            return False
+        if self.goal is not None:
+            self.robot.nav_cancel(timeout_s=0.5)
+            self.goal, self.cancel_request = None, None
+        self.event('step_detected', ahead_m=_r(sample.step_ahead_m, 2), rise_m=_r(sample.step_rise_m, 3))
+        self._begin_stairs('up' if sample.step_rise_m > 0 else 'down', 'switch_in', 'terrain step', mode='hstep',
+                           climb_speed=c.step_speed_m_s)
+        return True
+
+    def _step_wall_ahead(self, routine, travelled, pitch):
+        """End a step crossing at a wall: past the step (tilted onto it and level again, or 0.45 m walked) with an
+        obstacle within the walking standoff ahead."""
+        if getattr(self, 'stairs_kind', None) != 'step' or routine.state != 'climb':
+            return False
+        past = (routine.inclined and pitch is not None and abs(pitch) < routine.cfg.incline_pitch_rad) or \
+            travelled - routine.d_state >= STEP_PAST_M
+        sample = self._terrain_now(self.robot.now())
+        return past and sample is not None and sample.obstacle_ahead_m is not None and \
+            sample.obstacle_ahead_m <= self.explorer.standoff()
+
     def _stairs_tick(self, now):
         routine, iface, start = self.stairs
         tilt = self.robot.telemetry.current_tilt()
         odom = self.robot.telemetry.odom.latest()
         travelled = math.hypot(odom[1].x - start[0], odom[1].y - start[1]) if odom else 0.0
         action = routine.step(now, tilt[1] if tilt else None, tilt[0] if tilt else None, travelled)
+        if not (action.done or action.aborted) and self._step_wall_ahead(routine, travelled, tilt[1] if tilt else None):
+            routine._enter('switch_out', now, travelled)           # up and facing a wall: hand back to roaming
+            self.event('step_crossed_wall_ahead', travelled_m=_r(travelled, 2))
+            action = Action(switch='out')
         if action.switch == 'out' and not action.aborted and now - self.stairs_began < STAIR_MAX_AI_S:
             sample = self._terrain_now(now)          # uneven course: more lips ahead -> keep climbing in AI mode
             if sample is not None and sample.step_ahead_m is not None and sample.step_rise_m is not None and \
@@ -1950,7 +2887,11 @@ class RoamSession:
         result = None
         if cmd == 'pause':
             if self.state == 'ROAMING':
-                self._pause('operator pause')
+                self._operator_pause = True
+                try:
+                    self._pause('operator pause')
+                finally:
+                    self._operator_pause = False
             else:
                 result = f'not roaming ({self.state})'
         elif cmd == 'resume':
@@ -2017,7 +2958,23 @@ class RoamSession:
                  f'robot cmd {s["robot_cmd"]}')
 
     # -------------------------------------------------------------- main loop
+    def _select_auto_mode(self):
+        """Physical, after the operator typed ROAM: one navigation (auto) mode command, before readiness. The mode
+        switch itself does not move the robot; the result is logged (delivery evidence, not proof)."""
+        from .ros_io import NAVIGATION_MODE
+        if not (self.cfg.auto_mode and self.mode == MODE_PHYSICAL and self.robot.can_actuate):
+            return
+        try:
+            result = self.robot.send_simple_command(NAVIGATION_MODE)
+        except Exception as exc:  # noqa: BLE001 - readiness still checks the robot before anything moves
+            result = {'published': False, 'error': f'{type(exc).__name__}: {exc}'}
+        self.event('auto_mode', **{k: v for k, v in result.items() if isinstance(v, (bool, int, float, str))})
+        self.log(f'Navigation (auto) mode command: {"sent" if result.get("published") else "NOT sent"} '
+                 f'{result.get("reason") or result.get("error") or ""}'.rstrip())
+        time.sleep(0.5)                                   # let the mode switch settle before readiness
+
     def run(self, readiness_seq):
+        self._select_auto_mode()
         self.runner = SequenceRunner(readiness_seq, self.robot, self.mode, log=self.log,
                                      authorization=self.auth)
         self.runner.session_limit_s = self.cfg.max_minutes * 60 + 300
@@ -2069,10 +3026,23 @@ class RoamSession:
             # Judged as Nav2 does: no lethal/inscribed cost (>= 99) within the body half-width. With the
             # 0.40 m box at cost 70 every frontier in a ~1.5 m course sat in wall inflation (12:37 run).
             self.frontiers.clearance_m, self.frontiers.veto = FRONTIER_FALLBACK_CLEARANCE_M, FRONTIER_FALLBACK_VETO
-            self.frontiers.visited = [self.anchor]
-            self.explorer.visited = self.frontiers.visited      # one walked path for coverage and patrol
+            self.record = ExplorationRecord(self.cfg.map_session or getattr(r, 'map_session', None)
+                                            or f'roam-{dt.datetime.now():%Y%m%d-%H%M%S}', now=r.now())
+            self.record.add_breadcrumb(*self.anchor)
+            self.frontiers.visited = self.record.breadcrumbs    # one bounded walked path: coverage, patrol, overlay
+            self.explorer.visited = self.frontiers.visited
+            self.explorer.record = self.frontiers.record = self.record
             self.coverage = CameraCoverage(self.anchor, self.cfg.geofence_m + 1.0)
             self.frontiers.seen = self.coverage
+            if self.cfg.decision == 'unified':
+                # Grid aligned with the start pose (origin, heading) unless set per run: nothing course-specific.
+                ox, oy = self.cfg.grid_origin or self.anchor
+                yaw0 = math.radians(self.cfg.grid_heading_deg) if self.cfg.grid_heading_deg is not None else pose[2]
+                self.course = CourseGrid(ox, oy, yaw0, self.cfg.grid_cell_m, session=self.record.session)
+                self.stats.update(decisions=0, reselections=0, stuck=0, scene_requests=0, scene_hints=0,
+                                  auto_resumes=0)
+                self.event('course_grid', origin=[_r(ox, 2), _r(oy, 2)], heading_deg=_r(math.degrees(yaw0), 1),
+                           cell_m=self.cfg.grid_cell_m, decision='unified')
         self.scan_index = 0
         self.scan_sign = 1
         self.choose_after = -math.inf
@@ -2152,6 +3122,7 @@ class RoamSession:
                     self.stats['max_from_anchor_m'] = max(self.stats['max_from_anchor_m'], math.hypot(
                         pose[0] - self.anchor[0], pose[1] - self.anchor[1]))
                 self.last_pose = pose
+                tick_t0, self._tick_times = time.monotonic(), {}
                 if r.can_actuate:
                     if self.state == 'ROAMING':
                         self.runner._check()                    # feeds the dead-man only if all pass
@@ -2162,6 +3133,8 @@ class RoamSession:
                             self._stairs_tick(now)
                         elif self.crossing:
                             self._crossing_tick(now)
+                        elif self.nudge:
+                            self._nudge_tick(now)
                         else:
                             self._manage_goal(now, pose)
                         if now - getattr(self, '_limit_sent', -math.inf) >= 1.0:
@@ -2169,8 +3142,13 @@ class RoamSession:
                             self._limit_sent = now
                     else:
                         self.runner._check(feed=False)          # paused: dead-man stays locked
+                        self._auto_resume_tick(now)
                 else:
                     self._dry_tick(now, pose)
+                tick_s = time.monotonic() - tick_t0
+                if tick_s > SLOW_TICK_S:
+                    self.stats['slow_ticks'] = self.stats.get('slow_ticks', 0) + 1
+                    self.event('slow_tick', seconds=_r(tick_s, 2), steps=dict(self._tick_times))
                 if now - last_status >= 0.5:
                     last_status = now
                     status = self.status(now, pose)
@@ -2213,7 +3191,13 @@ class RoamSession:
         return self._finish(summary, outcome)
 
     def _dry_tick(self, now, pose):
-        """Dry: nothing is published. Evaluate what roaming would do and report health."""
+        """Dry: no motion is commanded. Evaluate what roaming would do and report health. The exploration record
+        and its RViz overlay (visualisation only) still run, showing the would-be destination."""
+        if self.record is not None and pose is not None:
+            self.record.add_breadcrumb(pose[0], pose[1])
+            self._note_map(now)
+            self._take_exploration_inputs(now)
+            self._publish_overlay(now)
         if self.goal_sent_at is None or now - self.goal_sent_at > 5.0:
             grid = self.map
             if grid is not None and pose is not None:
@@ -2226,6 +3210,12 @@ class RoamSession:
                     goal = self._choose(grid[1], now, pose)
                 if goal and (self.goal is None or (goal['x'], goal['y']) != (self.goal['x'], self.goal['y'])):
                     self.event('would_send_goal', kind=goal['kind'], x=_r(goal['x'], 2), y=_r(goal['y'], 2))
+                if self.record is not None:
+                    if goal:
+                        self.record.set_destination(now, goal, 'would walk', self.WALK_REASONS.get(
+                            goal.get('ends_at'), str(goal.get('ends_at'))))
+                    else:
+                        self.record.clear_destination(now, 'would search (no open direction)')
                 self.goal, self.goal_sent_at = goal, now
         why = self.roam_violation(now)
         if why and why != getattr(self, '_dry_last', None):
@@ -2240,6 +3230,9 @@ class RoamSession:
             'test': 'M10', 'title': 'Autonomous roaming', 'mode': self.mode, 'outcome': outcome,
             'final_state': self.state, 'stop_reason': self.reason,
             'sightings': self.sightings, 'exit': self.exit,
+            'exploration': self.record.summary() if self.record is not None else None,
+            'course_grid': self.course.summary(self.robot.now()) if self.course is not None else None,
+            'last_decision': self.last_decision.summary() if self.last_decision is not None else None,
             'config': self.cfg.as_dict(), 'speed_mode_at_end': self.speed_mode,
             'anchor': self.anchor, 'stats': {k: _r(v) if isinstance(v, float) else v
                                              for k, v in self.stats.items()},
@@ -2358,6 +3351,43 @@ def parse(argv):
     run.add_argument('--auto-stairs', action='store_true',
                      help='cross terrain-detected steps automatically in the stair mode (off: AI mode only on '
                           'stairs, whose detection is not done yet; operator 2026-11-21)')
+    run.add_argument('--step-crossing', default='on', choices=('on', 'off'),
+                     help='cross detected terrain steps straight on in the high-step gait (never AI mode)')
+    run.add_argument('--step-min-rise', type=float, default=0.12, help='smallest step crossed this way (m)')
+    run.add_argument('--step-max-rise', type=float, default=0.25, help='largest step attempted (m)')
+    run.add_argument('--step-trigger', type=float, default=0.6, help='start when the step is this close (m)')
+    run.add_argument('--step-speed', type=float, default=0.20, help='walking speed while crossing (m/s)')
+    run.add_argument('--decision', default='unified', choices=('unified', 'sequence'),
+                     help='unified (default): every source proposes, one evaluator decides, course grid memory, '
+                          'stuck ladder; sequence: the earlier fixed order')
+    run.add_argument('--weights', default='',
+                     help='evaluator weights, e.g. "info=1,camera=0.8,grid=1.5,travel=0.4" (goal_selection.py)')
+    run.add_argument('--min-score', type=float, default=GS.MIN_SCORE, help='below this no goal is worth walking to')
+    run.add_argument('--grid-cell', type=float, default=1.0, help='course grid cell size (m)')
+    run.add_argument('--grid-origin', type=float, nargs=2, metavar=('X', 'Y'),
+                     help='course grid origin in the map frame (default: start position)')
+    run.add_argument('--grid-heading-deg', type=float, help='course grid +X heading (default: start heading)')
+    run.add_argument('--stuck-window', type=float, default=60.0,
+                     help='stuck: less than 0.5 m moved and 0.5 m2 newly mapped/seen in this many seconds')
+    run.add_argument('--scene-max', type=int, default=6, help='scene-understanding requests per run when stuck')
+    run.add_argument('--scene-interval', type=float, default=60.0, help='seconds between scene requests')
+    run.add_argument('--scene-timeout', type=float, default=20.0, help='wait this long for a Pi scene answer')
+    run.add_argument('--auto-resume', type=float, default=15.0,
+                     help='pauses roam makes itself resume after this many seconds, backing off to 60 '
+                          '(0 = wait for the operator); roam.sh pause always waits')
+    run.add_argument('--no-reselect', action='store_true', help='never replace a walk goal with a better one')
+    run.add_argument('--auto-mode', default='off', choices=('on', 'off'),
+                     help='physical: put the robot in navigation (auto) mode (0x21010C03) after ROAM is typed '
+                          '(competition_start.sh --physical turns this on)')
+    run.add_argument('--stuck', type=float, default=40.0,
+                     help='give up on a goal after this long without 0.1 m of progress (s; was 20)')
+    run.add_argument('--goal-time-factor', type=float, default=5.0,
+                     help='walk goal time limit = distance / speed x this + --goal-time-base (was 3)')
+    run.add_argument('--goal-time-base', type=float, default=60.0, help='see --goal-time-factor (s; was 30)')
+    run.add_argument('--spin-stall', type=float, default=SPIN_STALL_S,
+                     help='give up on a turn after this long without angular progress (s; was 12)')
+    run.add_argument('--passage-wait', type=float, default=PASSAGE_ADVISORY_WAIT_S,
+                     help='at a blocked passage, look this long for a way on before pausing (s; was 3)')
     run.add_argument('--advisory', default='act', choices=ADVISORY_MODES,
                      help="stair/curtain advisory (~/stair_curtain): act on it, only log it, or ignore it")
     run.add_argument('--ai-axis-forward', type=int, default=12000,
@@ -2548,11 +3578,21 @@ def build_config(a, state):
                       min_lidar_hz=a.min_lidar_hz, stack_max_speed=stack_max,
                       strategy=a.strategy.replace('-', '_'), gait=a.gait,
                       docs_stops=state.get('STOP_LAYERS') == 'docs', heartbeat=a.heartbeat,
+                      map_session=state.get('RUN_DIR'),
                       rough_gait=a.rough_gait, ai_options=a.ai_option,
                       exit_open_radius_m=a.exit_open_radius, exit_min_area_m2=a.exit_min_area,
                       exit_min_from_start_m=a.exit_min_from_start, stop_at_exit=not a.no_stop_at_exit,
                       stair_mode=a.stair_mode, auto_stairs=a.auto_stairs, ai_axis_forward=a.ai_axis_forward,
-                      advisory=a.advisory)
+                      advisory=a.advisory, step_crossing=a.step_crossing == 'on',
+                      step_min_rise_m=a.step_min_rise, step_max_rise_m=a.step_max_rise,
+                      step_trigger_m=a.step_trigger, step_speed_m_s=a.step_speed, stuck_s=a.stuck,
+                      goal_time_factor=a.goal_time_factor, goal_time_base_s=a.goal_time_base,
+                      spin_stall_s=a.spin_stall, passage_wait_s=a.passage_wait,
+                      decision=a.decision, weights=a.weights, min_score=a.min_score, grid_cell_m=a.grid_cell,
+                      grid_origin=a.grid_origin, grid_heading_deg=a.grid_heading_deg,
+                      stuck_window_s=a.stuck_window, scene_max=a.scene_max, scene_interval_s=a.scene_interval,
+                      scene_timeout_s=a.scene_timeout, auto_resume_s=a.auto_resume, reselect=not a.no_reselect,
+                      auto_mode=a.auto_mode == 'on')
 
 
 def parse_script(text):
@@ -2770,6 +3810,8 @@ def run_session(a, state, directory):
         session = RoamSession(robot, cfg, mode, channel, log=lambda m: print(m, flush=True),
                               authorization=auth, watchdog=watchdog, script=script,
                               sim_stop_after_s=a.sim_seconds if mode == MODE_SIM else None)
+        session.out_dir = out
+        (out / 'mission_events.json').write_text('[]\n')   # mission events, one JSON file per run
         if use_watchdog:
             channel.write_status({'state': 'READY', 'heartbeat': time.time(), 'pid': os.getpid()})
             if not wait_watchdog(channel, 30.0):

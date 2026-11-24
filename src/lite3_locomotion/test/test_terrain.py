@@ -185,7 +185,7 @@ def test_step_limit_suits_stairs_and_rubble_and_launch_default_matches():
     """2026-11-21: 5 cm competition stairs and rubble are steps, not obstacles; configurable per run."""
     import re
     from pathlib import Path
-    assert T.TerrainParams().max_step_m == 0.40           # course lips 0.10-0.15 m, two stacked (12:33 run)
+    assert T.TerrainParams().max_step_m == 0.35           # course lips 0.10-0.15 m, two stacked (12:33 run)
     launch = (Path(__file__).resolve().parents[1] / 'launch' / 'navigation.launch.py').read_text()
     assert float(re.search(r'TERRAIN_MAX_STEP_M = ([0-9.]+)', launch).group(1)) == T.TerrainParams().max_step_m
     assert "arguments=['--max-step'" in launch

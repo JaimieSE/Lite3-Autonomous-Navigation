@@ -448,7 +448,7 @@ def test_stalled_search_pauses(tmp_path, monkeypatch):
     monkeypatch.setattr(R.ScanWalk, 'choose', lambda *a, **kw: None)
     monkeypatch.setattr(R.ScanWalk, 'straight_ahead', lambda *a, **kw: None)
     monkeypatch.setattr(FakeNavRobot, '_spin_tick', lambda self: None)
-    _, summary, _, _ = roam(tmp_path, stop_after=25, cfg=R.RoamConfig(strategy='scan_walk'))
+    _, summary, _, _ = roam(tmp_path, stop_after=25, cfg=R.RoamConfig(strategy='scan_walk', spin_stall_s=12.0))
     names = [e['event'] for e in summary['events']]
     assert 'spin_stalled' in names and 'paused' in names and 'walk' not in names
 
@@ -808,7 +808,8 @@ def test_consecutive_lips_keep_ai_mode_on_until_the_ground_is_flat(tmp_path, mon
         step = (0.5, 0.12) if stamp < window['until'] else (None, None)
         return original_terrain(self, stamp, stop, reason, ahead, stop_ahead, problems, processing_s, *step)
     monkeypatch.setattr(Telemetry, 'on_terrain', on_terrain)
-    _, summary, robot, _ = roam(tmp_path, stop_after=70, cfg=R.RoamConfig(strategy='scan_walk', auto_stairs=True))
+    _, summary, robot, _ = roam(tmp_path, stop_after=70, cfg=R.RoamConfig(strategy='scan_walk', auto_stairs=True,
+                                                                         step_crossing=False))   # AI path only
     names = [e['event'] for e in summary['events']]
     assert 'stairs_continue' in names and 'safety_stop' not in names
     simple = [s[2] for s in robot.sent if s[1] == 'simple']
@@ -828,7 +829,8 @@ def test_ai_mode_is_off_by_default_even_when_a_step_is_reported(tmp_path, monkey
     assert R.RoamConfig().auto_stairs is False
     _, summary, robot, _ = roam(tmp_path, stop_after=20, cfg=R.RoamConfig(strategy='scan_walk'))
     assert IO.AI_ENTER not in [s[2] for s in robot.sent if s[1] == 'simple']
-    assert 'stairs_start' not in [e['event'] for e in summary['events']]
+    # A 0.12 m step may be crossed by step crossing (2026-11-23), which uses the high-step gait, never AI mode.
+    assert all(e['mode'] == 'hstep' for e in summary['events'] if e['event'] == 'stairs_start')
 
 
 def test_scan_walk_falls_back_to_a_frontier_before_spinning():
@@ -854,6 +856,7 @@ def test_walk_cut_short_by_the_standoff_is_remembered():
     s = Stub()
     s.cfg, s.explorer, s.frontiers, s.failures, s.stats = R.RoamConfig(strategy='scan_walk'), sw, None, 0, \
         {'goals_failed': 0, 'goals_succeeded': 0, 'walks_to_obstacle': 0}
+    s.record = None
     s.goal = {'kind': 'walk', 'x': 0.77, 'y': -0.08, 'yaw': 0.0, 'ends_at': 'straight_on'}
     s.walk_start = (0.2, 0.0)
     s.events = []
@@ -902,7 +905,8 @@ def test_dead_end_with_a_passage_stops_in_front_of_it(tmp_path, monkeypatch):
     monkeypatch.setattr(R.RoamSession, '_frontier_goal', lambda *a, **kw: None)
     monkeypatch.setattr(R, 'blocked_passage', lambda grid, pose, **kw: {
         'yaw': pose[2] + math.pi / 2, 'wall_m': 0.40, 'unknown': 0.9, 'width_deg': 25})
-    outcome, summary, _, _ = roam(tmp_path, cfg=R.RoamConfig(strategy='scan_walk'), stop_after=100)
+    outcome, summary, _, _ = roam(tmp_path, cfg=R.RoamConfig(strategy='scan_walk', passage_wait_s=0.0),
+                                  stop_after=100)
     names = [e['event'] for e in summary['events']]
     assert 'blocked_passage' in names and 'backtrack' not in names
     paused = [e for e in summary['events'] if e['event'] == 'paused']
@@ -1235,3 +1239,106 @@ def test_a_hazard_cloud_that_stops_for_good_still_stops_roaming_in_docs_mode(tmp
     assert outcome == 'SAFETY_STOP' and 'hazard cloud stale' in summary['stop_reason'] or \
         'stale' in summary['stop_reason'], summary['stop_reason']
     assert summary['rest_verified'] is True
+
+
+def _terrain_step(monkeypatch, rise, ahead=0.5, seconds=12.0, obstacle_after=None):
+    """Telemetry sees a step (ahead, rise) for `seconds`; optionally an obstacle at the nose after `obstacle_after`."""
+    from lite3_movement_tests.telemetry import Telemetry
+    original = Telemetry.on_terrain
+    w = {'t0': None}
+
+    def on_terrain(self, stamp, stop, reason, obstacle, stop_ahead, problems, processing_s=None,
+                   step_ahead_m=None, step_rise_m=None):
+        w['t0'] = stamp if w['t0'] is None else w['t0']
+        if stamp < w['t0'] + seconds:
+            step_ahead_m, step_rise_m = ahead, rise
+        if obstacle_after is not None and stamp > w['t0'] + obstacle_after:
+            obstacle = 0.1
+        return original(self, stamp, stop, reason, obstacle, stop_ahead, problems, processing_s, step_ahead_m,
+                        step_rise_m)
+    monkeypatch.setattr(Telemetry, 'on_terrain', on_terrain)
+
+
+def test_terrain_step_is_crossed_in_the_high_step_gait_never_ai(tmp_path, monkeypatch):
+    """Operator 2026-11-23: a 20 cm block must be crossed; AI mode only for stairs; nothing course-specific."""
+    from lite3_movement_tests import ros_io as IO, stairs as ST
+    _terrain_step(monkeypatch, 0.20)
+    original_step = ST.StairRoutine.step
+    monkeypatch.setattr(ST.StairRoutine, 'step', lambda self, t, p, r, d: original_step(
+        self, t, 0.2 if 0.05 <= d < 0.3 else 0.0, r, d))                  # body tilts while stepping up
+    _, summary, robot, _ = roam(tmp_path, stop_after=60, cfg=R.RoamConfig(strategy='scan_walk'))
+    ev = summary['events']
+    start = next(e for e in ev if e['event'] == 'stairs_start')
+    assert start['mode'] == 'hstep' and start['trigger'] == 'terrain step'
+    assert any(e['event'] == 'step_detected' and abs(e['rise_m'] - 0.2) < 1e-6 for e in ev)
+    simple = [s[2] for s in robot.sent if s[1] == 'simple']
+    assert IO.AI_ENTER not in simple and IO.AI_GAIT_BASIC not in simple    # never AI mode
+    assert 'stairs_done' in [e['event'] for e in ev]
+
+
+def test_step_crossing_ends_when_a_wall_is_ahead(tmp_path, monkeypatch):
+    from lite3_movement_tests import stairs as ST
+    _terrain_step(monkeypatch, 0.20, obstacle_after=2.0)
+    original_step = ST.StairRoutine.step
+    monkeypatch.setattr(ST.StairRoutine, 'step', lambda self, t, p, r, d: original_step(
+        self, t, 0.2 if 0.05 <= d < 0.2 else 0.0, r, d))
+    _, summary, _, _ = roam(tmp_path, stop_after=60, cfg=R.RoamConfig(strategy='scan_walk'))
+    names = [e['event'] for e in summary['events']]
+    assert 'step_crossed_wall_ahead' in names
+    assert names.index('stairs_start') < names.index('step_crossed_wall_ahead') < names.index('stairs_done')
+
+
+def test_steps_outside_the_configured_range_are_not_crossed_this_way(tmp_path, monkeypatch):
+    _terrain_step(monkeypatch, 0.40)                                     # wall-like: not a step to climb
+    _, summary, _, _ = roam(tmp_path, stop_after=25, cfg=R.RoamConfig(strategy='scan_walk'))
+    assert 'step_detected' not in [e['event'] for e in summary['events']]
+    _terrain_step(monkeypatch, 0.20)
+    _, off, _, _ = roam(tmp_path / 'off', stop_after=25,
+                        cfg=R.RoamConfig(strategy='scan_walk', step_crossing=False)) \
+        if (tmp_path / 'off').mkdir() is None else (None, None, None, None)
+    assert 'step_detected' not in [e['event'] for e in off['events']]
+
+
+def test_step_crossing_options_come_from_the_command_line():
+    a = R.parse(['run', '--speed-limit', '0.5', '--step-min-rise', '0.15', '--step-max-rise', '0.22',
+                 '--step-trigger', '0.7', '--step-speed', '0.25', '--step-crossing', 'off'])
+    cfg = R.build_config(a, {'MAX_SPEED': '0.5'})
+    assert (cfg.step_crossing, cfg.step_min_rise_m, cfg.step_max_rise_m, cfg.step_trigger_m, cfg.step_speed_m_s) == \
+        (False, 0.15, 0.22, 0.7, 0.25)
+    d = R.build_config(R.parse(['run', '--speed-limit', '0.5']), {'MAX_SPEED': '0.5'})
+    assert (d.step_crossing, d.step_min_rise_m, d.step_max_rise_m) == (True, 0.12, 0.25)
+    with pytest.raises(ConfigError):
+        R.RoamConfig(step_min_rise_m=0.3, step_max_rise_m=0.2)
+
+
+def test_a_passage_that_opens_while_waiting_is_explored_instead_of_paused_at(tmp_path, monkeypatch):
+    """Operator 2026-11-23: think longer before giving up. While waiting at a blocked passage, a map update that
+    no longer shows it blocked sends roam back to exploring instead of pausing."""
+    monkeypatch.setattr(R.ScanWalk, 'choose', lambda *a, **kw: None)
+    monkeypatch.setattr(R.ScanWalk, 'straight_ahead', lambda *a, **kw: None)
+    monkeypatch.setattr(R.RoamSession, '_frontier_goal', lambda *a, **kw: None)
+    state = {'calls': 0}
+
+    def passage(grid, pose, **kw):
+        state['calls'] += 1
+        return {'yaw': 0.0, 'wall_m': 0.40, 'unknown': 0.9, 'width_deg': 25} if state['calls'] == 1 else None
+    monkeypatch.setattr(R, 'blocked_passage', passage)
+    _, summary, _, _ = roam(tmp_path, cfg=R.RoamConfig(strategy='scan_walk', passage_wait_s=30.0), stop_after=60)
+    names = [e['event'] for e in summary['events']]
+    assert 'passage_waiting' in names and 'passage_cleared' in names
+    assert not any('blocked passage' in (e.get('reason') or '') for e in summary['events'] if e['event'] == 'paused')
+
+
+def test_give_up_timings_are_longer_by_default_and_set_per_run():
+    cfg = R.RoamConfig()
+    assert cfg.stuck_s == 40.0 and cfg.spin_stall_s == 25.0 and cfg.passage_wait_s == 10.0
+    assert cfg.goal_time_s(2.0, 0.5) == 2.0 / 0.5 * 5 + 60              # was x3 + 30
+    assert cfg.goal_time_s(100.0, 0.1) == R.HARD_MAX_GOAL_S
+    d = R.build_config(R.parse(['run', '--speed-limit', '0.5']), {'MAX_SPEED': '0.5'})
+    assert (d.stuck_s, d.goal_time_factor, d.goal_time_base_s, d.spin_stall_s, d.passage_wait_s) == (40, 5, 60, 25, 10)
+    a = R.parse(['run', '--speed-limit', '0.5', '--stuck', '30', '--goal-time-factor', '4', '--goal-time-base',
+                 '45', '--spin-stall', '20', '--passage-wait', '6'])
+    c = R.build_config(a, {'MAX_SPEED': '0.5'})
+    assert (c.stuck_s, c.goal_time_factor, c.goal_time_base_s, c.spin_stall_s, c.passage_wait_s) == (30, 4, 45, 20, 6)
+    with pytest.raises(R.ConfigError):
+        R.RoamConfig(stuck_s=500)
