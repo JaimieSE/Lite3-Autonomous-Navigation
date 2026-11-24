@@ -136,6 +136,15 @@ ADVISORY_MAX_AGE_S = 0.5               # it publishes every ~0.15 s; older = det
 ADVISORY_STAIRS_TRIGGER_M = 0.9        # stairs nearer: start the crossing (its approach covers up to 1.0 m)
 ADVISORY_STAIRS_WALK_TO_M = 0.6        # stairs farther: walk to this far from the first riser first
 ADVISORY_ALIGN_DEG = 5.0               # turn to face the risers when the detector says more than this
+# Stairs / curtain from the Pi (operator 2026-11-24: the Orbbec is on the Pi, which runs the same detector). The Pi
+# processes ~0.6 frames/s, so a reading can be 1-2 s old: roam stops, then acts only on a reading captured after it
+# stopped (capture stamp minus arrival latency), so a stale distance never walks it into the stairs.
+PI_ADVISORY_MAX_AGE_S = 3.0            # a Pi reading older than this (by arrival) is ignored
+PI_CONFIRM_MAX_S = 8.0                 # stopped this long without a fresh confirmed reading: carry on
+PI_STILL_MARGIN_S = 0.5                # the frame must be captured this long after the stop (deceleration)
+PI_SETTLE_S = 2.5                      # no usable capture stamp: arrival this long after the stop instead
+PI_LATENCY_RANGE_S = (-0.5, 3.0)       # capture-to-arrival latency accepted as a sane clock
+PI_IGNORE_S = 10.0                     # after an unconfirmed stop, ignore Pi readings this long
 CURTAIN_TRIGGER_M = 1.2                # curtain this near base_link: cross it
 CURTAIN_CAMERA_AHEAD_M = 0.25          # RGB camera ahead of base_link (URDF camera mount x 0.252)
 CURTAIN_PAST_M = 0.61 + 0.30           # walk on past the curtain: body length + margin
@@ -225,7 +234,7 @@ class RoamConfig:
                  spin_stall_s=SPIN_STALL_S, passage_wait_s=PASSAGE_ADVISORY_WAIT_S,
                  decision='sequence', weights=None, min_score=GS.MIN_SCORE, grid_cell_m=1.0, grid_origin=None,
                  grid_heading_deg=None, stuck_window_s=60.0, scene_max=6, scene_interval_s=60.0,
-                 scene_timeout_s=20.0, auto_resume_s=0.0, reselect=True, auto_mode=False):
+                 scene_timeout_s=20.0, auto_resume_s=0.0, reselect=True, auto_mode=False, pi_advisory=True):
         self.speed_limit = _finite(speed_limit, 'speed_limit', 0.02, min(HARD_MAX_SPEED_M_S, stack_max_speed))
         modes = {**DEFAULT_MODES, **(modes or {})}         # unspecified modes keep their defaults
         self.modes = {}
@@ -325,6 +334,7 @@ class RoamConfig:
         # Operator 2026-11-24: every competition start puts the robot in navigation (auto) mode itself
         # (0x21010C03, Comm Interface s1.2.7; the same command the stair routine sends on leaving AI mode).
         self.auto_mode = bool(auto_mode)
+        self.pi_advisory = bool(pi_advisory)     # act on the Pi's stair/curtain readings (with the stop-and-confirm)
         self.max_map_age_s = _finite(max_map_age_s, 'max_map_age', 3.0, HARD_MAX_MAP_AGE_S)
         self.max_sensor_age_s = _finite(max_sensor_age_s, 'max_sensor_age', 0.1, HARD_MAX_SENSOR_AGE_S)
         self.min_lidar_hz = _finite(min_lidar_hz, 'min_lidar_hz', HARD_MIN_LIDAR_HZ, 20.0)
@@ -1087,6 +1097,8 @@ class RoamSession:
         self.scene_requests = []                 # times of scene requests (bounded per run)
         self.stuck_window = []                   # [(t, x, y, area)] for the no-progress check
         self._reselect_t = -math.inf
+        self.pi_gate = None                      # stopped for a Pi stairs/curtain reading: {'t'} (robot time)
+        self.pi_ignore_until = -math.inf
         self._heavy_tick = None                  # robot time of the pass that already did heavy work
         self._tick_times = {}                    # heavy step -> seconds in this pass (slow-tick log)
         self._operator_pause = False
@@ -2158,6 +2170,8 @@ class RoamSession:
             return 'DRIFT FIX'
         if self.hold_since is not None:
             return 'HOLD'
+        if self.pi_gate is not None:
+            return 'CHECKING STAIRS (Pi)'
         if self.scene_wait is not None:
             return 'STUCK: asking scene'
         if self.scene_task is not None:
@@ -2654,20 +2668,82 @@ class RoamSession:
         """Teammate's stair/curtain detector (advisory.py). Logs confirmed sightings; with advisory 'act'
         it turns a confirmed stairs into the AI-mode crossing and a near curtain into a slow straight
         crossing. Returns True when it took over this tick."""
-        item = getattr(self.robot, 'advisory', None)
-        if item is None or self.cfg.advisory == 'off' or now - item[0] > ADVISORY_MAX_AGE_S:
+        if self.cfg.advisory == 'off':
+            return False
+        item = self._pick_advisory(now)
+        if item == 'hold':
+            return True                                   # stopped: waiting for a reading taken standing still
+        if item is None:
             return False
         adv = parse_advisory(item[1])
         key = None if adv is None else (adv['obstacle'], round(adv['distance_m'] * 4) / 4)
         if adv is not None and key != self.adv_last:
             self.event('advisory', obstacle=adv['obstacle'], distance_m=_r(adv['distance_m'], 2),
-                       heading_deg=_r(adv['heading_deg'], 1))
+                       heading_deg=_r(adv['heading_deg'], 1), source=item[2])
         self.adv_last = key
         if adv is None or self.cfg.advisory != 'act' or self.stairs or self.crossing:
             return False
         if adv['obstacle'] == 'stairs':
             return self._advisory_stairs(now, pose, adv)
         return self._advisory_curtain(now, pose, adv)
+
+    def _pick_advisory(self, now):
+        """(arrival time, advisory JSON, source) to act on, 'hold' while stopped for a Pi reading, or None.
+        The NUC detector (/stair_curtain/advisory) is used as before. A confirmed Pi reading first stops the robot
+        and is acted on only once a frame captured after the stop confirms it."""
+        nuc = getattr(self.robot, 'advisory', None)
+        fallback = None
+        if nuc is not None and now - nuc[0] <= ADVISORY_MAX_AGE_S:
+            if parse_advisory(nuc[1]) is not None:
+                return nuc[0], nuc[1], 'detector'
+            fallback = (nuc[0], nuc[1], 'detector')
+        pi = getattr(self.robot, 'pi_advisory', None)
+        if pi is None or not self.cfg.pi_advisory or now - pi[0] > PI_ADVISORY_MAX_AGE_S:
+            if self.pi_gate is not None and now - self.pi_gate['t'] > PI_CONFIRM_MAX_S:
+                self._pi_gate_expired(now)
+            return 'hold' if self.pi_gate is not None else fallback
+        adv = parse_advisory(pi[2])
+        if self.cfg.advisory != 'act':
+            return (pi[0], pi[2], 'pi') if adv is not None else fallback
+        busy = (self.stairs or self.crossing or self.adv_task is not None
+                or (self.goal is not None and self.goal.get('ends_at') == 'stairs'))
+        if adv is not None and (adv['obstacle'] == 'stairs' and now < self.stairs_until
+                                or adv['obstacle'] == 'curtain' and (now < self.curtain_until
+                                                                     or adv['distance_m'] > CURTAIN_TRIGGER_M)):
+            adv = None                    # nothing roam would do with it (just crossed / too far): do not stop
+        if adv is None or busy or now < self.pi_ignore_until:
+            if self.pi_gate is not None and now - self.pi_gate['t'] > PI_CONFIRM_MAX_S:
+                self._pi_gate_expired(now)
+            return 'hold' if self.pi_gate is not None and not busy else fallback
+        if self.pi_gate is None:
+            self.pi_gate = {'t': now}
+            self._cancel_goal_now()
+            self.event('pi_obstacle_stop', obstacle=adv['obstacle'], distance_m=_r(adv['distance_m'], 2),
+                       reason='confirm with a frame taken standing still')
+            return 'hold'
+        if now - self.pi_gate['t'] > PI_CONFIRM_MAX_S:
+            self._pi_gate_expired(now)
+            return None
+        self._cancel_goal_now()
+        try:
+            capture_s = json.loads(pi[2]).get('capture_stamp_ns') / 1e9
+            latency = pi[1] - capture_s
+            captured = pi[0] - latency if PI_LATENCY_RANGE_S[0] <= latency <= PI_LATENCY_RANGE_S[1] else None
+        except (TypeError, ValueError, AttributeError):
+            captured = None
+        fresh = (captured >= self.pi_gate['t'] + PI_STILL_MARGIN_S) if captured is not None \
+            else pi[0] >= self.pi_gate['t'] + PI_SETTLE_S
+        if not fresh:
+            return 'hold'
+        self.event('pi_obstacle_confirmed', obstacle=adv['obstacle'], distance_m=_r(adv['distance_m'], 2),
+                   stopped_s=_r(now - self.pi_gate['t'], 1), by='capture stamp' if captured is not None else 'arrival')
+        self.pi_gate = None
+        return pi[0], pi[2], 'pi'
+
+    def _pi_gate_expired(self, now):
+        self.event('pi_obstacle_unconfirmed', waited_s=_r(now - self.pi_gate['t'], 1))
+        self.pi_gate = None
+        self.pi_ignore_until = now + PI_IGNORE_S
 
     def _advisory_stairs(self, now, pose, adv):
         """Far: walk to ADVISORY_STAIRS_WALK_TO_M before the first riser. Near: face the risers squarely
@@ -3376,6 +3452,9 @@ def parse(argv):
                      help='pauses roam makes itself resume after this many seconds, backing off to 60 '
                           '(0 = wait for the operator); roam.sh pause always waits')
     run.add_argument('--no-reselect', action='store_true', help='never replace a walk goal with a better one')
+    run.add_argument('--pi-advisory', default='on', choices=('on', 'off'),
+                     help="act on the Pi's stair/curtain readings (stop, confirm standing still, then the stairs "
+                          "routine / curtain crossing as for the NUC detector)")
     run.add_argument('--auto-mode', default='off', choices=('on', 'off'),
                      help='physical: put the robot in navigation (auto) mode (0x21010C03) after ROAM is typed '
                           '(competition_start.sh --physical turns this on)')
@@ -3592,7 +3671,7 @@ def build_config(a, state):
                       grid_origin=a.grid_origin, grid_heading_deg=a.grid_heading_deg,
                       stuck_window_s=a.stuck_window, scene_max=a.scene_max, scene_interval_s=a.scene_interval,
                       scene_timeout_s=a.scene_timeout, auto_resume_s=a.auto_resume, reselect=not a.no_reselect,
-                      auto_mode=a.auto_mode == 'on')
+                      auto_mode=a.auto_mode == 'on', pi_advisory=a.pi_advisory == 'on')
 
 
 def parse_script(text):

@@ -94,9 +94,17 @@ class RoamRobot(NavRobot):
         from collections import deque
         from .scene_hints import PI_DETECTIONS_TOPIC, PI_SCENES_TOPIC, SCENE_REQUEST_TOPIC
         self.pi_scene_messages = deque(maxlen=30)
-        for topic in (PI_DETECTIONS_TOPIC, PI_SCENES_TOPIC):
-            node.create_subscription(String, topic, lambda m: self.pi_scene_messages.append(
-                (time.monotonic(), m.data)), qos_profile_sensor_data)
+        from .scene_hints import pi_stair_curtain
+        self.pi_advisory = None                  # (arrival monotonic, arrival wall s, advisory JSON) from the Pi
+
+        def pi_detections(m):
+            self.pi_scene_messages.append((time.monotonic(), m.data))
+            reading = pi_stair_curtain(m.data)   # Orbbec on the Pi: its stair/curtain detector drives the stairs
+            if reading is not None:
+                self.pi_advisory = (time.monotonic(), time.time(), reading)
+        node.create_subscription(String, PI_DETECTIONS_TOPIC, pi_detections, qos_profile_sensor_data)
+        node.create_subscription(String, PI_SCENES_TOPIC, lambda m: self.pi_scene_messages.append(
+            (time.monotonic(), m.data)), qos_profile_sensor_data)
         scene_pub = node.create_publisher(String, SCENE_REQUEST_TOPIC, 10)
         self.publish_scene_request = lambda text: scene_pub.publish(String(data=text))
         # Stair / curtain advisory (teammate's ~/stair_curtain detector): latest message, stamped on arrival

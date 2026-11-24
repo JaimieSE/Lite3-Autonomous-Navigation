@@ -76,6 +76,21 @@ def parse_scene_hints(text):
     return sorted(hints, key=lambda h: (PRIORITY[h['kind']], abs(h['bearing_deg'])))
 
 
+def pi_stair_curtain(text):
+    """The detector reading inside one Pi detections message, as the advisory JSON roam already acts on (same
+    detector as ~/stair_curtain on the Pi: obstacle, reason, distance_m, distance_reference,
+    heading_correction_deg), plus "capture_stamp_ns" of the frame. None if the message has no such reading."""
+    try:
+        msg = json.loads(text)
+    except (TypeError, ValueError):
+        return None
+    sc = msg.get('stair_curtain') if isinstance(msg, dict) else None
+    if not isinstance(sc, dict):
+        return None
+    stamp = msg.get('capture_stamp_ns', sc.get('stamp_ns'))
+    return json.dumps(dict(sc, capture_stamp_ns=stamp if type(stamp) is int else None))
+
+
 def scene_request(request_id, reason, pose, map_session, stamp):
     return json.dumps({'request_id': request_id, 'reason': reason, 'map_session': map_session,
                        'pose': {'x': round(pose[0], 3), 'y': round(pose[1], 3), 'yaw': round(pose[2], 4)},

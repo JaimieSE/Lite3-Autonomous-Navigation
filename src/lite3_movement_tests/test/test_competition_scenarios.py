@@ -242,3 +242,88 @@ def test_physical_competition_start_selects_navigation_auto_mode_once():
     assert R.build_config(R.parse(['run', '--speed-limit', '0.5']), {'MAX_SPEED': '0.5'}).auto_mode is False
     script = (R.Path(__file__).resolve().parents[3] / 'operator' / 'competition_start.sh').read_text()
     assert '--physical --auto-mode on' in script
+
+
+def pi_stairs(monkeypatch, after_s, distance_m=0.7, latency_s=1.5, period_s=1.7, obstacle='stairs', until_s=1e9,
+              stamped=True):
+    """The Pi's detector (Orbbec on the Pi) reporting confirmed stairs every period_s from after_s on. Each frame
+    arrives latency_s after it was captured (capture stamp = arrival wall time - latency)."""
+    original = R.RoamSession._take_scene
+    state = {'next': None}
+
+    def take(self, now, pose):
+        if self.t_roam is not None and after_s <= now - self.t_roam <= until_s:
+            if state['next'] is None or now >= state['next']:
+                state['next'] = now + period_s
+                wall = 1_000_000.0 + now
+                reading = {'obstacle': obstacle, 'reason': 'confirmed', 'distance_m': distance_m,
+                           'distance_reference': 'base_link_forward', 'heading_correction_deg': 0.0,
+                           'capture_stamp_ns': int((wall - latency_s) * 1e9) if stamped else None}
+                self.robot.pi_advisory = (now, wall, json.dumps(reading))
+        return original(self, now, pose)
+    monkeypatch.setattr(R.RoamSession, '_take_scene', take)
+
+
+def staircase(monkeypatch):
+    from lite3_movement_tests import stairs as ST
+    original_step = ST.StairRoutine.step
+
+    def step(self, t, pitch, roll, travelled):
+        p = -0.17 if 0.1 <= travelled < 0.5 else 0.17 if 0.75 <= travelled < 1.15 else 0.0
+        return original_step(self, t, p, roll, travelled)
+    monkeypatch.setattr(ST.StairRoutine, 'step', step)
+
+
+def test_pi_stairs_stop_confirm_climb_in_ai_mode_and_return_to_auto_high_step(tmp_path, monkeypatch):
+    """Operator 2026-11-24: detect a stair (Pi, Orbbec), switch to AI mode, climb over, switch back to navigation
+    (auto) mode in the rug high-step gait with no AI. A reading captured before the stop is never acted on."""
+    from lite3_movement_tests import ros_io as IO
+    pi_stairs(monkeypatch, 6.0)
+    staircase(monkeypatch)
+    _, summary, robot, _ = roam(tmp_path, stop_after=90, cfg=cfg(gait='rug_hstep'))
+    ev, n = summary['events'], names(summary)
+    stop = first(summary, 'pi_obstacle_stop')
+    confirmed = first(summary, 'pi_obstacle_confirmed')
+    assert confirmed['by'] == 'capture stamp' and confirmed['stopped_s'] >= 1.5 + R.PI_STILL_MARGIN_S - 0.2
+    start = first(summary, 'stairs_start')
+    assert start['mode'] == 'ai' and start['trigger'] == 'advisory' and stop['t_s'] < start['t_s']
+    assert any(e['event'] == 'advisory' and e.get('source') == 'pi' for e in ev)
+    assert n.index('stairs_start') < n.index('stairs_done')
+    cmds = [(s[1], s[2]) for s in robot.sent if s[1] in ('simple', 'gait')]
+    enter = cmds.index(('simple', IO.AI_ENTER))
+    leave = cmds.index(('simple', IO.AI_EXIT), enter)
+    assert cmds[leave + 1] == ('simple', IO.NAVIGATION_MODE)                 # back to navigation (auto) mode
+    assert cmds[leave + 2] == ('gait', 'rug_hstep')                          # in the rug high-step gait, AI off
+    assert ('simple', IO.AI_ENTER) not in cmds[leave:leave + 3]
+
+def test_pi_stairs_that_are_not_confirmed_standing_still_are_left(tmp_path, monkeypatch):
+    pi_stairs(monkeypatch, 6.0, until_s=7.0)                  # one reading, then the Pi reports nothing
+    _, summary, _, _ = roam(tmp_path, stop_after=40, cfg=cfg())
+    n = names(summary)
+    assert 'pi_obstacle_stop' in n and 'pi_obstacle_unconfirmed' in n and 'stairs_start' not in n
+    assert n.count('walk') >= 2                                # roaming carries on
+
+
+def test_pi_readings_without_a_capture_stamp_wait_longer(tmp_path, monkeypatch):
+    pi_stairs(monkeypatch, 6.0, stamped=False)
+    _, summary, _, _ = roam(tmp_path, stop_after=30, cfg=cfg())
+    c = first(summary, 'pi_obstacle_confirmed')
+    assert c['by'] == 'arrival' and c['stopped_s'] >= R.PI_SETTLE_S - 0.1
+
+
+def test_pi_readings_are_only_logged_in_log_mode_or_when_switched_off(tmp_path, monkeypatch):
+    pi_stairs(monkeypatch, 6.0)
+    _, summary, _, _ = roam(tmp_path, stop_after=25, cfg=cfg(advisory='log'))
+    n = names(summary)
+    assert 'advisory' in n and 'pi_obstacle_stop' not in n and 'stairs_start' not in n
+    _, summary, _, _ = roam(tmp_path, stop_after=25, cfg=cfg(pi_advisory=False))
+    assert 'pi_obstacle_stop' not in names(summary)
+
+
+def test_after_the_climb_the_stairs_behind_do_not_stop_it_again(tmp_path, monkeypatch):
+    pi_stairs(monkeypatch, 6.0)
+    staircase(monkeypatch)
+    _, summary, _, _ = roam(tmp_path, stop_after=60, cfg=cfg(gait='rug_hstep'))
+    done = first(summary, 'stairs_done')['t_s']
+    later = [e for e in summary['events'] if e['event'] == 'pi_obstacle_stop' and done < e['t_s'] < done + R.STAIR_COOLDOWN_S]
+    assert not later

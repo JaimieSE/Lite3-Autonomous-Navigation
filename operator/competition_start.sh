@@ -94,6 +94,14 @@ if [ "$MODE" != sim ]; then
     "$OPERATOR_DIR/stop_navigation.sh"
   fi
   : > "$PIDS_FILE"
+  # Stairs and curtains come from the Pi (Orbbec on the Pi, same stair/curtain detector): warn if it is silent.
+  PI_PUBS=$(timeout 15 ros2 topic info /group8pi/perception/detections 2>/dev/null | sed -n 's/^Publisher count: //p')
+  if [ "${PI_PUBS:-0}" -gt 0 ]; then
+    echo "== Pi perception: publishing (stairs/curtains, missions, scene hints)"
+  else
+    echo "   WARNING: no Pi perception publisher on /group8pi/perception/detections: no stair detection, no scene"
+    echo "            hints. Check the Pi (systemctl --user status group8pi-perception) before typing ROAM."
+  fi
   if [ $PI_BRIDGE -eq 1 ]; then
     if [ -x "$HOME/live_mission/pi_bridge.sh" ] && [ -f "$MISSIONS" ]; then
       echo "== Pi mission bridge (dry decisions M01-M05) -> $RUN/pi_bridge.log"
