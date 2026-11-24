@@ -443,6 +443,18 @@ def test_a_terrain_stop_reading_never_holds_the_dog(tmp_path, monkeypatch):
         n = names(summary)
         assert 'hold' not in n and 'walk' in n
 
+def test_centre_lanes_never_hold_the_dog(tmp_path):
+    """Operator 2026-11-24 (run 14:05): with --centre-lane the dog off its cell's centre line was refused every lane
+    and waited 10 s, again and again. Now a lane may start anywhere in the cell, and a refusal walks the goal."""
+    c = cfg(grid_origin=(0.0, 0.35))                      # the dog starts 0.35 m off its cell's centre line
+    c.centre_lane = True
+    _, summary, _, _ = roam(tmp_path, stop_after=120, cfg=c)
+    n = names(summary)
+    assert 'centre_lane_hold' not in n
+    assert n.count('walk') >= 3 and summary['stats']['distance_m'] > 3.0
+    fallbacks = [e for e in summary['events'] if e['event'] == 'centre_lane_fallback']
+    assert len(fallbacks) < n.count('walk')               # most walks use a lane; a refusal still walks
+
 
 def scene_hold(monkeypatch, at_s, for_s=6.0, request_id='enc-1'):
     """nav_hold.py's message: hold from at_s for for_s (wall-clock expiry), then a release."""

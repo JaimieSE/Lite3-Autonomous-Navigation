@@ -2326,7 +2326,92 @@ class RoamSession:
         self.scan_index += 1
         self._start_spin(now, pose, angle)
 
+    def _centre_lane_ok(self, points, lane):
+        source, target = lane
+        axis = 0 if source[0] != target[0] else 1
+        lateral = 1 - axis
+        direction = target[axis] - source[axis]
+        span = self.course.cell_m
+        previous = -math.inf
+        for point in points:
+            uv = self.course.local(*point, *source)
+            along = uv[axis] * direction
+            # The dog may start anywhere in its cell (operator 2026-11-24: requiring it to stand on the centre line
+            # first refused nearly every lane); within the first 0.4 cell the path converges onto the centre line.
+            lateral_limit = 0.5 * span if along < 0.4 * span else min(0.15, 0.2 * span)
+            if abs(uv[lateral]) > lateral_limit or not -0.5 * span <= along <= span + 0.1:
+                return False
+            if along < previous - 0.08:
+                return False
+            previous = max(previous, along)
+        return bool(points)
+
+    def _centre_lane_hold(self, now, why, goal=None, pose=None):
+        """No centre lane: walk the evaluator's own goal now (operator 2026-11-24: the earlier 10 s wait repeated
+        forever - same goal, same refusal - and the dog barely moved, run 14:05)."""
+        self._centre_pending = None
+        self.event('centre_lane_fallback', reason=why)
+        if goal is not None and pose is not None:
+            self._start_walk(now, pose, dict(goal, centre_lane_skip=True))
+
+    def _centre_lane_request(self, now, pose, goal):
+        source = self.course.cell(*pose[:2])
+        proposed = self.course.cell(goal['x'], goal['y'])
+        delta = tuple(b - a for a, b in zip(source, proposed))
+        if not any(delta):
+            self._centre_lane_hold(now, 'goal is in this cell', goal, pose)
+            return
+        axis = max(range(2), key=lambda i: abs(delta[i]))
+        target = list(source)
+        target[axis] += 1 if delta[axis] > 0 else -1
+        target = tuple(target)
+        lane = source, target
+        x, y = self.course.centre(*target)
+        ox, oy = self.course.centre(*source)
+        original = goal
+        goal = dict(goal, x=x, y=y, yaw=math.atan2(y - oy, x - ox), centre_lane=lane)
+        if (not self._centre_lane_ok([pose[:2]], lane) or self._goal_invalid(goal)
+                or self.course.connection(source, target, now) == 'blocked'):
+            self._centre_lane_hold(now, 'centre lane or target centre unavailable', original, pose)
+            return
+        if self.mode == MODE_SIM:
+            self._start_walk(now, pose, goal)
+            return
+        request = self.robot.centre_plan_request(x, y, goal['yaw'])
+        if request is None:
+            self._centre_lane_hold(now, 'Nav2 plan-only server unavailable', original, pose)
+            return
+        self._centre_pending = (now, goal, request, original)
+
+    def _centre_lane_tick(self, now, pose):
+        started, goal, request, original = self._centre_pending
+        try:
+            points = self.robot.centre_plan_result(request)
+        except Exception as error:
+            self._centre_lane_hold(now, f'Nav2 plan request failed: {error}', original, pose)
+            return
+        if points is None and now - started < 3.0:
+            return
+        end = goal['x'], goal['y']
+        unsafe = (not points or math.dist(points[-1], end) > 0.15
+                  or math.dist(points[0], pose[:2]) > 0.15
+                  or self._goal_invalid(goal)
+                  or not self._centre_lane_ok([pose[:2], *points], goal['centre_lane'])
+                  or (self.wall_gaps is not None and WG.crosses(*self.wall_gaps, points)))
+        if unsafe:
+            self._centre_lane_hold(now, 'Nav2 did not provide a valid centre-lane plan', original, pose)
+            return
+        self._centre_pending = None
+        self.event('centre_lane_accepted', goal=list(end))
+        self._start_walk(now, pose, goal)
+
     def _start_walk(self, now, pose, goal):
+        if (getattr(self.cfg, 'centre_lane', False) and self.course is not None
+                and goal.get('ends_at') not in PROTECTED_ENDS and 'centre_lane' not in goal
+                and not goal.get('centre_lane_skip')):
+            if not getattr(self, '_centre_pending', None):
+                self._centre_lane_request(now, pose, goal)
+            return
         if not self.robot.nav_send_goal(goal['x'], goal['y'], goal['yaw']):
             self._walk_failed(now, 'Nav2 rejected the walk goal', goal)
             return
@@ -2454,6 +2539,9 @@ class RoamSession:
             return
         if self.state != 'ROAMING' or self._auto_stairs(now, sample):
             return
+        if self.goal is None and getattr(self, '_centre_pending', None):
+            self._centre_lane_tick(now, pose)
+            return
         if self.goal is None:
             if self.adv_task is not None:
                 if now >= self.choose_after:
@@ -2568,6 +2656,8 @@ class RoamSession:
             self._end_walk(now, pose, f'Nav2 {result}')
         elif approaching:
             self._cancel_scan_walk(now, 'obstacle ahead (walking standoff)')
+        elif self._centre_lane_changed(now):
+            self._cancel_scan_walk(now, 'Nav2 replanned outside the centre lane')
         elif self._plan_through_wall(now):
             self._cancel_scan_walk(now, 'Nav2 path goes through a gap in a wall')
         elif now - self.goal_sent_at > self.goal_timeout:
@@ -2575,10 +2665,18 @@ class RoamSession:
         elif now - self.progress[0] > self.cfg.stuck_s:
             self._cancel_scan_walk(now, f'no progress for {self.cfg.stuck_s:.0f} s')
         elif self.cfg.decision == 'unified' and self.cfg.reselect and now - self._reselect_t >= RESELECT_PERIOD_S \
-                and self.goal.get('ends_at') not in PROTECTED_ENDS and self.passage is None \
+                and 'centre_lane' not in self.goal and self.goal.get('ends_at') not in PROTECTED_ENDS and self.passage is None \
                 and self.scene_task is None and self._heavy_tick != now:
             self._reselect_t = now
             self._maybe_reselect(now, pose)
+
+    def _centre_lane_changed(self, now):
+        lane = self.goal.get('centre_lane') if self.goal else None
+        plan = getattr(self.robot, 'nav_plan', None)
+        if lane is None or plan is None or plan[0] < self.goal_sent_at or not plan[1]:
+            return False
+        return (math.dist(plan[1][-1], (self.goal['x'], self.goal['y'])) <= 0.2
+                and not self._centre_lane_ok(plan[1], lane))
 
     def _in_course(self, x, y):
         """Inside the course walls (wall_gaps.in_course); True while the reachable floor is not known yet."""
@@ -2715,6 +2813,7 @@ class RoamSession:
             self.log(f'WARNING: could not leave the stair mode ({error}); use the remote / app to exit AI mode')
 
     def _pause(self, why):
+        self._centre_pending = None
         self._leave_stairs(f'pause: {why}')
         self.crossing, self.adv_task, self.look, self.nudge = None, None, [], None
         if self.record is not None:
@@ -2827,6 +2926,7 @@ class RoamSession:
 
     # -------------------------------------------------------------- stair / curtain advisory
     def _cancel_goal_now(self):
+        self._centre_pending = None
         if self.goal is not None:
             self.robot.nav_cancel(timeout_s=0.5)
             self.goal, self.cancel_request = None, None
@@ -3614,6 +3714,9 @@ def parse(argv):
     run.add_argument('--weights', default='',
                      help='evaluator weights, e.g. "info=1,camera=0.8,grid=1.5,travel=0.4" (goal_selection.py)')
     run.add_argument('--min-score', type=float, default=GS.MIN_SCORE, help='below this no goal is worth walking to')
+    run.add_argument('--centre-lane', action='store_true',
+                     help='ordinary unified goals use adjacent cell centres; without a straight lane the goal is walked '
+                          'as chosen (no wait)')
     run.add_argument('--grid-cell', type=float, default=1.0, help='course grid cell size (m)')
     run.add_argument('--grid-origin', type=float, nargs=2, metavar=('X', 'Y'),
                      help='course grid origin in the map frame (default: start position)')
@@ -3984,6 +4087,9 @@ def run_session(a, state, directory):
         # sim: no stack; the stand-in runs with the boundary roam.sh would start navigation with
         cfg = build_config(a, state if mode != MODE_SIM else
                            {'MAX_SPEED': str(a.speed_limit or DEFAULT_ROAM_SPEED)})
+        cfg.centre_lane = getattr(a, 'centre_lane', False)
+        if cfg.centre_lane and (cfg.decision != 'unified' or cfg.strategy != 'scan_walk'):
+            raise ValueError('--centre-lane requires unified scan-walk')
         script = parse_script(a.sim_script)
     except (ConfigError, ValueError) as error:
         print(f'REFUSED: {error}')

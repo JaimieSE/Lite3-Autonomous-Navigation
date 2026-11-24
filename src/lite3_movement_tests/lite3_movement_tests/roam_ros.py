@@ -134,6 +134,40 @@ class RoamRobot(NavRobot):
         node.create_subscription(lio_type, lio_topic, lambda raw: t.lio_cloud.add(
             time.monotonic(), len(raw)), qos_profile_sensor_data, raw=True)
 
+    def centre_plan_request(self, x, y, yaw):
+        from nav2_msgs.action import ComputePathToPose
+        from rclpy.action import ActionClient
+
+        if not hasattr(self, '_centre_planner'):
+            node = self._nodes[self.wiring.velocity_domain]
+            self._centre_planner = ActionClient(node, ComputePathToPose, '/compute_path_to_pose')
+        if not self._centre_planner.server_is_ready():
+            return None
+        goal = ComputePathToPose.Goal()
+        goal.goal.header.frame_id = 'map'
+        goal.goal.pose.position.x, goal.goal.pose.position.y = float(x), float(y)
+        goal.goal.pose.orientation.z = math.sin(yaw / 2)
+        goal.goal.pose.orientation.w = math.cos(yaw / 2)
+        return [self._centre_planner.send_goal_async(goal), None]
+
+    def centre_plan_result(self, request):
+        from action_msgs.msg import GoalStatus
+
+        submitted, result = request
+        if result is None:
+            if not submitted.done():
+                return None
+            handle = submitted.result()
+            if not handle.accepted:
+                return []
+            request[1] = result = handle.get_result_async()
+        if not result.done():
+            return None
+        reply = result.result()
+        if reply.status != GoalStatus.STATUS_SUCCEEDED or reply.result.path.header.frame_id != 'map':
+            return []
+        return [(p.pose.position.x, p.pose.position.y) for p in reply.result.path.poses]
+
     def _grid(self, name):
         with self._grid_lock:
             item = self._grids.get(name)
