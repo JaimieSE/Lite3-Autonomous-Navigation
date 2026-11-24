@@ -313,7 +313,7 @@ class FakeNavRobot(FakeRobot):
     def _locked(self):
         hold = 'deadman_ignored' not in self.faults and self.t - self.last_feed > 0.5
         hold = hold or self._walk_fault('deadman_lapse_walk', after=3.0)
-        return hold or (self.terrain_stop and 'mux_leak' not in self.faults)
+        return hold          # (terrain proximity lock removed 2026-11-24, as on the robot)
 
     def _mux(self, source, vx, wz):
         self.inputs[source] = (self.t, vx, wz)
@@ -394,6 +394,9 @@ class FakeNavRobot(FakeRobot):
             if hazard:
                 self.last_hazard = t
             self.terrain_stop = t - self.last_hazard < 1.0
+            # The straight-line "Nav2" below does not plan round obstacles: it stops for one straight ahead (the real
+            # Nav2 avoids it in its costmap). Walls beside the body no longer stop it (terrain lock removed 2026-11-24).
+            self.nav_blocked = nearest is not None and nearest <= trigger
             reason = None
             if hazard:
                 reason = (f'hazard {nearest:.2f} m ahead' if nearest is not None and nearest <= trigger
@@ -445,7 +448,9 @@ class FakeNavRobot(FakeRobot):
             return
         m, (gx, gy, gyaw) = self.model, self.goal
         dist = math.hypot(gx - m.x, gy - m.y)
-        if self.terrain_stop:
+        bearing_err = math.atan2(math.sin(math.atan2(gy - m.y, gx - m.x) - m.yaw),
+                                 math.cos(math.atan2(gy - m.y, gx - m.x) - m.yaw))
+        if getattr(self, 'nav_blocked', False) and dist >= 0.10 and abs(bearing_err) <= 0.5:   # driving into it
             blocked = self.goal_state['blocked_since'] = self.goal_state['blocked_since'] or self.t
             self.goal_state['recoveries'] = int((self.t - blocked) // 4)
             if self.t - blocked > 10.0:

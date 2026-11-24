@@ -118,10 +118,7 @@ class NavSteps(ProximityStopSteps):
     def step_nav_readiness(self, step):
         """Nav2, terrain monitor, LiDAR rate and the physical mux wiring, without commanding."""
         p = step.params
-        want_ahead = p['stop_distance_m'] + NOSE_OFFSET_M
-        applied = {}
-        if self.robot.can_actuate:
-            applied = self.robot.set_stop_distance(want_ahead)
+        # (the terrain proximity stop and its distance were removed 2026-11-24: Nav2 avoids obstacles)
 
         def ready():
             now = self.robot.now()
@@ -151,14 +148,6 @@ class NavSteps(ProximityStopSteps):
             else:
                 if sample.problems:
                     problems.append(f'terrain inputs invalid: {list(sample.problems)}')
-                detail['stop_ahead_active_m'] = sample.stop_ahead_m
-                detail['proximity_stop_now'] = sample.stop
-                if sample.stop_ahead_m is None:
-                    problems.append('terrain monitor does not report its stop distance (an older build '
-                                    'is running: operator/build.sh, then restart navigation)')
-                elif abs(sample.stop_ahead_m - want_ahead) > 0.011:
-                    problems.append(f'proximity stop distance is {sample.stop_ahead_m} m from centre, '
-                                    f'requested {want_ahead:.3f} m')
             if t.clearance.age(now) > 0.5:
                 problems.append('hazard cloud stale')
             if p['cm_boundary_m'] > 0:
@@ -167,9 +156,8 @@ class NavSteps(ProximityStopSteps):
             return not problems, detail
 
         ok, detail = self._wait_until(step, ready, poll=0.25)
-        detail['stop_distance_request'] = applied
         return (self.PASSED if ok else self.FAILED,
-                f'Nav2, terrain monitor ({p["stop_distance_m"]:.2f} m stop), LiDAR and mux wiring ready'
+                'Nav2, terrain monitor, LiDAR and mux wiring ready'
                 if ok else f'navigation not ready: {detail.get("problems")}', detail)
 
     def _boundary_problems(self, p, detail):

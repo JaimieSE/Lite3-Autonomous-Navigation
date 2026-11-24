@@ -32,7 +32,8 @@ OPEN_NEIGHBOUR_MAPPED = 0.50          # a neighbour mapped less than this behind
 LANE_OFFSETS = (-0.25, 0.0, 0.25)     # x cell_m, lanes across a shared edge
 LANE_HALF_M = 0.20                    # each lane checked this far either side of the edge
 LANE_BODY_M = 0.15                    # lateral half-width checked along a lane (body half width)
-RETURN_CLEARANCE_M = 0.50             # a "come back" point needs free floor this far around it (body + margin)
+RETURN_CLEARANCE_M = 0.35             # a "come back" point needs free floor this far around it (was 0.50: on
+                                       # the cluttered course hardly any point qualified; Nav2 checks the fit)
 RETURN_REACH_M = 0.25                 # ... and may lie this far outside the cell (a viewpoint, not a centre)
 TEMP_BLOCK_S, TEMP_MAX = 10.0, 3      # same limits as exploration_record (temporary / persistent failures)
 PERSIST_BLOCK_S, PERSIST_MAX = 120.0, 2
@@ -83,9 +84,11 @@ class CourseGrid:
         return self.centre(i, j)[0] + self.c * u - self.s * v, self.centre(i, j)[1] + self.s * u + self.c * v
 
     # ------------------------------------------------------------------ update
-    def update(self, grid, coverage=None, breadcrumbs=(), now=0.0, walls=None):
+    def update(self, grid, coverage=None, breadcrumbs=(), now=0.0, walls=None, reach=None):
         """Recompute mapped / seen / visited per cell and the connection states from the current SLAM map.
-        walls: optional bool mask (SLAM shape) of extra wall cells - small gaps in a wall closed (wall_gaps.py)."""
+        walls: optional bool mask (SLAM shape) of extra wall cells - small gaps in a wall closed (wall_gaps.py).
+        reach: optional bool mask of the floor connected to the dog inside the walls; cells without any of it are
+        outside the course (seen over / through a wall) and never "come back" targets."""
         data, res, gx, gy = _slam(grid)
         if walls is not None and walls.shape == data.shape:
             data = np.where(walls, np.int16(100), data)
@@ -101,12 +104,16 @@ class CourseGrid:
         keep = (np.abs(ci) <= self.n) & (np.abs(cj) <= self.n)
         ci, cj, wx, wy = ci[keep], cj[keep], wx[keep], wy[keep]
         vals = data[jj[keep], ii[keep]]
+        inside = reach[jj[keep], ii[keep]] if reach is not None and reach.shape == data.shape else None
         free = vals <= FREE_MAX
         span = 2 * self.n + 1
+        reach_n = None
         key = (ci + self.n) * span + (cj + self.n)
         known_n = np.bincount(key, minlength=span * span)
         free_n = np.bincount(key, weights=free, minlength=span * span)
         seen_n = np.zeros(span * span)
+        if inside is not None:
+            reach_n = np.bincount(key, weights=inside, minlength=span * span)
         if coverage is not None and free.any():
             fi, fj, ok = coverage._cells(wx[free], wy[free])
             seen = np.zeros(fi.size, dtype=bool)
@@ -119,9 +126,10 @@ class CourseGrid:
             c = (int(k // span - self.n), int(k % span - self.n))
             f = float(free_n[k])
             cells[c] = {'mapped': min(1.0, float(known_n[k]) / per_cell), 'free_m2': f * res * res,
-                        'seen': float(seen_n[k]) / f if f else 0.0, 'visited': c in self.visited}
+                        'seen': float(seen_n[k]) / f if f else 0.0, 'visited': c in self.visited,
+                        'reachable': True if reach_n is None else reach_n[k] * res * res >= MIN_FREE_M2}
         for c in self.visited:
-            cells.setdefault(c, {'mapped': 0.0, 'free_m2': 0.0, 'seen': 0.0, 'visited': True})
+            cells.setdefault(c, {'mapped': 0.0, 'free_m2': 0.0, 'seen': 0.0, 'visited': True, 'reachable': True})
         self.cells = cells
         self._data, self._geo = data, (res, gx, gy)
         self.edges = {}
@@ -195,8 +203,8 @@ class CourseGrid:
         info = self.cells.get(c)
         # Operator 2026-11-24: a cell the dog has walked through is explored - never backtrack into it; come back
         # only for cells not yet visited (reached through the explored ones).
-        if info is None or info['free_m2'] < MIN_FREE_M2 or info['visited']:
-            return False
+        if info is None or info['free_m2'] < MIN_FREE_M2 or info['visited'] or not info.get('reachable', True):
+            return False                                  # (unreachable: outside the course walls)
         if info['seen'] < SEEN_DONE:
             return True
         for n in ((c[0] + 1, c[1]), (c[0] - 1, c[1]), (c[0], c[1] + 1), (c[0], c[1] - 1)):

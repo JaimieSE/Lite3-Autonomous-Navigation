@@ -122,3 +122,12 @@ def test_a_visited_cell_is_explored_never_a_place_to_come_back_to():
     for t in (1.0, 100.0, 1000.0):
         g.note_failure(t, (0.0, 0.0), (1.0, 0.0), 'terrain')
     assert g.connection((0, 0), (1, 0), 5000.0) == 'open'           # terrain trouble never blocks for good
+
+
+def test_cells_outside_the_course_walls_are_never_come_back_targets():
+    from lite3_movement_tests import wall_gaps as WG
+    slam = grid_of(free=[(-0.5, 3.5, -0.5, 0.5)], occupied=[(1.45, 1.55, -0.6, 0.6)])   # wall at x = 1.5
+    reach = WG.reachable_mask(slam, (0.0, 0.0))
+    g = CourseGrid(0.0, 0.0, 0.0)
+    g.update(slam, CameraCoverage((0.0, 0.0), 4.0), reach=reach)
+    assert g.unfinished((1, 0)) and not g.cells[(3, 0)]['reachable'] and not g.unfinished((3, 0))

@@ -111,12 +111,9 @@ local_costmap:
       obstacle_layer:
         plugin: nav2_costmap_2d::ObstacleLayer
         enabled: true
-        observation_sources: scan hazards
+        observation_sources: scan
         scan: {topic: /scan, max_obstacle_height: 2.0, clearing: true, marking: true,
           data_type: LaserScan, obstacle_max_range: 3.5, raytrace_max_range: 4.0}
-        hazards: {topic: /lite3_terrain/hazards, data_type: PointCloud2, marking: true,
-          clearing: false, min_obstacle_height: -2.0, max_obstacle_height: 2.0, obstacle_max_range: 1.0,
-          obstacle_min_range: 0.0, expected_update_rate: 0.5}
       voxel_layer:
         plugin: nav2_costmap_2d::VoxelLayer
         enabled: false
@@ -151,13 +148,10 @@ global_costmap:
       obstacle_layer:
         plugin: nav2_costmap_2d::ObstacleLayer
         enabled: true
-        observation_sources: scan hazards
+        observation_sources: scan
         scan: {topic: /scan, max_obstacle_height: 2.0, clearing: true, marking: true,
           data_type: LaserScan, raytrace_max_range: 4.0, raytrace_min_range: 0.0,
           obstacle_max_range: 3.5, obstacle_min_range: 0.0}
-        hazards: {topic: /lite3_terrain/hazards, data_type: PointCloud2, marking: true,
-          clearing: false, min_obstacle_height: -2.0, max_obstacle_height: 2.0, obstacle_max_range: 1.0,
-          obstacle_min_range: 0.0, expected_update_rate: 0.5}
       voxel_layer:
         plugin: nav2_costmap_2d::VoxelLayer
         enabled: false

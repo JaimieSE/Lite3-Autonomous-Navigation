@@ -180,11 +180,7 @@ class StairInterface:
     def switch_out(self):
         raise NotImplementedError
 
-    def relax_stops(self):
-        """Relax our own stop zone / approach slowdown for the stairs (restored by restore_stops)."""
-
-    def restore_stops(self):
-        pass
+    # (relax_stops / restore_stops removed 2026-11-24 with the terrain proximity stop)
 
 
 class HStepGaitStairs(StairInterface):
@@ -200,13 +196,6 @@ class HStepGaitStairs(StairInterface):
     def switch_out(self):
         return self.robot.send_gait(self.normal_gait)
 
-    def relax_stops(self):
-        if hasattr(self.robot, 'set_terrain_proximity_stop'):
-            self.robot.set_terrain_proximity_stop(False)
-
-    def restore_stops(self):
-        if hasattr(self.robot, 'set_terrain_proximity_stop'):
-            self.robot.set_terrain_proximity_stop(True)
 
 
 class AiModeStairs(StairInterface):

@@ -50,13 +50,10 @@ def test_behavior_tree_has_no_blind_reverse():
 
 
 @pytest.mark.parametrize('costmap', ['local_costmap', 'global_costmap'])
-def test_terrain_hazards_feed_both_costmaps_and_must_stay_fresh(costmap):
+def test_costmaps_use_the_lidar_scan_only(costmap):
+    """Operator 2026-11-24: system default navigation - no terrain hazard cloud in the costmaps."""
     layer = get(costmap, costmap, 'ros__parameters', 'obstacle_layer')
-    assert layer['observation_sources'].split() == ['scan', 'hazards']
-    hazards = layer['hazards']
-    assert hazards['topic'] == '/lite3_terrain/hazards' and hazards['data_type'] == 'PointCloud2'
-    assert hazards['marking'] and hazards['min_obstacle_height'] < -0.5
-    assert 0 < hazards['expected_update_rate'] <= 1.0
+    assert layer['observation_sources'].split() == ['scan'] and 'hazards' not in layer
 
 
 @pytest.mark.parametrize('costmap', ['local_costmap', 'global_costmap'])
@@ -69,15 +66,11 @@ def test_scan_is_cleared_by_a_layer_that_can_raytrace(costmap):
     assert scan['clearing'] and scan['marking']
 
 
-def test_mux_lock_blocks_navigation_but_not_joystick():
-    lock = yaml.safe_load((ROOT / 'params' / 'twist_mux_locks.yaml').read_text())
-    lock = lock['twist_mux']['ros__parameters']['locks']['terrain_stop']
-    topics = yaml.safe_load(Path('/home/user/ros2_ws/src/lite3_launcher/config/twist_mux_topics.yaml')
-                            .read_text())['twist_mux']['ros__parameters']['topics'] \
-        if Path('/home/user/ros2_ws').exists() else {'navigation': {'priority': 10},
-                                                     'joystick': {'priority': 100}}
-    assert lock['topic'] == '/lite3_terrain/stop' and 0 < lock['timeout'] <= 0.5
-    assert topics['navigation']['priority'] < lock['priority'] < topics['joystick']['priority']
+def test_no_terrain_proximity_lock_in_the_command_path():
+    """Operator 2026-11-24: the terrain lock is removed; only the dead-man lock stays."""
+    assert not (ROOT / 'params' / 'twist_mux_locks.yaml').exists()
+    src = (ROOT / 'launch' / 'navigation.launch.py').read_text()
+    assert 'twist_mux_locks.yaml' not in src.split('removed); only')[-1] and 'proximity_stop' not in src
 
 
 def test_launch_defaults_to_non_actuating_output():
@@ -92,12 +85,11 @@ def test_physical_mux_config_dead_man_and_stop_priorities():
     cfg = yaml.safe_load((ROOT / 'params' / 'twist_mux_physical.yaml').read_text())
     cfg = cfg['twist_mux']['ros__parameters']
     hold = cfg['locks']['operator_hold']
-    terrain = yaml.safe_load((ROOT / 'params' / 'twist_mux_locks.yaml').read_text())[
-        'twist_mux']['ros__parameters']['locks']['terrain_stop']
     assert hold['topic'] == '/lite3_ops/hold' and 0 < hold['timeout'] <= 0.5
-    # Nav2 (10) and test moves (20) are blocked by BOTH locks; the zeros-only stop input is above.
-    assert cfg['topics']['test_cmd']['priority'] < min(hold['priority'], terrain['priority'])
-    assert cfg['topics']['safety_stop']['priority'] > max(hold['priority'], terrain['priority'], 100)
+    # Nav2 (10) and test moves (20) are blocked by the dead-man lock; the zeros-only stop input is above.
+    assert cfg['topics']['test_cmd']['priority'] < hold['priority']
+    assert cfg['topics']['safety_stop']['priority'] > max(hold['priority'], 100)
+    assert set(cfg['locks']) == {'operator_hold'}
     assert cfg['topics']['safety_stop']['timeout'] <= 0.25
 
 

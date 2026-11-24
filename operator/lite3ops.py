@@ -197,11 +197,11 @@ def msg_types():
     from livox_ros_driver2.msg import CustomMsg
     from nav_msgs.msg import Odometry, OccupancyGrid
     from sensor_msgs.msg import Imu, JointState, LaserScan, PointCloud2
-    from std_msgs.msg import Bool, String
+    from std_msgs.msg import String
     return {'/joint_states': (JointState, False), '/imu/data': (Imu, False),
             '/leg_odom2': (Odometry, False), '/livox/points': (PointCloud2, False),
             '/livox/lidar': (CustomMsg, True), '/odom': (Odometry, False),
-            '/scan': (LaserScan, False), '/lite3_terrain/stop': (Bool, False),
+            '/scan': (LaserScan, False),
             '/lite3_terrain/status': (String, False), '/map': (OccupancyGrid, True)}
 
 
@@ -381,8 +381,7 @@ def cmd_wait_ready(args):
 
 def check_flow(report, ros, seconds):
     types = msg_types()
-    rates = ros.measure({t: types[t] for t in ('/odom', '/scan', '/lite3_terrain/stop',
-                                                '/lite3_terrain/status')}, seconds)
+    rates = ros.measure({t: types[t] for t in ('/odom', '/scan', '/lite3_terrain/status')}, seconds)
     for topic, r in rates.items():
         level = 'OK' if r['hz'] >= 8 and (r['max_gap_s'] or 9) < 0.5 else \
             'WARN' if r['hz'] >= 3 else 'FAIL'
@@ -421,9 +420,10 @@ def check_physical_path(report, ros):
                'twist_mux -> collision_monitor -> /cmd_vel' if mux == ['twist_mux'] and cm_in
                else f'mux_out publishers {mux}, collision_monitor subscribed {cm_in}',
                'restart with operator/start_navigation.sh --physical')
-    mux_subs = [t for t in ('/lite3_ops/hold', '/lite3_ops/test_cmd_vel', '/lite3_ops/stop_cmd_vel',
-                            '/lite3_terrain/stop') if 'twist_mux' not in ros.subscribers(t)]
-    report.add('OK' if not mux_subs else 'FAIL', 'PHYSICAL: dead-man + proximity locks wired',
+    # (the terrain proximity lock /lite3_terrain/stop was removed 2026-11-24)
+    mux_subs = [t for t in ('/lite3_ops/hold', '/lite3_ops/test_cmd_vel', '/lite3_ops/stop_cmd_vel')
+                if 'twist_mux' not in ros.subscribers(t)]
+    report.add('OK' if not mux_subs else 'FAIL', 'PHYSICAL: dead-man lock wired',
                'twist_mux has all lock/stop inputs' if not mux_subs else f'missing {mux_subs}',
                'restart with operator/start_navigation.sh --physical')
     foreign = {t: [p for p in ros.publishers(t) if p != 'lite3_movement_test']

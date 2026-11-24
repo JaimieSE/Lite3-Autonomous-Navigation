@@ -362,8 +362,8 @@ class NavRobot(RosRobot):
                 s = json.loads(msg.data)
             except ValueError:
                 return
-            stop = s.get('stop') or {}
-            t.on_terrain(now(), stop.get('active', True), stop.get('reason'),
+            stop = s.get('stop') or {}        # no 'stop' since 2026-11-24 (proximity stop removed): never stopping
+            t.on_terrain(now(), bool(stop.get('active', False)), stop.get('reason'),
                          (s.get('corridor') or {}).get('nearest_obstacle_m'), stop.get('ahead_m'),
                          s.get('problems'), s.get('processing_s'),
                          (s.get('corridor') or {}).get('nearest_step_m'),
@@ -384,8 +384,6 @@ class NavRobot(RosRobot):
 
         node.create_subscription(String, '/lite3_terrain/status', on_status, 10)
         node.create_subscription(PointCloud2, '/lite3_terrain/hazards', on_hazards, 5)
-        node.create_subscription(Bool, '/lite3_terrain/stop',
-                                 lambda m: t.terrain_stop.add(now(), bool(m.data)), 10)
         node.create_subscription(Twist, MUX_OUT_TOPIC, lambda m: t.mux_out.add(
             now(), TwistSample(m.linear.x, m.linear.y, m.angular.z)), 50)
         from rcl_interfaces.msg import Log
@@ -677,7 +675,7 @@ class NavRobot(RosRobot):
             problems.append('Nav2 controller not subscribed to /speed_limit')
         if self.map_pose() is None:
             problems.append('no map -> base_link transform (SLAM not running?)')
-        mux_inputs = {OPS_HOLD_TOPIC, OPS_TEST_TOPIC, OPS_STOP_TOPIC, '/lite3_terrain/stop'}
+        mux_inputs = {OPS_HOLD_TOPIC, OPS_TEST_TOPIC, OPS_STOP_TOPIC}      # (terrain lock removed 2026-11-24)
         for topic in sorted(mux_inputs):
             subs = {i.node_name for i in node.get_subscriptions_info_by_topic(topic)}
             if 'twist_mux' not in subs:
@@ -736,9 +734,6 @@ class NavRobot(RosRobot):
         joy = names(vel.get_publishers_info_by_topic('/joy_cmd_vel'))
         if joy:
             problems.append(f'/joy_cmd_vel publishers {joy} (joystick input bypasses the locks)')
-        stop_pubs = names(vel.get_publishers_info_by_topic('/lite3_terrain/stop'))
-        if stop_pubs != [f'/{TERRAIN_NODE}']:
-            problems.append(f'/lite3_terrain/stop publishers {stop_pubs}')
         for topic in ('/cmd_vel_corrected', '/complex_cmd'):
             for node in (vel, system):
                 if names(node.get_publishers_info_by_topic(topic)):

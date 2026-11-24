@@ -64,7 +64,10 @@ def test_one_evaluator_explores_with_logged_reasons_and_grid_memory(tmp_path, mo
     box = keep_session(monkeypatch)
     outcome, summary, _, _ = roam(tmp_path, stop_after=200, cfg=cfg())
     st = summary['stats']
-    assert st['decisions'] >= 3 and st['goals_failed'] == 0 and st['distance_m'] > 8
+    # at most one terrain retry: return points may sit 0.35 m from a wall, which the simulator's straight-line "Nav2"
+    # cannot always reach (the real Nav2 plans round it)
+    assert st['decisions'] >= 3 and st['goals_failed'] <= 1 and st['distance_m'] > 8
+    assert all(e['category'] == 'terrain' for e in summary['events'] if e['event'] == 'destination_failed')
     d = first(summary, 'decision')
     assert d['chosen']['terms'] and 'score' in d['chosen'] and isinstance(d['alternatives'], list)
     grid = summary['course_grid']
@@ -335,7 +338,9 @@ def test_auto_resume_accepts_a_robot_standing_and_stepping_in_place(tmp_path, mo
     no_goal_until(monkeypatch, 1e9)
     monkeypatch.setattr(R.RoamSession, '_grid_returns', lambda self, now, pose, relaxed=False: [])
     monkeypatch.setattr(R.RoamSession, '_backtrack', lambda self, now, pose: False)
-    for reasons, resumes in ((['joints still moving'], True), (['joints still moving', 'body tilt exceeds limit'], False)):
+    for reasons, resumes in ((['joints still moving'], True),
+                             (['leg extensions disagree beyond spread limit', 'joints still moving'], True),
+                             (['joints still moving', 'body tilt exceeds limit'], False)):
         monkeypatch.setattr(SequenceRunner, '_standing_precondition', lambda self, require_still=True, r=reasons: (
             False, {'posture': {'posture': 'standing', 'reasons': list(r), 'tilt_rad': None, 'extensions_m': {}}}))
         _, summary, _, _ = roam(tmp_path, stop_after=150, cfg=cfg(auto_resume_s=5.0))
@@ -377,3 +382,118 @@ def test_a_nav2_path_through_a_wall_gap_is_cancelled(tmp_path, monkeypatch):
     s._plan_check_t, s.robot.nav_plan = -1e9, (4.0, [(0.2, 0.5), (1.8, 0.5)])   # plan older than this walk
     assert not s._plan_through_wall(10.0)
     assert WG.crosses(gaps, (0.05, 0.0, 0.0), [(0.2, 0.5), (1.8, 0.5)])
+
+
+def test_blocked_turns_make_room_then_look_again(tmp_path, monkeypatch):
+    """Physical 2026-11-24 14:20: next to a wall panel every turn ended "Collision Ahead" and nothing was worth
+    walking to. After two blocked turns roam steps straight away (forward when clear) and looks round again."""
+    from lite3_movement_tests.sim_model import FakeNavRobot
+
+    def blocked(self):                                     # Nav2 spin: "Collision Ahead - Exiting Spin"
+        self.goal_state['spun_rad'] = 0.02
+        self.goal_state['result'] = 'ABORTED'
+        self.spin = None
+    monkeypatch.setattr(FakeNavRobot, '_spin_tick', blocked)
+    no_goal_until(monkeypatch, 1e9)
+    _, summary, robot, _ = roam(tmp_path, stop_after=60, cfg=cfg())
+    n = names(summary)
+    room = first(summary, 'make_room')
+    assert room['way'] == 'forward' and room['step_m'] == R.MAKE_ROOM_M
+    assert 'make_room_end' in n and n.index('make_room') < n.index('make_room_end')
+    assert n.index('make_room') < n.index('scene_request') if 'scene_request' in n else True
+    assert n.count('make_room') <= R.MAKE_ROOM_MAX * (n.count('stuck') or 1)
+    after = n[n.index('make_room_end') + 1:]
+    assert 'spin' in after                                  # looks round again from the new spot
+    assert summary['stats']['make_room'] >= 1
+
+
+def test_a_25_cm_block_on_its_pallet_is_crossed_not_treated_as_a_wall(tmp_path, monkeypatch):
+    """Operator 2026-11-24: the block field is at most 25 cm from the ground; the terrain monitor measured 0.276 m
+    (block + pallet) and roam refused it (limit was 0.25). Crossed in the high-step gait, never AI mode."""
+    from lite3_movement_tests import ros_io as IO
+    from test_m10 import _terrain_step
+    _terrain_step(monkeypatch, 0.276)
+    _, summary, robot, _ = roam(tmp_path, stop_after=20, cfg=cfg())
+    step = first(summary, 'step_detected')
+    assert abs(step['rise_m'] - 0.276) < 1e-6 and first(summary, 'stairs_start')['mode'] == 'hstep'
+    assert IO.AI_ENTER not in [s[2] for s in robot.sent if s[1] == 'simple']
+
+
+def test_a_step_crossing_never_touches_a_proximity_stop(tmp_path, monkeypatch):
+    """Operator 2026-11-24: the terrain proximity stop is deleted; a crossing switches nothing on or off."""
+    from lite3_movement_tests.sim_model import FakeNavRobot
+    from test_m10 import _terrain_step
+    calls = []
+    monkeypatch.setattr(FakeNavRobot, 'set_terrain_proximity_stop', lambda self, on, timeout_s=2.0: calls.append(on)
+                        or True, raising=False)
+    _terrain_step(monkeypatch, 0.26)
+    _, summary, _, _ = roam(tmp_path, stop_after=25, cfg=cfg())
+    assert 'stairs_start' in names(summary) and calls == []
+
+def test_a_terrain_stop_reading_never_holds_the_dog(tmp_path, monkeypatch):
+    """Operator 2026-11-24: the terrain proximity stop and roam's hold on it are deleted; Nav2 avoids obstacles."""
+    from lite3_movement_tests.telemetry import Telemetry
+    original = Telemetry.on_terrain
+
+    def stopping(self, stamp, stop, reason, *a, **kw):
+        return original(self, stamp, True, 'hazard 0.28 m ahead', *a, **kw)
+    monkeypatch.setattr(Telemetry, 'on_terrain', stopping)
+    for docs in (True, False):
+        _, summary, _, _ = roam(tmp_path, stop_after=40, cfg=cfg(docs_stops=docs))
+        n = names(summary)
+        assert 'hold' not in n and 'walk' in n
+
+
+def scene_hold(monkeypatch, at_s, for_s=6.0, request_id='enc-1'):
+    """nav_hold.py's message: hold from at_s for for_s (wall-clock expiry), then a release."""
+    import time as _time
+    original = R.RoamSession._scene_hold_tick
+    state = {'sent': False}
+
+    def tick(self, now, pose):
+        if not state['sent'] and now - self.t_roam >= at_s:
+            state['sent'] = True
+            wall = _time.time_ns()
+            self.robot.scene_hold_msg = json.dumps({'hold': True, 'request_id': request_id, 'encounter_ids': ['e1'],
+                                                    'reason': 'scene_pending person', 'stamp_ns': wall,
+                                                    'expires_wall_ns': wall + int(for_s * 1e9)})
+        return original(self, now, pose)
+    monkeypatch.setattr(R.RoamSession, '_scene_hold_tick', tick)
+
+
+def test_a_pi_scene_hold_stops_squares_up_to_the_grid_then_carries_on(tmp_path, monkeypatch):
+    """Operator 2026-11-24: on a Pi scene check the dog stops (not mid-stairs / curtain / roller), squares up to the
+    1 x 1 m grid and waits for the result or the 6 s expiry, then roams on."""
+    import time as _time
+    scene_hold(monkeypatch, 4.0, for_s=1.5)              # 1.5 s of wall clock (the simulator runs faster)
+    started = _time.time()
+    _, summary, _, _ = roam(tmp_path, stop_after=60, cfg=cfg(grid_heading_deg=30.0))
+    ev, n = summary['events'], names(summary)
+    i, j = n.index('scene_hold'), n.index('scene_hold_end')
+    assert first(summary, 'scene_hold')['request_id'] == 'enc-1'
+    between = ev[i + 1:j]
+    assert not [e for e in between if e['event'] == 'walk']                   # no new walk while holding
+    squares = [e for e in between if e['event'] == 'spin']
+    assert squares                                                              # turned square to the grid (+30 deg)
+    assert 'walk' in n[j:]                                                      # carries on after the hold
+    assert summary['stats']['scene_holds'] == 1 and _time.time() - started < 120
+
+
+def test_an_expired_or_released_hold_is_clear():
+    import time as _time
+    from lite3_movement_tests.scene_hints import active_hold
+    now = _time.time_ns()
+    on = {'hold': True, 'request_id': 'r', 'stamp_ns': now, 'expires_wall_ns': now + 6_000_000_000}
+    assert active_hold(json.dumps(on), now)['remaining_s'] == 6.0
+    assert active_hold(json.dumps(on), now + 7_000_000_000) is None           # expired = clear
+    assert active_hold(json.dumps(dict(on, hold=False)), now) is None
+    assert active_hold(json.dumps(dict(on, stamp_ns=now - 60_000_000_000)), now) is None   # stale
+    assert active_hold('garbage', now) is None
+
+
+def test_stairs_square_up_to_the_grid_when_the_detector_is_close_to_it(tmp_path, monkeypatch):
+    from test_m10 import _advise
+    _advise(monkeypatch, 3.0, distance_m=0.7, heading_correction_deg=12.0)   # 12 deg off the grid axis
+    _, summary, _, _ = roam(tmp_path, stop_after=30, cfg=cfg())
+    n = names(summary)
+    assert 'stairs_start' in n and 'stairs_align' not in n                     # already square with the grid

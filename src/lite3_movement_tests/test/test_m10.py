@@ -952,12 +952,12 @@ def test_confirmed_stairs_nearby_start_the_stair_routine(tmp_path, monkeypatch):
 
 
 def test_stairs_at_an_angle_are_faced_first(tmp_path, monkeypatch):
-    _advise(monkeypatch, 3.0, distance_m=0.7, heading_correction_deg=20.0)
+    _advise(monkeypatch, 3.0, distance_m=0.7, heading_correction_deg=30.0)   # > 20 deg off the grid axis
     _, summary, _, _ = roam(tmp_path, cfg=R.RoamConfig(strategy='scan_walk'), stop_after=40)
     names = [e['event'] for e in summary['events']]
     assert names.index('stairs_align') < names.index('stairs_start')
     spin = [e for e in summary['events'] if e['event'] == 'spin'][-1]
-    assert spin['degrees'] == 20
+    assert spin['degrees'] == 30
 
 
 def test_far_stairs_are_walked_to_first(tmp_path, monkeypatch):
@@ -1306,7 +1306,7 @@ def test_step_crossing_options_come_from_the_command_line():
     assert (cfg.step_crossing, cfg.step_min_rise_m, cfg.step_max_rise_m, cfg.step_trigger_m, cfg.step_speed_m_s) == \
         (False, 0.15, 0.22, 0.7, 0.25)
     d = R.build_config(R.parse(['run', '--speed-limit', '0.5']), {'MAX_SPEED': '0.5'})
-    assert (d.step_crossing, d.step_min_rise_m, d.step_max_rise_m) == (True, 0.12, 0.25)
+    assert (d.step_crossing, d.step_min_rise_m, d.step_max_rise_m) == (True, 0.12, 0.30)   # 25 cm blocks on a pallet
     with pytest.raises(ConfigError):
         R.RoamConfig(step_min_rise_m=0.3, step_max_rise_m=0.2)
 

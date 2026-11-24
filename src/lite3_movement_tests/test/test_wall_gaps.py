@@ -29,3 +29,33 @@ def test_gap_boxes_for_rviz_nearest_first():
     assert boxes
     x0, y0, x1, y1 = boxes[0]
     assert x0 <= 1.0 <= x1 + 0.05 and y0 - 0.05 <= 0.0 <= y1 + 0.05
+
+
+def course_and_outside():
+    # course: x -2..1 inside walls at x = 1 (with a 0.2 m hole) and y = +-2; outside floor seen over the wall x 1..3
+    return grid_of(free=[(-2.0, 3.0, -2.0, 2.0)],
+                   occupied=[(0.95, 1.05, -2.0, -0.1), (0.95, 1.05, 0.1, 2.0), (-2.0, 3.0, 1.95, 2.05),
+                             (-2.0, 3.0, -2.05, -1.95)])
+
+
+def test_goals_beyond_the_course_walls_are_outside_even_through_a_small_hole():
+    import numpy as np
+    g = course_and_outside()
+    gaps, geo = WG.gap_mask(g)
+    reach = WG.reachable_mask(g, (0.0, 0.0), gaps)
+    data = np.asarray(g.data, dtype=np.int16).reshape(g.height, g.width)
+    assert WG.in_course(data, reach, geo, -1.0, 1.0)                  # inside the walls
+    assert not WG.in_course(data, reach, geo, 2.0, 0.0)               # seen over the wall: outside
+    assert not WG.in_course(data, reach, geo, 1.2, 0.0)               # just behind the wall, past the small hole
+    reach_open = WG.reachable_mask(g, (0.0, 0.0))                     # without closing the hole it leaks out
+    assert reach_open[int((0.0 + 3) / 0.05), int((2.0 + 3) / 0.05)]
+
+
+def test_unmapped_floor_next_to_the_course_floor_is_a_frontier_goal():
+    import numpy as np
+    g = grid_of(free=[(-1.0, 1.0, -1.0, 1.0)])                        # the rest is unknown
+    reach = WG.reachable_mask(g, (0.0, 0.0))
+    data = np.asarray(g.data, dtype=np.int16).reshape(g.height, g.width)
+    geo = (0.05, g.origin_x, g.origin_y)
+    assert WG.in_course(data, reach, geo, 1.3, 0.0)                   # 0.3 m into the unknown: a frontier
+    assert not WG.in_course(data, reach, geo, 2.5, 0.0)               # far into the unknown: no

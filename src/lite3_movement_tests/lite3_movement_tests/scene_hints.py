@@ -98,3 +98,29 @@ def scene_request(request_id, reason, pose, map_session, stamp):
     return json.dumps({'request_id': request_id, 'reason': reason, 'map_session': map_session,
                        'pose': {'x': round(pose[0], 3), 'y': round(pose[1], 3), 'yaw': round(pose[2], 4)},
                        'stamp': round(stamp, 3)})
+
+
+# ---------------------------------------------------------------------------------- scene hold (Pi, nav_hold.py)
+# Operator 2026-11-24: while the Pi asks Claude about a scene (person, object, warning sign), roam stops at the next
+# safe point, squares up to the 1 x 1 m course grid and waits for the result (at most the hold's expiry, 6 s) -
+# except on stairs, curtains and rollers. Contract: ~/live_mission/PI_SCENE_EVENTS.md.
+HOLD_TOPIC = '/group8/navigation/hold_request'
+HOLD_MAX_AGE_S = 30.0          # a hold published longer ago than this is stale whatever its expiry says
+
+
+def active_hold(text, now_wall_ns):
+    """{'request_id', 'reason', 'encounter_ids', 'remaining_s'} while the hold applies; None when clear, expired,
+    stale or unreadable (an expired message counts as clear, so a crashed hold node never strands the dog)."""
+    try:
+        msg = json.loads(text)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(msg, dict) or msg.get('hold') is not True:
+        return None
+    expires, stamp = msg.get('expires_wall_ns'), msg.get('stamp_ns')
+    if type(expires) is not int or now_wall_ns >= expires:
+        return None
+    if type(stamp) is int and now_wall_ns - stamp > HOLD_MAX_AGE_S * 1e9:
+        return None
+    return {'request_id': msg.get('request_id'), 'reason': msg.get('reason'),
+            'encounter_ids': msg.get('encounter_ids') or [], 'remaining_s': round((expires - now_wall_ns) / 1e9, 2)}

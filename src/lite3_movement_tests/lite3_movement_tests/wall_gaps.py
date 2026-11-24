@@ -75,3 +75,74 @@ def gap_boxes(gaps, geo, near=None, max_boxes=MAX_BOXES):
     if near is not None:
         boxes.sort(key=lambda b: math.hypot((b[0] + b[2]) / 2 - near[0], (b[1] + b[3]) / 2 - near[1]))
     return boxes[:max_boxes]
+
+
+# ---------------------------------------------------------------------------------- reachable floor
+# Operator 2026-11-24: "troubleshoot why it is setting goals outside of the course". The LiDAR sees over and through
+# the course walls, so SLAM maps free floor OUTSIDE the course, and the frontier / patrol / come-back goals went there
+# (only the geofence bounded them). The walls are the guide: a goal must lie on floor connected to the dog without
+# crossing a wall (small gaps closed). Unknown floor is not connected - the course goes on only through seen floor or
+# a frontier next to it, which is why goals may sit up to REACH_SLACK_M beyond the connected floor.
+REACH_CLEARANCE_M = 0.0      # (holes narrower than the dog are already closed by gap_mask)
+REACH_SLACK_M = 0.5          # a goal may be this far past the connected floor (frontier / unseen ends)
+
+
+def reachable_mask(grid, start_xy, gaps=None, walked=(), clearance_m=REACH_CLEARANCE_M):
+    """Bool mask (SLAM shape) of free floor connected to start_xy without crossing a wall or a closed gap.
+    Cells the dog has walked count as connected floor whatever the map says now. None if start is off the map."""
+    from scipy import ndimage
+    data = np.asarray(grid.data, dtype=np.int16).reshape(grid.height, grid.width)
+    res = grid.resolution
+    wall = data > 50
+    if gaps is not None and gaps.shape == wall.shape:
+        wall = wall | gaps
+    r = int(round(clearance_m / res))
+    near_wall = ndimage.binary_dilation(wall, structure=_disc(r)) if r > 0 else wall
+    passable = (data >= 0) & (data <= 20) & ~near_wall
+    trail = np.zeros_like(passable)
+    for x, y in walked:
+        i, j = int((x - grid.origin_x) / res), int((y - grid.origin_y) / res)
+        if 0 <= i < grid.width and 0 <= j < grid.height:
+            trail[j, i] = True
+    if trail.any():
+        passable |= ndimage.binary_dilation(trail, structure=_disc(max(1, int(round(0.15 / res))))) & ~wall
+    si, sj = int((start_xy[0] - grid.origin_x) / res), int((start_xy[1] - grid.origin_y) / res)
+    if not (0 <= si < grid.width and 0 <= sj < grid.height):
+        return None
+    # 4-connected: floor may not leak diagonally through a one-cell-thick wall
+    labels, _ = ndimage.label(passable, structure=np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]]))
+    k = int(round(1.0 / res))                    # LiDAR blind zone round the dog: its floor may start ~0.7 m out
+    window = labels[max(0, sj - k):sj + k + 1, max(0, si - k):si + k + 1]
+    ids = window[window > 0]
+    if ids.size == 0:
+        return None
+    lab = np.bincount(ids).argmax()
+    return labels == lab
+
+
+def near_mask(mask, geo, x, y, slack_m=REACH_SLACK_M):
+    """True if (x, y) is within slack_m of a True cell of mask."""
+    res, gx, gy = geo
+    k = int(math.ceil(slack_m / res))
+    i, j = int(math.floor((x - gx) / res)), int(math.floor((y - gy) / res))
+    h, w = mask.shape
+    i0, i1, j0, j1 = max(0, i - k), min(w, i + k + 1), max(0, j - k), min(h, j + k + 1)
+    if i0 >= i1 or j0 >= j1:
+        return False
+    return bool(mask[j0:j1, i0:i1].any())
+
+
+def in_course(grid_data, reach, geo, x, y, slack_m=REACH_SLACK_M):
+    """A goal is inside the course: on mapped free floor it must be on the dog's own floor (reach); on still
+    unmapped floor (a frontier, a scan-walk end in unseen space) it must be within slack_m of it."""
+    res, gx, gy = geo
+    i, j = int(math.floor((x - gx) / res)), int(math.floor((y - gy) / res))
+    h, w = reach.shape
+    if not (0 <= i < w and 0 <= j < h):
+        return near_mask(reach, geo, x, y, slack_m)
+    v = grid_data[j, i]
+    if 0 <= v <= 20:
+        return bool(reach[j, i])
+    if v < 0:
+        return near_mask(reach, geo, x, y, slack_m)
+    return False

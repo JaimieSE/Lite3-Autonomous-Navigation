@@ -1,12 +1,13 @@
 # PHYSICAL MODE ONLY (navigation.launch.py loads this only with allow_robot_motion:=true),
-# on top of the university twist_mux_topics.yaml and twist_mux_locks.yaml (both unchanged).
+# on top of the university twist_mux_topics.yaml (unchanged). The terrain proximity lock
+# (twist_mux_locks.yaml) was removed 2026-11-24.
 #
 # operator_hold: dead-man lock. Blocks every input below priority 50 (Nav2 = 10,
 #   supervised test moves = 20) unless the supervising test runner publishes
 #   /lite3_ops/hold = false at >= 2 Hz. No runner, a crashed runner, a closed SSH
 #   session or Ctrl+C -> silence -> locked within 0.5 s. Idle physical stack = locked.
 # test_cmd: bounded direct moves of the supervised test runner. Priority 20, so the
-#   terrain proximity lock AND the dead-man lock both block it.
+#   dead-man lock blocks it.
 # safety_stop: zero-velocity stop commands only (the runner refuses to publish anything
 #   else; the test guard aborts on any other publisher). Priority 255, above the locks,
 #   so a stop is actively commanded even while a lock silences everything else.

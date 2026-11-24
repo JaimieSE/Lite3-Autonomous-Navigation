@@ -7,14 +7,10 @@ odom_relay) for accumulation of recent scans.
 
 Outputs (new, read-only consumers): /lite3_terrain/grid (OccupancyGrid),
 /lite3_terrain/hazards (PointCloud2 of obstacle/drop cells in base_link, suitable
-as an extra Nav2 costmap observation source), /lite3_terrain/status (JSON), /lite3_terrain/stop (Bool) for a twist_mux lock:
-true when an obstacle/drop is within the proximity zone or inputs are invalid;
-held true for 1 s after clearing. If this node stops, the lock's timeout engages.
-ROS parameters stop_ahead_m (from base_link centre) / body_margin_m (round the footprint) may be raised at
-runtime for a test, never below the validated defaults (terrain.STOP_LIMITS); the
-active values are reported in status.stop.
-The stop signal is a perception output; blocking motion is the mux's job.
-It has no velocity, posture, mode or service interfaces.
+as an extra Nav2 costmap observation source), /lite3_terrain/status (JSON).
+Operator 2026-11-24: the proximity stop (/lite3_terrain/stop -> twist_mux lock) is removed - "it is the reason why
+everything is not working"; obstacles and drops reach Nav2 through the costmap only, as in the vendor navigation.
+It has no velocity, posture, mode, stop or service interfaces.
 """
 
 import argparse
@@ -69,7 +65,7 @@ def main(args=None):
     from rclpy.time import Time
     from nav_msgs.msg import OccupancyGrid
     from sensor_msgs.msg import Imu, JointState, PointCloud2, PointField
-    from std_msgs.msg import Bool, String
+    from std_msgs.msg import String
     from tf2_ros import Buffer, TransformListener
 
     rclpy.init(args=args)
@@ -81,33 +77,6 @@ def main(args=None):
     grid_pub = node.create_publisher(OccupancyGrid, '/lite3_terrain/grid', 1)
     hazard_pub = node.create_publisher(PointCloud2, '/lite3_terrain/hazards', 1)
     status_pub = node.create_publisher(String, '/lite3_terrain/status', 1)
-    stop_pub = node.create_publisher(Bool, '/lite3_terrain/stop', 1)
-    from rcl_interfaces.msg import SetParametersResult
-    state['stop_params'] = T.StopParams()
-    state['last_hazard'] = -math.inf
-    for name in T.STOP_LIMITS:
-        node.declare_parameter(name, getattr(state['stop_params'], name))
-    # Operator 2026-11-20 (docs-only stops): false = obstacles go to the Nav2 costmaps only, as in the
-    # vendor navigation; the lock then only engages on invalid/stale inputs (or if this node dies).
-    state['proximity_stop'] = bool(node.declare_parameter('proximity_stop', True).value)
-
-    def on_parameters(parameters):
-        """Proximity-stop distances: may be raised for a test, never below the validated default."""
-        params = state['stop_params']
-        try:
-            for p in parameters:
-                if p.name in T.STOP_LIMITS:
-                    params = T.updated_stop_params(params, p.name, p.value)
-        except ValueError as error:
-            return SetParametersResult(successful=False, reason=str(error))
-        for p in parameters:          # roam's stair routine switches it off only while on the stairs
-            if p.name == 'proximity_stop':
-                state['proximity_stop'] = bool(p.value)
-        state['stop_params'] = params
-        node.get_logger().info(f'proximity stop now ahead {params.stop_ahead_m} m, '
-                               f'body margin {params.body_margin_m} m')
-        return SetParametersResult(successful=True)
-    node.add_on_set_parameters_callback(on_parameters)
 
     def on_imu(msg):
         q = msg.orientation
@@ -132,7 +101,6 @@ def main(args=None):
                   'perception_only': True, 'problems': [],
                   # cloud age when this callback starts (wall clock - stamp): delay before processing
                   'input_age_s': round(time.time() - (msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9), 3)}
-        hazard = (True, 'not evaluated')
         try:
             now = time.monotonic()
             if state['extrinsic'] is None:
@@ -170,7 +138,6 @@ def main(args=None):
             level = base @ level_r.T
             floor_z, source = T.estimate_floor(level, legs[0], params)
             grid = T.build_grid(level, floor_z, params, source)
-            hazard = T.proximity_stop(grid, state['stop_params'])
             status.update({
                 'floor_z_m': round(floor_z, 3), 'floor_source': source,
                 'leg_floor_reference_m': round(legs[0], 3),
@@ -206,21 +173,6 @@ def main(args=None):
             if not node.context.ok():   # shutting down: nothing may be published any more
                 state['busy'] = False
                 return
-            if not state['proximity_stop']:
-                hazard = (False, None)          # obstacles: costmaps only (docs-only stops)
-            if status['problems']:
-                hazard = (True, 'inputs invalid: ' + '; '.join(status['problems']))
-            now = time.monotonic()
-            if hazard[0]:
-                state['last_hazard'] = now
-            stop_params = state['stop_params']
-            stop = now - state['last_hazard'] < stop_params.release_hold_s
-            status['stop'] = {'active': stop, 'reason': hazard[1] if hazard[0] else
-                              ('release hold' if stop else None),
-                              'ahead_m': stop_params.stop_ahead_m,
-                              'body_margin_m': stop_params.body_margin_m,
-                              'proximity_stop': state['proximity_stop']}
-            stop_pub.publish(Bool(data=stop))
             status['processing_s'] = round(time.monotonic() - started, 3)
             status_pub.publish(String(data=json.dumps(status)))
             state['busy'] = False

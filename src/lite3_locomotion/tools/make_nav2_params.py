@@ -109,8 +109,9 @@ def patches():
     ]
     for costmap in ('local_costmap.local_costmap', 'global_costmap.global_costmap'):
         base = costmap + '.ros__parameters.obstacle_layer.'
-        out.append((base + 'observation_sources', 'scan hazards'))
-        out.append((base + 'hazards', dict(HAZARD_SOURCE)))
+        # Operator 2026-11-24: system default navigation - the LiDAR scan only; the terrain hazard cloud
+        # (HAZARD_SOURCE, /lite3_terrain/hazards) is no longer a costmap source.
+        out.append((base + 'observation_sources', 'scan'))
         # The voxel layer only duplicates the planar /scan already in obstacle_layer, and its z range
         # starts at origin_z 0.0 while the scan origin (base_link in odom) sits at about -0.01 m: it
         # "cannot raytrace" (thousands of warnings in every launch.log since 2026-11-17), so it marks

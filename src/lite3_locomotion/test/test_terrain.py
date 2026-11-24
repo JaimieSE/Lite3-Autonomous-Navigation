@@ -152,33 +152,9 @@ def test_terrain_monitor_has_no_command_interfaces():
         assert forbidden not in src
 
 
-def test_proximity_stop_ahead_and_around_but_not_far():
-    near_wall = np.vstack([floor(x1=0.35), wall(0.35, -1, 1, FLOOR, FLOOR + 1.0)])   # nose + 0.045 m
-    stop, reason = T.proximity_stop(grid_of(near_wall))
-    assert stop and 'ahead' in reason
-    far_wall = np.vstack([floor(x1=1.5), wall(1.5, -1, 1, FLOOR, FLOOR + 1.0)])
-    assert T.proximity_stop(grid_of(far_wall)) == (False, None)
-    # Beside the body: within 5 cm of the footprint side (y 0.185) stops, 0.36 m out (17 cm away) does not
-    # (operator 2026-11-20, course <= 1.5 m wide; was a 0.40 m circle round the centre).
-    side = np.vstack([floor(), np.array([[-0.10, 0.22, FLOOR + 0.5]] * 5)])
-    stop, reason = T.proximity_stop(grid_of(side))
-    assert stop and 'within' in reason
-    wide = np.vstack([floor(), np.array([[-0.10, 0.36, FLOOR + 0.5]] * 5)])
-    assert T.proximity_stop(grid_of(wide)) == (False, None)
-    drop = np.vstack([floor(x1=0.30), plane(0.35, 2.9, -1, 1, FLOOR - 0.4)])
-    assert T.proximity_stop(grid_of(drop))[0]
-
-
-def test_stop_distance_can_be_raised_but_never_reduced():
-    from lite3_locomotion.terrain import STOP_LIMITS, StopParams, updated_stop_params
-    base = StopParams()
-    assert updated_stop_params(base, 'stop_ahead_m', 0.705).stop_ahead_m == 0.705
-    for bad in (0.35, -1.0, float('nan'), 5.0, True):
-        with pytest.raises(ValueError):
-            updated_stop_params(base, 'stop_ahead_m', bad)
-    with pytest.raises(ValueError):
-        updated_stop_params(base, 'release_hold_s', 0.0)
-    assert STOP_LIMITS['stop_ahead_m'][0] == 0.355       # roaming's 5 cm floor; default stays 0.505
+def test_the_proximity_stop_is_gone():
+    """Operator 2026-11-24: removed; Nav2 avoids obstacles as in the vendor navigation."""
+    assert not hasattr(T, 'proximity_stop') and not hasattr(T, 'StopParams')
 
 
 def test_step_limit_suits_stairs_and_rubble_and_launch_default_matches():
@@ -224,3 +200,8 @@ def test_two_stacked_course_lips_are_steps_not_a_wall():
     terrace = np.vstack([floor(x1=0.6), plane(0.6, 1.0, -1, 1, FLOOR + 0.12), plane(1.0, 2.5, -1, 1, FLOOR + 0.24)])
     s = T.corridor_summary(grid_of(terrace), T.TerrainParams())
     assert s['nearest_obstacle_m'] is None and s['nearest_step_m'] is not None
+
+
+def test_drops_up_to_the_course_block_height_are_not_hazards():
+    """Operator 2026-11-24: blocks reach 25 cm (0.276 m on their pallet); the timber ladder frame's gaps ~0.26 m."""
+    assert T.TerrainParams().max_drop_m == 0.30

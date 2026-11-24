@@ -1,4 +1,4 @@
-"""University perception + SLAM + Nav2 with Lite3 limits, terrain hazards and proximity lock.
+"""University perception + SLAM + Nav2 with Lite3 limits and terrain hazards (no proximity lock since 2026-11-24).
 
 Reuses (unchanged) university launch files: lite3_bringup.launch.py (Fast-LIO,
 odom relay, /scan) and lite3_navigation.launch.py (SLAM or localization + Nav2),
@@ -41,6 +41,7 @@ POINTS_SOURCE, POINTS_DIRECT = '/livox/points', '/lite3/livox_points'
 
 
 TERRAIN_MAX_STEP_M = 0.35   # was 0.40, 0.30, 0.18; = lite3_locomotion.terrain.TerrainParams.max_step_m default
+TERRAIN_MAX_DROP_M = 0.30   # was 0.18; = lite3_locomotion.terrain.TerrainParams.max_drop_m default
 
 def _setup(context):
     share = get_package_share_directory('lite3_locomotion')
@@ -73,7 +74,7 @@ def _setup(context):
     if docs_only:
         approach = None
         print('[lite3] stop layers: DOCS (Perception Development Guide s8.2): obstacles are avoided by Nav2 '
-              'planning only; collision_monitor passes commands through, terrain proximity stop off. '
+              'planning only; collision_monitor passes commands through, no terrain lock. '
               'The remote STOP button is the emergency stop.', flush=True)
     cm_params = CP.collision_monitor_params(bound['boundary_m'], MUX_OUT, output, approach, docs_only=docs_only)
     if approach:
@@ -85,8 +86,9 @@ def _setup(context):
     print(f'[lite3] collision_monitor stop boundary {bound["boundary_m"]} m from the nose: {bound}; '
           f'calibration {cal}', flush=True)
     include = os.path.join(university, 'launch', 'include')
-    mux_params = [os.path.join(university, 'config', 'twist_mux_topics.yaml'),
-                  os.path.join(share, 'params', 'twist_mux_locks.yaml')]
+    # Operator 2026-11-24: no terrain proximity lock any more (params/twist_mux_locks.yaml removed); only the
+    # dead-man lock and the supervised stop input (twist_mux_physical.yaml) sit between Nav2 and the robot.
+    mux_params = [os.path.join(university, 'config', 'twist_mux_topics.yaml')]
     if allow:   # dead-man lock + supervised test/stop inputs; see params/twist_mux_physical.yaml
         mux_params.append(os.path.join(share, 'params', 'twist_mux_physical.yaml'))
     source = os.environ.get('LITE3_LIO_SOURCE', 'local')
@@ -111,8 +113,9 @@ def _setup(context):
         Node(package='lite3_livox_cloud', executable='livox_cloud', output='screen'),
         bringup,
         Node(package='lite3_locomotion', executable='terrain_monitor', name='lite3_terrain_monitor',
-             output='screen', parameters=[{'proximity_stop': not docs_only}],
-             arguments=['--max-step', LaunchConfiguration('max_step').perform(context)],
+             output='screen',
+             arguments=['--max-step', LaunchConfiguration('max_step').perform(context),
+                        '--max-drop', LaunchConfiguration('max_drop').perform(context)],
              remappings=[('/joint_states', '/lite3/joint_states'),
                                           ('/imu/data', '/lite3/imu_data'),
                                           (POINTS_SOURCE, POINTS_DIRECT)]),
@@ -143,11 +146,13 @@ def generate_launch_description():
                               description='fastest speed the boundary must cover (m/s, <= 0.5; validated to 0.10)'),
         DeclareLaunchArgument('depth_camera', default_value='true',
                               description='fuse the RealSense depth near field into the terrain monitor'),
+        DeclareLaunchArgument('max_drop', default_value=str(TERRAIN_MAX_DROP_M),
+                              description='terrain monitor: deeper than this is a drop-off (m)'),
         DeclareLaunchArgument('max_step', default_value=str(TERRAIN_MAX_STEP_M),
                               description='terrain: highest rise still walkable (m)'),
-        DeclareLaunchArgument('stop_layers', default_value='full', choices=['full', 'docs'],
-                              description='full: collision_monitor stop + terrain lock; docs: Nav2 '
-                                          'avoidance only (vendor navigation)'),
+        DeclareLaunchArgument('stop_layers', default_value='docs', choices=['docs'],
+                              description='docs: Nav2 avoidance only (vendor navigation); the full stop '
+                                          'layers were removed 2026-11-24'),
         DeclareLaunchArgument('calibration', default_value='',
                               description='operator calibration.json (measured latency/coast)'),
         OpaqueFunction(function=_setup),

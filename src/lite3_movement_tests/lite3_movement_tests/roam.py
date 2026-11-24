@@ -11,8 +11,9 @@ Command path (all existing components; this module talks to none of them directl
       left/right Nav2 turns and check each new map for an opening.
     frontier / patrol goal -> Nav2 (SLAM map, costmaps incl. terrain hazards, planner, MPPI)
       -> velocity_smoother (max_velocity = the selected speed mode, read back)
-      -> /nav_cmd_vel (prio 10) -> twist_mux [dead-man fed only while every check passes,
-         terrain_stop backup lock] -> collision_monitor STOP polygon -> /cmd_vel -> robot
+      -> /nav_cmd_vel (prio 10) -> twist_mux [dead-man fed only while every check passes]
+         -> collision_monitor (pass-through) -> /cmd_vel -> robot. No terrain proximity lock (removed
+         2026-11-24): Nav2's costmaps, inflation and collision-checked behaviours avoid obstacles.
 
 Speed modes: the Lite3's gait modes cannot be verified on this deployment - the vendor ROS
 bridge has no gait-switch command, the firmware's robot_gait_state is dropped by the deployed
@@ -50,7 +51,7 @@ from .advisory import parse_advisory
 from .coverage import CameraCoverage
 from .course_grid import CourseGrid
 from . import goal_selection as GS
-from .scene_hints import parse_scene_hints, scene_request
+from .scene_hints import active_hold, parse_scene_hints, scene_request
 from . import wall_gaps as WG
 from .exploration_record import (ExplorationRecord, INSPECTION_ARRIVE_M, INSPECTION_WAIT_S,
                                  INSPECTION_YAW_TOL_DEG, build_markers, classify_failure)
@@ -136,6 +137,7 @@ ADVISORY_MODES = ('act', 'log', 'off')  # teammate's stair/curtain advisory: act
 ADVISORY_MAX_AGE_S = 0.5               # it publishes every ~0.15 s; older = detector stopped
 ADVISORY_STAIRS_TRIGGER_M = 0.9        # stairs nearer: start the crossing (its approach covers up to 1.0 m)
 ADVISORY_STAIRS_WALK_TO_M = 0.6        # stairs farther: walk to this far from the first riser first
+STAIR_GRID_SNAP_DEG = 20.0             # stairs: square up to the course grid axis when within this of the risers
 ADVISORY_ALIGN_DEG = 5.0               # turn to face the risers when the detector says more than this
 # Stairs / curtain from the Pi (operator 2026-11-24: the Orbbec is on the Pi, which runs the same detector). The Pi
 # processes ~0.6 frames/s, so a reading can be 1-2 s old: roam stops, then acts only on a reading captured after it
@@ -202,7 +204,16 @@ SCENE_TURN_MIN_DEG = 10.0
 PLAN_CHECK_PERIOD_S = 1.0              # while walking, check Nav2's planned path against closed wall gaps
 STRAIGHT_SOURCES = ('straight_on', 'corridor', 'corridor_walked')   # goals walked in a straight line
 PROTECTED_ENDS = ('inspection', 'passage', 'stairs', 'scene', 'exit', 'backtrack')   # never reselected
-LADDER = ('look', 'scene', 'grid_return', 'clear_costmaps', 'backtrack', 'pause')
+LADDER = ('look', 'make_room', 'scene', 'grid_return', 'clear_costmaps', 'backtrack', 'pause')
+# Make room (operator 2026-11-24, run 14:20): the dog stood a few cm from a wall panel; Nav2 refused every turn
+# ("Collision Ahead - Exiting Spin", 15 of 16), the LiDAR cannot see the floor within ~0.5 m and SLAM adds scans only
+# on movement, so the map stayed ~3 m2 and nothing was worth walking to. Blocked turns -> step straight away first.
+BLOCKED_TURN_DEG = 15.0                # a turn that ended before this is blocked
+MAKE_ROOM_AFTER = 2                    # blocked turns in a row before making room
+MAKE_ROOM_M = 0.40                     # step this far (nudge: NUDGE_SPEED_M_S, own odometry)
+MAKE_ROOM_MAX = 2                      # per stuck episode
+MAKE_ROOM_FRONT_CLEAR_M = 0.55         # nose margin: known obstacle ahead farther than the step + this
+MAKE_ROOM_REAR_CLEAR_M = 0.60          # rear: known obstacle behind farther than the step + this (body half + margin)
 AUTO_RESUME_MAX_S = 60.0
 AUTO_RESUME_RETRY_S = 5.0
 WALK_PROGRESS_M = 0.3                  # a walk that got this far is a success even if Nav2 aborted
@@ -229,10 +240,10 @@ class RoamConfig:
                  frontier_clearance_m=0.40, stuck_s=40.0, max_map_age_s=15.0, max_sensor_age_s=0.5,
                  min_lidar_hz=HARD_MIN_LIDAR_HZ, watchdog_timeout_s=2.0, max_goal_failures=5,
                  stack_max_speed=0.10, strategy='frontier', gait=None, docs_stops=False, heartbeat=False,
-                 rough_gait=ROUGH_GAIT, ai_options=(), exit_open_radius_m=1.0, exit_min_area_m2=3.0,
+                 rough_gait=ROUGH_GAIT, ai_options=(), exit_open_radius_m=1.5, exit_min_area_m2=6.0,
                  exit_min_from_start_m=2.0, stop_at_exit=True, stair_mode='ai', auto_stairs=False,
                  ai_axis_forward=12000, advisory='act', map_session=None,
-                 step_crossing=True, step_min_rise_m=0.12, step_max_rise_m=0.25, step_trigger_m=0.6,
+                 step_crossing=True, step_min_rise_m=0.12, step_max_rise_m=0.30, step_trigger_m=0.6,
                  step_speed_m_s=0.20, goal_time_factor=5.0, goal_time_base_s=60.0,
                  spin_stall_s=SPIN_STALL_S, passage_wait_s=PASSAGE_ADVISORY_WAIT_S,
                  decision='sequence', weights=None, min_score=GS.MIN_SCORE, grid_cell_m=1.0, grid_origin=None,
@@ -290,7 +301,9 @@ class RoamConfig:
         # on in the high-step gait, outside Nav2, before the robot is close enough for the LiDAR blind zone.
         self.step_crossing = bool(step_crossing)
         self.step_min_rise_m = _finite(step_min_rise_m, 'step_min_rise', 0.02, 0.30)
-        self.step_max_rise_m = _finite(step_max_rise_m, 'step_max_rise', 0.05, 0.30)
+        # Operator 2026-11-24: course blocks are at most 25 cm from the ground; measured 0.276 m on their pallet
+        # (14:20 run), so 0.30 by default (was 0.25); never above the terrain monitor's walkable rise (0.35).
+        self.step_max_rise_m = _finite(step_max_rise_m, 'step_max_rise', 0.05, 0.35)
         if self.step_min_rise_m >= self.step_max_rise_m:
             raise ConfigError('step_min_rise must be below step_max_rise')
         self.step_trigger_m = _finite(step_trigger_m, 'step_trigger', 0.35, 1.2)
@@ -1100,7 +1113,9 @@ class RoamSession:
         self.scene_requests = []                 # times of scene requests (bounded per run)
         self.stuck_window = []                   # [(t, x, y, area)] for the no-progress check
         self._reselect_t = -math.inf
+        self.scene_hold = None                   # holding for a Pi scene check: {'id', 't', 'aligned'}
         self.wall_gaps = None                    # (mask, geo) of closed wall gaps (wall_gaps.py)
+        self.course_reach = None                 # (mask, SLAM array, geo): floor connected to the dog inside the walls
         self._plan_check_t = -math.inf
         self.pi_gate = None                      # stopped for a Pi stairs/curtain reading: {'t'} (robot time)
         self.pi_ignore_until = -math.inf
@@ -1323,6 +1338,10 @@ class RoamSession:
         self.event('spin_' + how, turned_deg=_r(math.degrees(spun or 0.0), 0))
         if how == 'done':
             self.stats['spins_completed'] += 1
+        if how == 'incomplete' and abs(spun or 0.0) < math.radians(BLOCKED_TURN_DEG):
+            self.spins_blocked = getattr(self, 'spins_blocked', 0) + 1
+        elif how == 'done':
+            self.spins_blocked = 0
         looking = bool(self.goal and self.goal.get('look'))
         spin = self.goal or {}
         self.goal = None
@@ -1379,16 +1398,59 @@ class RoamSession:
             elif now - n['progress'][0] > 1.5:
                 done = 'no progress'
         sample = self._terrain_now(now)
-        if done is None and sample is not None and sample.obstacle_ahead_m is not None and \
-                sample.obstacle_ahead_m < NUDGE_CLEAR_M:
+        if done is None and n.get('sign', 1) > 0 and sample is not None and sample.obstacle_ahead_m is not None \
+                and sample.obstacle_ahead_m < NUDGE_CLEAR_M:
             done = 'obstacle ahead'
+        sign = n.get('sign', 1)
+        if done is None and sign < 0 and self._rear_obstacle() < MAKE_ROOM_REAR_CLEAR_M - 0.25:
+            done = 'obstacle behind'
         if done is None:
-            self.robot.send_velocity(min(NUDGE_SPEED_M_S, self.cfg.mode_speed(self.speed_mode)[0]), 0.0)
+            self.robot.send_velocity(sign * min(NUDGE_SPEED_M_S, self.cfg.mode_speed(self.speed_mode)[0]), 0.0)
             return
         self.robot.send_velocity(0.0, 0.0)
         self.nudge = None
         self.choose_after = now + 0.5
-        self.event('drift_correction_end', how=done)
+        self.event(n.get('end_event', 'drift_correction_end'), how=done)
+
+    def _rear_obstacle(self):
+        """Distance to the first KNOWN obstacle straight behind (SLAM, LiDAR sees all round); inf if none."""
+        pose = self._pose()
+        if pose is None or self.map is None:
+            return 0.0
+        return self.explorer.ray(self.map[1], self._costmap(), pose, pose[2] + math.pi)[2]
+
+    def _make_room(self, now, pose):
+        """Turns keep being blocked: step MAKE_ROOM_M straight forward if clear (terrain monitor and SLAM), else
+        straight back if SLAM shows it clear behind. True if a step started."""
+        if not self.robot.can_actuate or self.map is None:
+            return False
+        odom = self.robot.telemetry.odom.latest()
+        if odom is None:
+            return False
+        sample = self._terrain_now(now)
+        ahead_terrain = None if sample is None else sample.obstacle_ahead_m
+        ahead_map = self.explorer.ray(self.map[1], self._costmap(), pose, pose[2])[2]
+        behind = self._rear_obstacle()
+        if (ahead_terrain is None or ahead_terrain >= MAKE_ROOM_M + NUDGE_CLEAR_M) and \
+                ahead_map >= MAKE_ROOM_M + MAKE_ROOM_FRONT_CLEAR_M:
+            sign, way = 1, 'forward'
+        elif behind >= MAKE_ROOM_M + MAKE_ROOM_REAR_CLEAR_M:
+            sign, way = -1, 'back'
+        else:
+            self.event('make_room_impossible', ahead_terrain_m=_r(ahead_terrain, 2), ahead_map_m=_r(ahead_map, 2),
+                       behind_m=_r(behind, 2))
+            return False
+        self.nudge = {'origin': (odom[1].x, odom[1].y), 't': now, 'length': MAKE_ROOM_M, 'progress': (now, 0.0),
+                      'sign': sign, 'end_event': 'make_room_end'}
+        self.spins_blocked = 0
+        self.stats['make_room'] = self.stats.get('make_room', 0) + 1
+        self.event('make_room', way=way, step_m=MAKE_ROOM_M, ahead_terrain_m=_r(ahead_terrain, 2),
+                   ahead_map_m=_r(ahead_map, 2), behind_m=_r(behind, 2))
+        if self.record is not None:
+            self.record.set_destination(now, {'kind': 'walk', 'x': pose[0] + sign * MAKE_ROOM_M * math.cos(pose[2]),
+                                              'y': pose[1] + sign * MAKE_ROOM_M * math.sin(pose[2]), 'yaw': pose[2]},
+                                        'make room', 'turns blocked: step away from the wall')
+        return True
 
     def _floor_lookup(self, now, pose):
         """(x, y) -> observed floor, from the latest terrain_monitor grid (level base_link frame, centred
@@ -1738,7 +1800,12 @@ class RoamSession:
         t0 = time.monotonic()
         try:
             self.wall_gaps = WG.gap_mask(self.map[1], self.record.breadcrumbs)
-            self.course.update(self.map[1], self.coverage, self.record.breadcrumbs, now, walls=self.wall_gaps[0])
+            reach = None
+            if self.last_pose is not None:
+                reach = WG.reachable_mask(self.map[1], self.last_pose[:2], self.wall_gaps[0], self.record.breadcrumbs)
+                self.course_reach = None if reach is None else (reach, self._slam_np()[0], self.wall_gaps[1])
+            self.course.update(self.map[1], self.coverage, self.record.breadcrumbs, now, walls=self.wall_gaps[0],
+                               reach=reach)
         except Exception as exc:  # noqa: BLE001 - the grid is memory only: it must never stop roaming
             self._grid_error(exc)
         self._timed('course_update', t0)
@@ -1821,7 +1888,7 @@ class RoamSession:
                        key=lambda c: math.dist(self.course.centre(*c), pose[:2]))
         out, limit = [], GRID_RETURN_MAX * (2 if relaxed else 1)
         for c in cells[:3 * limit]:
-            p = self.course.return_point(c, ok=lambda x, y: self._reachable(x, y) and not (
+            p = self.course.return_point(c, ok=lambda x, y: self._reachable(x, y) and self._in_course(x, y) and not (
                 self.record is not None and self.record.avoided(x, y, now)))   # free, below the inscribed cost
             if p is None or math.dist(p, pose[:2]) < GRID_RETURN_MIN_M:
                 continue
@@ -1857,6 +1924,9 @@ class RoamSession:
         def add(goal, source, reason):
             if goal is None or self._goal_invalid(goal):              # endpoint: geofence, costmap, SLAM
                 return
+            if not self._in_course(goal['x'], goal['y']):
+                self.stats['outside_course_rejected'] = self.stats.get('outside_course_rejected', 0) + 1
+                return                                                # beyond the course walls
             if source in STRAIGHT_SOURCES and self.wall_gaps is not None and \
                     WG.crosses(self.wall_gaps[0], self.wall_gaps[1], [pose[:2], (goal['x'], goal['y'])]):
                 return                                                # straight through a gap in a wall
@@ -1910,7 +1980,7 @@ class RoamSession:
         d = self._evaluate(now, pose)
         if d.chosen is not None:
             self._take_decision(now, pose, d)
-        elif self.scan_index < len(SCAN_STEPS):
+        elif self.scan_index < len(SCAN_STEPS) and getattr(self, 'spins_blocked', 0) <= MAKE_ROOM_AFTER:
             self._search_turn(now, pose)                       # look around first
         else:
             self._start_ladder(now, 'no worthwhile goal after looking around')
@@ -1965,6 +2035,7 @@ class RoamSession:
     # ---- stuck: detection and the recovery ladder (look around -> scene -> unfinished cell -> ...)
     def _stuck_check(self, now, pose):
         busy = (self.stairs or self.crossing or self.nudge or self.scene_wait or self.scene_task or self.ladder
+                or self.scene_hold is not None
                 or self.ladder_pending or self.hold_since is not None or self.passage is not None
                 or (self.record is not None and self.record.active_inspection))
         if busy or self.map is None:
@@ -2002,6 +2073,13 @@ class RoamSession:
                 if self.scan_index < len(SCAN_STEPS):
                     lad['recheck'] = True
                     self._search_turn(now, pose)
+                    return
+            elif name == 'make_room':
+                if getattr(self, 'spins_blocked', 0) >= MAKE_ROOM_AFTER and lad.get('rooms', 0) < MAKE_ROOM_MAX \
+                        and self._make_room(now, pose):
+                    lad['rooms'] = lad.get('rooms', 0) + 1
+                    lad['step'], lad['recheck'] = 0, True          # look round again from the new spot
+                    self.scan_index = 0
                     return
             elif name == 'scene':
                 if self.scene_wait is not None:
@@ -2177,11 +2255,13 @@ class RoamSession:
         if self.crossing:
             return 'CURTAIN CROSSING'
         if self.nudge:
-            return 'DRIFT FIX'
+            return 'MAKING ROOM' if self.nudge.get('end_event') == 'make_room_end' else 'DRIFT FIX'
         if self.hold_since is not None:
             return 'HOLD'
         if self.pi_gate is not None:
             return 'CHECKING STAIRS (Pi)'
+        if self.scene_hold is not None:
+            return 'SCENE HOLD (Pi)'
         if self.scene_wait is not None:
             return 'STUCK: asking scene'
         if self.scene_task is not None:
@@ -2336,7 +2416,7 @@ class RoamSession:
         if self.failures >= self.cfg.max_goal_failures:
             sample = self._terrain_now(now)
             held = f' (terrain proximity stop holding: {sample.reason}; move the robot or the object)' \
-                if sample is not None and sample.stop else ''
+                if self._terrain_stop(sample) else ''
             self._pause(f'{self.failures} consecutive spins/walks found no way on{held}: check the area, '
                         'then resume')
 
@@ -2360,31 +2440,14 @@ class RoamSession:
             self._update_course(now)
             self._publish_overlay(now)
         sample = self._terrain_now(now)
-        if self.course is not None and sample is not None and not sample.stop:
+        if self.course is not None and sample is not None and not self._terrain_stop(sample):
             self._stuck_check(now, pose)
         if sample is None:
             self._pause('LiDAR/terrain status stale; check the sensors before resuming')
             return
-        if sample.stop:
-            # Operator 2026-11-20: a proximity stop is a HOLD, not a pause. The twist_mux lock already
-            # stops all Nav2 output; cancel the walk, wait for the area to clear, then carry on by itself.
-            if self.hold_since is None:
-                self.hold_since = now
-                self.stats['holds'] = self.stats.get('holds', 0) + 1
-                self.event('hold', reason=sample.reason)
-            elif now - self.hold_since > TERRAIN_HOLD_MAX_S:
-                self.hold_since = None
-                self._pause(f'terrain proximity stop for {TERRAIN_HOLD_MAX_S:.0f} s ({sample.reason}); '
-                            'check the area before resuming')
-                return
-            if self.goal is None:
-                return
-            if self.cancel_request is None:
-                self._cancel_scan_walk(now, TERRAIN_HOLD_REASON)
-                return
-        elif self.hold_since is not None:
-            self.event('hold_cleared', held_s=_r(now - self.hold_since, 1))
-            self.hold_since = None
+        # (Operator 2026-11-24: the terrain proximity stop and roam's hold on it are removed - Nav2 avoids obstacles.)
+        if self._scene_hold_tick(now, pose):
+            return                                    # holding for the Pi's scene check (squared up to the grid)
         self._take_scene(now, pose)
         self._check_exit(now, pose)
         if self.state == 'ROAMING' and self._advisory(now, pose):
@@ -2517,6 +2580,13 @@ class RoamSession:
             self._reselect_t = now
             self._maybe_reselect(now, pose)
 
+    def _in_course(self, x, y):
+        """Inside the course walls (wall_gaps.in_course); True while the reachable floor is not known yet."""
+        if self.course_reach is None:
+            return True
+        reach, data, geo = self.course_reach
+        return WG.in_course(data, reach, geo, x, y)
+
     def _plan_through_wall(self, now):
         """Nav2's latest global plan for this walk crosses a closed wall gap (a hole the dog cannot fit through)."""
         plan = getattr(self.robot, 'nav_plan', None)
@@ -2531,6 +2601,55 @@ class RoamSession:
             self.cancel_request = (now, reason)
         else:
             self._pause(f'Nav2 did not acknowledge cancellation: {reason}')
+
+    def _grid_axis_yaw(self, yaw):
+        """The 1 x 1 m course grid axis nearest yaw (grid +X and its 90-degree turns); yaw itself without a grid."""
+        if self.course is None:
+            return yaw
+        h, q = self.course.heading, math.pi / 2
+        return h + round((yaw - h) / q) * q
+
+    def _scene_hold_tick(self, now, pose):
+        """Pi scene hold (nav_hold.py): stop at the next safe point, square up to the grid, wait for the result
+        or the expiry. Never on stairs, curtains or rollers: those run outside _scan_walk, and a walk to stairs
+        or a scene hint is left alone. True while holding (no new goal this tick)."""
+        text = getattr(self.robot, 'scene_hold_msg', None)
+        hold = active_hold(text, time.time_ns()) if text else None
+        if hold is None:
+            if self.scene_hold is not None:
+                self.event('scene_hold_end', request_id=self.scene_hold['id'], held_s=_r(now - self.scene_hold['t'], 1))
+                self.scene_hold, self.choose_after = None, now
+            return False
+        if (self.goal is not None and self.goal.get('ends_at') in ('stairs', 'scene')) or self.adv_task is not None \
+                or self.pi_gate is not None:
+            return False                                      # on the way into stairs / a curtain: carry on
+        if self.scene_hold is None or self.scene_hold['id'] != hold['request_id']:
+            self.scene_hold = {'id': hold['request_id'], 't': now, 'aligned': False}
+            self.stats['scene_holds'] = self.stats.get('scene_holds', 0) + 1
+            self.event('scene_hold', request_id=hold['request_id'], reason=hold['reason'],
+                       encounters=hold['encounter_ids'], expires_in_s=hold['remaining_s'])
+        if self.cancel_request is not None:
+            return False                                      # let the walk's cancellation finish
+        if self.goal is not None:
+            if self.goal.get('kind') == 'walk':
+                self._cancel_scan_walk(now, 'reselect: scene hold')   # ends the walk, not a failure
+            return False                                      # a turn (or the squaring-up turn) finishes first
+        if not self.scene_hold['aligned']:
+            self.scene_hold['aligned'] = True
+            turn = math.atan2(math.sin(self._grid_axis_yaw(pose[2]) - pose[2]),
+                              math.cos(self._grid_axis_yaw(pose[2]) - pose[2]))
+            if abs(turn) > math.radians(SCENE_TURN_MIN_DEG):
+                self._start_spin(now, pose, turn, reason='scene hold: square up to the grid')
+                if self.goal is not None:
+                    self.goal['look'] = True
+                return True
+        return True
+
+    def _terrain_stop(self, sample):
+        """Always False: operator 2026-11-24 removed the terrain proximity stop ("it is the reason why everything is
+        not working"). Nav2's costmaps, inflation and collision-checked behaviours avoid obstacles, as in the vendor
+        navigation; the remote STOP is the emergency stop."""
+        return False
 
     def _terrain_max_age(self):
         # docs-only stops: terrain is a costmap input only (Nav2 tolerates a late update), so a single
@@ -2591,7 +2710,6 @@ class RoamSession:
         try:
             if getattr(iface, 'active', True):
                 self.event('stairs_switch_out', evidence=iface.switch_out(), reason=why)
-            iface.restore_stops()
         except Exception as error:  # noqa: BLE001 - keep stopping; tell the operator
             self.event('stairs_switch_out_failed', error=str(error))
             self.log(f'WARNING: could not leave the stair mode ({error}); use the remote / app to exit AI mode')
@@ -2651,11 +2769,13 @@ class RoamSession:
         ok, pre = self.runner._standing_precondition(require_still=False)
         if not ok and self.robot.can_actuate:
             # Physical 2026-11-24 10:18: every auto-resume was refused while the robot stood in rug_hstep, which
-            # keeps stepping in place - the joints never settle. For a resume, standing with moving joints is fine;
-            # tilt, disagreeing legs, invalid IMU or not standing still refuse.
+            # keeps stepping in place - the joints never settle. For a resume, standing with moving joints or legs at
+            # different heights is fine; body tilt beyond the limit, invalid IMU or not standing still refuse.
             from .geometry import STANDING
             posture = pre.get('posture', {})
-            others = [r for r in posture.get('reasons', []) if r != 'joints still moving']
+            # Uneven course (13:24 run): standing with one leg on a lip (extensions 0.26-0.35 m) is still standing.
+            others = [r for r in posture.get('reasons', []) if r not in ('joints still moving',
+                                                                          'leg extensions disagree beyond spread limit')]
             if not (posture.get('posture') == STANDING and not others):
                 self.event('resume_refused_posture', posture=posture.get('posture'), reasons=posture.get('reasons'),
                            tilt_rad=posture.get('tilt_rad'), extensions_m=posture.get('extensions_m'))
@@ -2814,10 +2934,18 @@ class RoamSession:
         if self.adv_task is not None:
             return False                                   # turning to face them already
         self._cancel_goal_now()
-        if abs(h) > ADVISORY_ALIGN_DEG:
+        # Operator 2026-11-24: square up within the 1 x 1 m course grid before climbing - the grid axis nearest the
+        # risers' heading when the detector agrees with it (within STAIR_GRID_SNAP_DEG), else the detector's own.
+        facing = pose[2] + math.radians(h)
+        axis = self._grid_axis_yaw(facing)
+        snapped = abs(math.atan2(math.sin(axis - facing), math.cos(axis - facing))) <= math.radians(STAIR_GRID_SNAP_DEG)
+        turn = math.degrees(math.atan2(math.sin((axis if snapped else facing) - pose[2]),
+                                       math.cos((axis if snapped else facing) - pose[2])))
+        if abs(turn) > ADVISORY_ALIGN_DEG:
             self.adv_task = {'kind': 'stairs_align'}
-            self.event('stairs_align', heading_deg=_r(h, 1), distance_m=_r(d, 2))
-            self._start_spin(now, pose, math.radians(h))
+            self.event('stairs_align', heading_deg=_r(turn, 1), detector_deg=_r(h, 1), grid_axis=snapped,
+                       distance_m=_r(d, 2))
+            self._start_spin(now, pose, math.radians(turn))
             return True
         self.event('stairs_detected', ahead_m=_r(d, 2), source='advisory')
         self._begin_stairs('up', 'approach', 'advisory', over=True)
@@ -2907,7 +3035,6 @@ class RoamSession:
         mode = mode or self.cfg.stair_mode
         iface = AiModeStairs(self.robot, self.cfg.ai_axis_forward, normal) if mode == 'ai' \
             else HStepGaitStairs(self.robot, self.cfg.rough_gait, normal)
-        iface.relax_stops()
         odom = self.robot.telemetry.odom.latest()
         origin = (odom[1].x, odom[1].y) if odom else (0.0, 0.0)
         kw = {'climb_speed_m_s': climb_speed} if climb_speed else {}
@@ -2994,7 +3121,6 @@ class RoamSession:
             self.runner.own_axis_until = now + OWN_AXIS_GRACE_S     # our axis commands echo on /handle_state
         iface.drive(min(action.vx, self.cfg.mode_speed(self.speed_mode)[0]))   # never above the mode
         if action.done or action.aborted:
-            iface.restore_stops()
             self.stairs = None
             self.stairs_until = now + STAIR_COOLDOWN_S
             self.goal = None
@@ -3326,9 +3452,9 @@ class RoamSession:
             if grid is not None and pose is not None:
                 if self.cfg.strategy == 'scan_walk':
                     sample = self._terrain_now(now)
-                    goal = self._walk_candidate(now, pose) if sample and not sample.stop else None
+                    goal = self._walk_candidate(now, pose) if sample and not self._terrain_stop(sample) else None
                     if goal is None:
-                        self.event('would_scan' if sample and not sample.stop else 'would_pause')
+                        self.event('would_scan' if sample and not self._terrain_stop(sample) else 'would_pause')
                 else:
                     goal = self._choose(grid[1], now, pose)
                 if goal and (self.goal is None or (goal['x'], goal['y']) != (self.goal['x'], self.goal['y'])):
@@ -3464,9 +3590,11 @@ def parse(argv):
                      help='documented perception switch sent at start (repeatable; none by default). The '
                           'Perception guide s7.1.3/s8.1.3 says to turn all AI options off before mapping. '
                           'Caution: the vendor app code stops the RealSense service on value 0x00 (all_off).')
-    run.add_argument('--exit-open-radius', type=float, default=1.0,
+    # Operator 2026-11-24: the open area outside the course is ~5 m across ahead of the dog; 1.0 m / 3 m2 also
+    # fitted wide bays inside the course (false 'exit reached' stops). Was 1.0 m and 3 m2.
+    run.add_argument('--exit-open-radius', type=float, default=1.5,
                      help='exit = known-free cells this far from any wall/unknown (m; 0 = no exit detection)')
-    run.add_argument('--exit-min-area', type=float, default=3.0, help='exit open area at least this large, m2')
+    run.add_argument('--exit-min-area', type=float, default=6.0, help='exit open area at least this large, m2')
     run.add_argument('--exit-min-from-start', type=float, default=2.0, help='ignore open space near the start, m')
     run.add_argument('--no-stop-at-exit', action='store_true', help='keep exploring after reaching the exit')
     run.add_argument('--stair-mode', default='ai', choices=STAIR_MODES,
@@ -3477,7 +3605,7 @@ def parse(argv):
     run.add_argument('--step-crossing', default='on', choices=('on', 'off'),
                      help='cross detected terrain steps straight on in the high-step gait (never AI mode)')
     run.add_argument('--step-min-rise', type=float, default=0.12, help='smallest step crossed this way (m)')
-    run.add_argument('--step-max-rise', type=float, default=0.25, help='largest step attempted (m)')
+    run.add_argument('--step-max-rise', type=float, default=0.30, help='largest step attempted (m)')
     run.add_argument('--step-trigger', type=float, default=0.6, help='start when the step is this close (m)')
     run.add_argument('--step-speed', type=float, default=0.20, help='walking speed while crossing (m/s)')
     run.add_argument('--decision', default='unified', choices=('unified', 'sequence'),
@@ -3958,8 +4086,6 @@ def run_session(a, state, directory):
     finally:
         try:
             if 'robot' in locals():
-                if mode == MODE_PHYSICAL and backup > HARD_MIN_ROAM_STOP_DISTANCE_M + 1e-9:
-                    robot.set_stop_distance(DEFAULT_STOP_AHEAD_M)        # restore the default lock
                 robot.close() if hasattr(robot, 'close') else None
         except Exception:  # noqa: BLE001
             pass

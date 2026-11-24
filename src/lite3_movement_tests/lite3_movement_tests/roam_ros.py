@@ -107,6 +107,12 @@ class RoamRobot(NavRobot):
             (time.monotonic(), m.data)), qos_profile_sensor_data)
         scene_pub = node.create_publisher(String, SCENE_REQUEST_TOPIC, 10)
         self.publish_scene_request = lambda text: scene_pub.publish(String(data=text))
+        # Scene hold from ~/live_mission/nav_hold.py (Pi scene understanding): RELIABLE + TRANSIENT_LOCAL, latest only
+        from .scene_hints import HOLD_TOPIC
+        self.scene_hold_msg = None
+        hold_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
+                              durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        node.create_subscription(String, HOLD_TOPIC, lambda m: setattr(self, 'scene_hold_msg', m.data), hold_qos)
         # Nav2's global plan (the path the current walk will take): checked against closed wall gaps (wall_gaps.py)
         from nav_msgs.msg import Path as NavPath
         self.nav_plan = None
@@ -139,24 +145,6 @@ class RoamRobot(NavRobot):
             cached = (stamp, grid_from_occupancy(msg))
             self._grid_cache[name] = cached
         return cached
-
-    def set_terrain_proximity_stop(self, enabled, timeout_s=2.0):
-        """terrain_monitor's proximity_stop parameter (stairs: off while climbing, back on after)."""
-        from rcl_interfaces.msg import Parameter, ParameterType, ParameterValue
-        from rcl_interfaces.srv import SetParameters
-        node = self._nodes[self.wiring.velocity_domain]
-        client = node.create_client(SetParameters, '/lite3_terrain_monitor/set_parameters')
-        try:
-            if not client.wait_for_service(timeout_sec=timeout_s):
-                return False
-            value = ParameterValue(type=ParameterType.PARAMETER_BOOL, bool_value=bool(enabled))
-            future = client.call_async(SetParameters.Request(parameters=[Parameter(name='proximity_stop', value=value)]))
-            deadline = time.monotonic() + timeout_s
-            while not future.done() and time.monotonic() < deadline:
-                time.sleep(0.02)
-            return future.done() and all(r.successful for r in future.result().results)
-        finally:
-            node.destroy_client(client)
 
     def map_grid(self):
         return self._grid('map')

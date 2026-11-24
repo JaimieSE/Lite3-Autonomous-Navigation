@@ -6,12 +6,13 @@
 #        domain-8 bridge instead: measured 2026-11-19 (stationary, 300 s) at 89 Hz with 29-31 gaps of
 #        0.25-0.50 s and 1-message seconds, vs 199.5 Hz / max gap 0.12 s at the source - enough to trip
 #        M2's 0.25 s freshness stop and the watchdog's 20 Hz readiness.
-#        --stop-layers docs|full (default docs, operator 2026-11-20): docs = obstacle avoidance by Nav2
-#            planning only, as the vendor navigation (Perception Development Guide s8.2); the remote STOP
-#            button is the emergency stop. full = also the collision_monitor stop zone and the terrain
-#            proximity lock (use for the supervised M-series tests).
+#        Obstacle avoidance is Nav2's (costmaps, inflation, collision-checked behaviours), as in the vendor
+#            navigation (Perception Development Guide s8.2); the remote STOP button is the emergency stop.
+#            Operator 2026-11-24: the extra stop layers (collision_monitor stop zone, terrain proximity lock,
+#            --stop-layers full / --full-stops) were removed: "the reason why everything is not working".
 #        --no-depth-camera: do not fuse the RealSense depth near field (adds ~6 MB/s on the robot link)
 #        --max-step M (default 0.35): terrain monitor's highest walkable rise (stairs ~0.05, rubble)
+#        --max-drop M (default 0.30): deeper than this is a drop-off (course blocks reach 25 cm)
 #        --clearance M (default 0.15): obstacle clearance the collision_monitor stop must leave
 #        --max-speed V (default 0.10): fastest speed that boundary must cover (<= 1.0 m/s; only <= 0.10 is
 #            validated. Above 0.10 the boundary grows fast: braking distance is taken as quadratic in speed)
@@ -33,10 +34,11 @@ while [ $# -gt 0 ]; do
   case "$arg" in
     --clearance) CLEARANCE="$1"; shift ;;
     --max-speed) MAX_SPEED="$1"; shift ;;
-    --stop-layers) STOP_LAYERS="$1"; shift ;;
+    --stop-layers) [ "$1" = docs ] || { echo "--stop-layers full was removed (operator 2026-11-24): Nav2 avoids obstacles, as in the vendor navigation"; exit 2; }; shift ;;
     --max-step) LAUNCH_ARGS+=(max_step:="$1"); shift ;;
+    --max-drop) LAUNCH_ARGS+=(max_drop:="$1"); shift ;;
     --no-depth-camera) LAUNCH_ARGS+=(depth_camera:=false) ;;
-    --full-stops) STOP_LAYERS=full ;;
+    --full-stops) echo "--full-stops was removed (operator 2026-11-24): Nav2 avoids obstacles, as in the vendor navigation"; exit 2 ;;
     --accept-degraded) ACCEPT_DEGRADED=1 ;;
     --physical) MODE=physical ;;
     --direct-telemetry) TELEMETRY=direct; PREFLIGHT_ARGS=(--direct-telemetry) ;;
@@ -44,7 +46,6 @@ while [ $# -gt 0 ]; do
     *) echo "Unknown option: $arg (see the header of this script)"; exit 2 ;;
   esac
 done
-case "$STOP_LAYERS" in docs|full) ;; *) echo "--stop-layers must be docs or full"; exit 2 ;; esac
 CALIBRATION="$LOG_ROOT/calibration.json"
 if [ "$MODE" = physical ]; then
   if [ $ACCEPT_DEGRADED -eq 1 ]; then

@@ -14,6 +14,7 @@
 #   --missions FILE   missions JSON for the Pi mission bridge (default ~/live_mission/competition-v6.3-practice.json)
 #   --no-pi-bridge    do not start ~/live_mission/pi_bridge.sh (dry: it only decides M01-M05, never moves the robot)
 #   --no-rviz         do not open RViz (operator/competition.rviz)
+#   --no-scene-hold   do not start ~/live_mission/nav_hold.py (Pi scene checks then never stop the dog)
 # When roam ends, the Pi bridge stops; RViz and navigation stay up ("stop" ends navigation too).
 # Every other option goes to roam (operator/roam.sh start), e.g. --max-minutes 30, --auto-resume 20,
 # --weights "grid=2", --geofence 10. Speed is normal (regular) by default.
@@ -56,10 +57,10 @@ case "${1:-}" in
     echo "navigation: $(nav_running && echo "running ($(nav_mode))" || echo 'not running')"
     exit 0 ;;
   -h|--help|help)
-    sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 esac
 
-MODE=dry; PI_BRIDGE=1; RVIZ=1
+MODE=dry; PI_BRIDGE=1; RVIZ=1; SCENE_HOLD=1
 MISSIONS="$HOME/live_mission/competition-v6.3-practice.json"
 ROAM_ARGS=()
 while [ $# -gt 0 ]; do
@@ -71,6 +72,7 @@ while [ $# -gt 0 ]; do
     --missions) MISSIONS="$1"; shift ;;
     --no-pi-bridge) PI_BRIDGE=0 ;;
     --no-rviz) RVIZ=0 ;;
+    --no-scene-hold) SCENE_HOLD=0 ;;
     *) ROAM_ARGS+=("$a") ;;
   esac
 done
@@ -95,7 +97,8 @@ if [ "$MODE" != sim ]; then
   fi
   : > "$PIDS_FILE"
   # Stairs and curtains come from the Pi (Orbbec on the Pi, same stair/curtain detector): warn if it is silent.
-  PI_PUBS=$(timeout 15 ros2 topic info /group8pi/perception/detections 2>/dev/null | sed -n 's/^Publisher count: //p')
+  PI_PUBS=$( (timeout 15 ros2 topic info /group8pi/perception/detections 2>/dev/null || true) \
+            | sed -n 's/^Publisher count: //p')
   if [ "${PI_PUBS:-0}" -gt 0 ]; then
     echo "== Pi perception: publishing (stairs/curtains, missions, scene hints)"
   else
@@ -112,6 +115,13 @@ if [ "$MODE" != sim ]; then
       echo "   NOTE: Pi mission bridge not started (missing ~/live_mission/pi_bridge.sh or $MISSIONS)"
     fi
   fi
+  if [ $SCENE_HOLD -eq 1 ] && [ -f "$HOME/live_mission/nav_hold.py" ]; then
+    # Pi scene check -> roam stops at a safe point, squares up to the grid, waits <= 6 s (never on stairs,
+    # curtains or rollers). It only publishes /group8/navigation/hold_request; it never sends motion.
+    echo "== Scene hold (nav_hold.py) -> $RUN/nav_hold.log"
+    setsid python3 "$HOME/live_mission/nav_hold.py" > "$RUN/nav_hold.log" 2>&1 < /dev/null &
+    echo "nav_hold $!" >> "$PIDS_FILE"
+  fi
   if [ $RVIZ -eq 1 ]; then
     if [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && command -v rviz2 >/dev/null; then
       echo "== RViz (operator/competition.rviz): map, costmap, plan, roam grid/goal/alternatives/status line"
@@ -127,7 +137,7 @@ on_exit() {
   code=$?
   echo "== Roam ended (exit $code). Stopping the Pi mission bridge; RViz and navigation stay up."
   if [ -f "$PIDS_FILE" ]; then
-    grep -v '^rviz ' "$PIDS_FILE" > "$PIDS_FILE.keep" || true
+    grep -v '^rviz ' "$PIDS_FILE" > "$PIDS_FILE.keep" || true      # (pi_bridge and nav_hold stop with roam)
     mv "$PIDS_FILE.keep" "$PIDS_FILE"
     helpers_stop
   fi

@@ -46,8 +46,10 @@ class TerrainParams:
     max_step_m: float = 0.35            # operator 2026-11-23: default after the 20 cm-block course ran well at 0.35; was 0.40, 0.30 (operator: smaller hazard cloud; /scan covers >= ~0.43 m), 0.18 (course 12:33: stacked/unseen-top lips marked as walls
                                         # boxed the robot in at the start); before that 0.10, 0.12, 0.15; course lips are 0.10-0.15 m (operator 2026-11-21),
                                         # judged as the jump to the lowest neighbouring cell (see build_grid)
-    max_drop_m: float = 0.18            # deeper than this = drop-off; was 0.10, 0.15 (stepping off a 0.10-0.15 m
-                                        # lip counts as a step down, 2026-11-21)
+    max_drop_m: float = 0.30            # deeper than this = drop-off. Operator 2026-11-24: course blocks reach 25 cm
+                                        # (0.276 m measured on their pallet) and the gaps of the timber ladder frame
+                                        # ~0.26 m: at 0.18 they were hazards that boxed the dog in. Was 0.18, 0.15, 0.10
+                                        # (stepping off a 0.10-0.15 m lip counts as a step down, 2026-11-21)
     body_clearance_m: float = 0.75      # points above this (over floor) are overhead
     min_points_per_cell: int = 2
     # Front edge measured 2026-11-20 (standing, 108 clouds): own-body returns reach x 0.289 at most (head,
@@ -325,57 +327,9 @@ class Accumulator:
         return (world - np.asarray(odom_t)) @ r   # inverse rigid transform: R^T (p - t)
 
 
-@dataclass(frozen=True)
-class StopParams:
-    """Proximity stop for the twist_mux lock. Forward-only driving (Nav2 vx_min = 0).
-
-    stop_ahead_m: footprint front 0.305 m + 0.20 m nose-to-obstacle stop boundary (operator decision
-    2026-11-19, was 0.295 m). Covers the calibrated stop up to 0.08 m/s (reaction ~0.03 + coast ~0.06
-    + 5 cm grid margin = 0.14 m, leaving >= 5 cm); at 0.10 m/s about 4 cm would remain.
-    body_margin_m: hazard within this distance of the body footprint (0.61 x 0.37 m box) on any side.
-    Operator 2026-11-20 (course <= 1.5 m wide): was a 0.40 m circle round the centre, which stopped
-    the robot for walls 21 cm beside it. In-place turns are covered by roam's turn-room check and
-    Nav2's footprint collision checking, not by this backup lock.
-    """
-    stop_ahead_m: float = 0.505         # default nose + 0.20 (physical tests); roaming lowers it to 0.405
-    body_margin_m: float = 0.05         # 5 cm round the footprint (was a 0.40 m circle; operator 2026-11-20)
-    half_width_m: float = 0.235         # body half width 0.185 + 5 cm (was 0.30)
-    release_hold_s: float = 1.0
-
-
-# Runtime-adjustable range of the proximity stop (ROS parameters on terrain_monitor). The lower
-# bounds are the validated defaults: a test may make the stop MORE conservative, never less.
+# Operator 2026-11-24: the proximity stop (StopParams, STOP_LIMITS, proximity_stop) is removed; Nav2's costmaps,
+# inflation and collision-checked behaviours avoid obstacles, as in the vendor navigation.
 NOSE_OFFSET_M = 0.305          # footprint front edge ahead of base_link
-STOP_LIMITS = {'stop_ahead_m': (0.355, 3.40),   # floor nose + 0.05 for roaming (operator 2026-11-20);   # was 1.80; 2.95 m nose + 0.305 at 1.0 m/s
-               'body_margin_m': (StopParams.body_margin_m, 1.00)}
 FOOTPRINT_HALF_LENGTH_M = 0.305   # Nav2 footprint [[0.305, 0.185], ...]
 FOOTPRINT_HALF_WIDTH_M = 0.185
 
-
-def updated_stop_params(params, name, value):
-    """New StopParams with one field changed, or ValueError if outside STOP_LIMITS."""
-    if name not in STOP_LIMITS:
-        raise ValueError(f'{name} is not adjustable')
-    low, high = STOP_LIMITS[name]
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) \
-            or not low <= value <= high:
-        raise ValueError(f'{name}={value} outside [{low}, {high}]; the minimum is the validated '
-                         'default and cannot be lowered')
-    return StopParams(**{**params.__dict__, name: float(value)})
-
-
-def proximity_stop(grid, params=StopParams()):
-    """Return (stop, reason) from obstacle/drop cells near the robot (level frame)."""
-    xs, ys = grid.cell_centres()
-    rows, cols = np.where(np.isin(grid.labels, (OBSTACLE, DROP)))
-    if not len(rows):
-        return False, None
-    x, y = xs[cols], ys[rows]
-    ahead = (x > 0) & (x <= params.stop_ahead_m) & (np.abs(y) <= params.half_width_m)
-    around = (np.abs(x) <= FOOTPRINT_HALF_LENGTH_M + params.body_margin_m) & \
-             (np.abs(y) <= FOOTPRINT_HALF_WIDTH_M + params.body_margin_m)
-    if ahead.any():
-        return True, f'hazard {float(x[ahead].min()):.2f} m ahead'
-    if around.any():
-        return True, f'hazard within {params.body_margin_m} m of the body'
-    return False, None

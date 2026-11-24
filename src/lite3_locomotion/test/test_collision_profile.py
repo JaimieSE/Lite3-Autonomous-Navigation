@@ -100,7 +100,7 @@ def test_hard_speed_ceiling_is_one_metre_per_second():
 
 
 def test_one_metre_per_second_boundary_fits_and_is_inside_perception_reach():
-    from lite3_locomotion.terrain import STOP_LIMITS, TerrainParams
+    from lite3_locomotion.terrain import TerrainParams
     with pytest.raises(ValueError):              # default (unmeasured) calibration: 4.02 m, refused
         CP.boundary(0.15, 1.0)
     measured = CP.Calibration(sensing_age_s=0.17, path_latency_s=0.195, coast_m=0.035,
@@ -108,7 +108,6 @@ def test_one_metre_per_second_boundary_fits_and_is_inside_perception_reach():
     assert CP.boundary(0.15, 1.0, measured)['boundary_m'] == pytest.approx(2.81)   # 2.5 cm margin (half cell)
     reach = TerrainParams().size_m / 2 - CP.NOSE_M          # terrain grid ahead of the nose
     assert CP.MAX_BOUNDARY_M < reach
-    assert STOP_LIMITS['stop_ahead_m'][1] >= CP.MAX_BOUNDARY_M - 0.05 + CP.NOSE_M
 
 
 def test_boundary_at_validated_speeds_is_unchanged_and_grows_beyond():
