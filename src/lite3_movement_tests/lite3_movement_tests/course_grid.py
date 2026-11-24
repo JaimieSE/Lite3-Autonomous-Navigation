@@ -13,7 +13,7 @@ evaluator (goal_selection.py), which weighs them against every other candidate.
   after ~/grid_roam_nav2/preview.py Explorer.crossing by a teammate, re-implemented here on numpy), plus failure
   memory: a failed walk across a connection blocks it for a while (temporary) or longer (persistent).
 
-  unfinished  enough mapped free floor AND (camera has not seen most of it OR an OPEN connection - free floor across
+  unfinished  not walked through AND enough mapped free floor AND (camera has not seen most of it OR an OPEN connection - free floor across
               the shared edge - leads to a cell that is still mostly unmapped). An unfinished cell is the "let's get back there" flag.
 
 Alignment is automatic (origin = start pose, +X = start heading; nothing about the course is hard-coded) and can be
@@ -83,9 +83,12 @@ class CourseGrid:
         return self.centre(i, j)[0] + self.c * u - self.s * v, self.centre(i, j)[1] + self.s * u + self.c * v
 
     # ------------------------------------------------------------------ update
-    def update(self, grid, coverage=None, breadcrumbs=(), now=0.0):
-        """Recompute mapped / seen / visited per cell and the connection states from the current SLAM map."""
+    def update(self, grid, coverage=None, breadcrumbs=(), now=0.0, walls=None):
+        """Recompute mapped / seen / visited per cell and the connection states from the current SLAM map.
+        walls: optional bool mask (SLAM shape) of extra wall cells - small gaps in a wall closed (wall_gaps.py)."""
         data, res, gx, gy = _slam(grid)
+        if walls is not None and walls.shape == data.shape:
+            data = np.where(walls, np.int16(100), data)
         h, w = data.shape
         jj, ii = np.nonzero(data >= 0)                                        # known SLAM cells only
         if ii.size == 0:
@@ -175,22 +178,24 @@ class CourseGrid:
         f = self.edge_failures.get(key) or {'category': category, 'attempts': 0, 'until': -math.inf}
         f['attempts'] += 1
         f['category'] = category
-        f['until'] = now + (PERSIST_BLOCK_S if category == 'persistent' else TEMP_BLOCK_S)
+        # Only walls block for good; terrain / temporary trouble only for a while (longer each time).
+        f['until'] = now + (PERSIST_BLOCK_S if category == 'persistent' else TEMP_BLOCK_S * min(f['attempts'], 6))
         self.edge_failures[key] = f
         return key
 
     def connection(self, a, b, now):
         f = self.edge_failures.get(frozenset((a, b)))
         if f is not None:
-            limit = PERSIST_MAX if f['category'] == 'persistent' else TEMP_MAX
-            if now < f['until'] or f['attempts'] >= limit:
+            if now < f['until'] or (f['category'] == 'persistent' and f['attempts'] >= PERSIST_MAX):
                 return 'blocked'
         return self.edges.get(frozenset((a, b)), 'unknown')
 
     # ------------------------------------------------------------------ memory queries
     def unfinished(self, c, now=0.0):
         info = self.cells.get(c)
-        if info is None or info['free_m2'] < MIN_FREE_M2:
+        # Operator 2026-11-24: a cell the dog has walked through is explored - never backtrack into it; come back
+        # only for cells not yet visited (reached through the explored ones).
+        if info is None or info['free_m2'] < MIN_FREE_M2 or info['visited']:
             return False
         if info['seen'] < SEEN_DONE:
             return True

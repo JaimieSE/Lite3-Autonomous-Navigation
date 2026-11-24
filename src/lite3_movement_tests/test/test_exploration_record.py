@@ -12,17 +12,18 @@ def test_failure_classification():
     assert E.classify_failure('Nav2 rejected the walk goal') == 'temporary'
     assert E.classify_failure('LiDAR/terrain status stale') == 'temporary'
     assert E.classify_failure('Nav2 cancellation has no terminal result') == 'temporary'
-    assert E.classify_failure('walk ended after 0.02 m (obstacle ahead (walking standoff))') == 'persistent'
-    assert E.classify_failure('Nav2 ABORTED') == 'persistent'
+    assert E.classify_failure('walk ended after 0.02 m (obstacle ahead (walking standoff))') == 'terrain'
+    assert E.classify_failure('Nav2 ABORTED') == 'terrain'                    # uneven ground is not a wall
+    assert E.classify_failure('Nav2 path goes through a gap in a wall') == 'persistent'
     assert E.classify_failure('something new') == 'persistent'
 
 
 def test_repeated_unsuccessful_goal_is_avoided_and_then_given_up():
     r = rec()
-    r.fail(0.0, 1.0, 1.0, 'walk ended after 0.02 m (obstacle ahead (walking standoff))')
+    r.fail(0.0, 1.0, 1.0, 'Nav2 path goes through a gap in a wall')
     assert r.avoided(1.1, 1.0, 1.0) and r.avoided(1.0, 1.0, E.PERSIST_AVOID_S - 1)
     assert not r.avoided(1.0, 1.0, E.PERSIST_AVOID_S + 1)          # may retry once later
-    f = r.fail(E.PERSIST_AVOID_S + 2, 1.0, 1.0, 'Nav2 ABORTED')
+    f = r.fail(E.PERSIST_AVOID_S + 2, 1.0, 1.0, 'Nav2 path goes through a gap in a wall')
     assert f['attempts'] == 2 and 'for this session' in f['retry']
     assert r.avoided(1.0, 1.0, 10_000.0)                            # exhausted for good
     assert not r.avoided(3.0, 3.0, 1.0)                             # elsewhere unaffected
@@ -111,7 +112,7 @@ def test_map_reset_invalidates_positions_but_keeps_requests():
     r.observe_map(12.0, 1.0)
     r.add_breadcrumb(0.0, 0.0); r.add_breadcrumb(1.0, 0.0)
     r.note_decision((0, 0, 0), [0.0, math.pi])
-    r.fail(1.0, 2.0, 2.0, 'Nav2 ABORTED')
+    r.fail(1.0, 2.0, 2.0, 'wall in the way')
     r.add_inspection(1.0, req('a'))
     assert r.observe_map(11.0, 2.0) is None                                  # normal fluctuation
     why = r.observe_map(3.0, 3.0)                                            # slam reset
@@ -130,7 +131,7 @@ def test_markers_reflect_the_record_with_labels_and_bounded_counts():
         r.add_breadcrumb(k * 0.5, 0.0)
     r.note_decision((0, 0, 0), [0.0, math.pi / 2])
     for k in range(E.MAX_FAILURE_MARKERS + 10):
-        r.fail(float(k), k * 1.0, 5.0, 'Nav2 ABORTED')
+        r.fail(float(k), k * 1.0, 5.0, 'wall in the way')
     r.add_inspection(0.0, req('a'))
     m = E.build_markers(r, labels=True)
     ns = {x['ns'] for x in m}
@@ -153,7 +154,7 @@ def test_default_overlay_is_shapes_only():
     r.note_decision((0, 0, 0), [0.0, math.pi / 2, math.pi])
     j = r.junctions[0]
     j['branches'][0]['state'], j['branches'][1]['state'], j['branches'][2]['state'] = 'INSPECTED', 'DEFERRED', 'BLOCKED'
-    f = r.fail(0.0, 2.0, 2.0, 'Nav2 ABORTED'); r.fail(1.0, 2.0, 2.0, 'Nav2 ABORTED')
+    f = r.fail(0.0, 2.0, 2.0, 'wall in the way'); r.fail(1.0, 2.0, 2.0, 'wall in the way')
     r.add_inspection(0.0, req('a'))
     m = E.build_markers(r, labels=False)
     assert not [x for x in m if x['type'] == 'text']                                      # no words
@@ -179,7 +180,7 @@ def test_default_overlay_has_short_tags_on_every_shape():
     r.set_destination(0.0, {'kind': 'walk', 'x': 1.0, 'y': 0.0, 'yaw': 0.0}, 'walk', 'frontier: nearest unexplored edge')
     r.note_decision((0, 0, 0), [0.0, math.pi / 2, math.pi])
     r.junctions[0]['branches'][2]['state'] = 'BLOCKED'
-    r.fail(0.0, 2.0, 2.0, 'Nav2 ABORTED'); r.fail(1.0, 2.0, 2.0, 'Nav2 ABORTED')
+    r.fail(0.0, 2.0, 2.0, 'wall in the way'); r.fail(1.0, 2.0, 2.0, 'wall in the way')
     r.add_inspection(0.0, req('a'))
     m = E.build_markers(r)
     tags = [x for x in m if x['type'] == 'text']
@@ -191,3 +192,26 @@ def test_default_overlay_has_short_tags_on_every_shape():
     assert len({x['id'] for x in tags}) == len(tags)
     shapes = [x for x in m if x['type'] != 'text']
     assert shapes == E.build_markers(r, labels=False)
+
+
+def test_terrain_trouble_is_never_inaccessible_and_walked_spots_stay_reachable():
+    """Operator 2026-11-24: uneven terrain is not a wall; where the dog has been is reachable."""
+    assert E.classify_failure('walk ended after 0.02 m (terrain proximity hold)') == 'terrain'
+    assert E.classify_failure('no progress for 40 s') == 'terrain'
+    assert E.classify_failure('Nav2 path goes through a gap in a wall') == 'persistent'
+    assert E.classify_failure('Nav2 rejected the walk goal') == 'temporary'
+    r = rec()
+    for k in range(6):                                            # terrain: never given up, only a growing wait
+        r.fail(k * 1000.0, 2.0, 2.0, 'no progress for 40 s')
+    f = next(iter(r.failures.values()))
+    assert f['category'] == 'terrain' and r.avoided(2.0, 2.0, 5000.0 + 10) \
+        and not r.avoided(2.0, 2.0, 5000.0 + E.TERRAIN_RETRY_MAX_S + 1)
+    r = rec()
+    r.add_breadcrumb(0.0, 0.0); r.add_breadcrumb(0.3, 0.0)
+    f = r.fail(0.0, 0.3, 0.2, 'some unknown failure')            # next to the walked path
+    assert f['category'] == 'terrain'
+    for k in range(5):
+        r.fail(k * 1000.0, 0.3, 0.2, 'some unknown failure')
+    assert not r.avoided(0.3, 0.2, 5000.0 + E.TERRAIN_RETRY_MAX_S + 1)
+    w = r.fail(0.0, 0.3, 0.2, 'Nav2 path goes through a gap in a wall')
+    assert w['category'] == 'persistent'                          # a wall stays a wall

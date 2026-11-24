@@ -51,6 +51,7 @@ from .coverage import CameraCoverage
 from .course_grid import CourseGrid
 from . import goal_selection as GS
 from .scene_hints import parse_scene_hints, scene_request
+from . import wall_gaps as WG
 from .exploration_record import (ExplorationRecord, INSPECTION_ARRIVE_M, INSPECTION_WAIT_S,
                                  INSPECTION_YAW_TOL_DEG, build_markers, classify_failure)
 from .mission_events import parse_mission_event
@@ -198,6 +199,8 @@ GRID_RETURN_MIN_M = 0.8
 INFO_RADIUS_M = 1.5                    # unknown area this close to a goal counts as information gain
 CAMERA_GAIN_RADIUS_M = 2.0
 SCENE_TURN_MIN_DEG = 10.0
+PLAN_CHECK_PERIOD_S = 1.0              # while walking, check Nav2's planned path against closed wall gaps
+STRAIGHT_SOURCES = ('straight_on', 'corridor', 'corridor_walked')   # goals walked in a straight line
 PROTECTED_ENDS = ('inspection', 'passage', 'stairs', 'scene', 'exit', 'backtrack')   # never reselected
 LADDER = ('look', 'scene', 'grid_return', 'clear_costmaps', 'backtrack', 'pause')
 AUTO_RESUME_MAX_S = 60.0
@@ -1097,6 +1100,8 @@ class RoamSession:
         self.scene_requests = []                 # times of scene requests (bounded per run)
         self.stuck_window = []                   # [(t, x, y, area)] for the no-progress check
         self._reselect_t = -math.inf
+        self.wall_gaps = None                    # (mask, geo) of closed wall gaps (wall_gaps.py)
+        self._plan_check_t = -math.inf
         self.pi_gate = None                      # stopped for a Pi stairs/curtain reading: {'t'} (robot time)
         self.pi_ignore_until = -math.inf
         self._heavy_tick = None                  # robot time of the pass that already did heavy work
@@ -1732,7 +1737,8 @@ class RoamSession:
         self._course_t, self._course_map_t = now, self.map[0]
         t0 = time.monotonic()
         try:
-            self.course.update(self.map[1], self.coverage, self.record.breadcrumbs, now)
+            self.wall_gaps = WG.gap_mask(self.map[1], self.record.breadcrumbs)
+            self.course.update(self.map[1], self.coverage, self.record.breadcrumbs, now, walls=self.wall_gaps[0])
         except Exception as exc:  # noqa: BLE001 - the grid is memory only: it must never stop roaming
             self._grid_error(exc)
         self._timed('course_update', t0)
@@ -1849,8 +1855,12 @@ class RoamSession:
         cands = []
 
         def add(goal, source, reason):
-            if goal is not None and not self._goal_invalid(goal):    # endpoint: geofence, costmap, SLAM
-                cands.append(self._candidate(now, pose, goal, source, reason))
+            if goal is None or self._goal_invalid(goal):              # endpoint: geofence, costmap, SLAM
+                return
+            if source in STRAIGHT_SOURCES and self.wall_gaps is not None and \
+                    WG.crosses(self.wall_gaps[0], self.wall_gaps[1], [pose[:2], (goal['x'], goal['y'])]):
+                return                                                # straight through a gap in a wall
+            cands.append(self._candidate(now, pose, goal, source, reason))
         if not near and hasattr(self.explorer, 'straight_ahead'):
             add(self.explorer.straight_ahead(grid, pose, costmap, now), 'straight_on', self.WALK_REASONS['straight_on'])
         corridor = self._choose(grid, now, pose, forward_blocked=near)
@@ -2196,6 +2206,17 @@ class RoamSession:
                               rgb=(0.75, 0.75, 0.75), alpha=0.7))
                 out.append(_m('alternatives_tags', n, 'text', c.x, c.y, 0.28, scale=(0, 0, 0.06), alpha=0.9,
                               text=f'{c.source[:12]} {sc:.1f}'))
+        if self.wall_gaps is not None:
+            from .exploration_record import _box_edges
+            edges = []
+            boxes = WG.gap_boxes(self.wall_gaps[0], self.wall_gaps[1], near=pose[:2] if pose else None)
+            for x0, y0, x1, y1 in boxes:
+                edges += _box_edges((x0 + x1) / 2, (y0 + y1) / 2, 0.0, max(x1 - x0, 0.1), max(y1 - y0, 0.1), 0.5, 0.0)
+            if edges:
+                out.append(_m('walls', 0, 'line_list', scale=(0.03, 0, 0), rgb=(1.0, 0.25, 0.25), points=edges))
+            for n, (x0, y0, x1, y1) in enumerate(boxes[:8]):
+                out.append(_m('walls_tags', n, 'text', (x0 + x1) / 2, (y0 + y1) / 2, 0.62, scale=(0, 0, 0.07),
+                              rgb=(1.0, 0.45, 0.45), alpha=0.9, text='WALL GAP'))
         if pose is not None:
             text = self._status_text()
             rgb = (1.0, 0.6, 0.1) if text.startswith(('STUCK', 'PAUSED', 'HOLD')) else (0.4, 1.0, 0.5)
@@ -2282,8 +2303,8 @@ class RoamSession:
         # goal: _end_walk clears self.goal first. Course 2026-11-21 12:25: that lost the failed spot, so
         # roam re-picked the same terrain-blocked heading after every search round (3 x, 0.02-0.06 m each).
         failed = goal or self.goal
+        category = classify_failure(why)
         if self.record is not None:
-            category = classify_failure(why)
             if failed and failed.get('kind') == 'walk':
                 f = self.record.fail(now, failed['x'], failed['y'], why, category)
                 self.event('destination_failed', category=category, attempts=f['attempts'], retry=f['retry'])
@@ -2296,7 +2317,7 @@ class RoamSession:
         if getattr(self, 'course', None) is not None and failed and failed.get('kind') == 'walk' \
                 and getattr(self, 'walk_start', None) is not None:
             try:
-                self.course.note_failure(now, self.walk_start, (failed['x'], failed['y']), classify_failure(why))
+                self.course.note_failure(now, self.walk_start, (failed['x'], failed['y']), category)
             except Exception as exc:  # noqa: BLE001 - memory only
                 self._grid_error(exc)
         self.stats['goals_failed'] += 1
@@ -2484,6 +2505,8 @@ class RoamSession:
             self._end_walk(now, pose, f'Nav2 {result}')
         elif approaching:
             self._cancel_scan_walk(now, 'obstacle ahead (walking standoff)')
+        elif self._plan_through_wall(now):
+            self._cancel_scan_walk(now, 'Nav2 path goes through a gap in a wall')
         elif now - self.goal_sent_at > self.goal_timeout:
             self._cancel_scan_walk(now, 'timeout')
         elif now - self.progress[0] > self.cfg.stuck_s:
@@ -2493,6 +2516,15 @@ class RoamSession:
                 and self.scene_task is None and self._heavy_tick != now:
             self._reselect_t = now
             self._maybe_reselect(now, pose)
+
+    def _plan_through_wall(self, now):
+        """Nav2's latest global plan for this walk crosses a closed wall gap (a hole the dog cannot fit through)."""
+        plan = getattr(self.robot, 'nav_plan', None)
+        if plan is None or self.wall_gaps is None or now - self._plan_check_t < PLAN_CHECK_PERIOD_S \
+                or self.goal is None or plan[0] < self.goal_sent_at:
+            return False
+        self._plan_check_t = now
+        return WG.crosses(self.wall_gaps[0], self.wall_gaps[1], plan[1][::2] + plan[1][-1:])
 
     def _cancel_scan_walk(self, now, reason):
         if self.robot.nav_cancel():
@@ -2590,7 +2622,7 @@ class RoamSession:
         self.ladder, self.ladder_pending, self.scene_wait, self.scene_task = None, None, None, None
         if self.pause_auto:
             self.auto_pauses = [t for t in self.auto_pauses if now - t < 300.0] + [now]
-            delay = min(AUTO_RESUME_MAX_S, self.cfg.auto_resume_s * 2 ** (len(self.auto_pauses) - 1))
+            delay = self.cfg.auto_resume_s                # operator 2026-11-24: always the same countdown (15 s)
             self.auto_resume_at = now + delay
             self.event('paused', reason=why, auto_resume_s=_r(delay, 1))
         else:
@@ -2644,6 +2676,11 @@ class RoamSession:
         self.ladder, self.ladder_pending = None, None
         self.stuck_window = []
         self.event('resumed', speed_mode=self.speed_mode)
+        if self.cfg.decision == 'unified':
+            # Operator 2026-11-24: after a pause, turn round to scan the surroundings before choosing a way on.
+            steps = int(round(360.0 / LOOK_STEP_DEG))
+            self.look = [math.radians(LOOK_STEP_DEG)] * steps
+            self.event('resume_scan', turns_deg=[LOOK_STEP_DEG] * steps)
         return None
 
     def _switch_gait(self, name):

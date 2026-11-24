@@ -50,8 +50,8 @@ def test_choose_skips_a_destination_the_record_avoids():
 
 
 def test_failed_walks_are_recorded_and_not_repeated(tmp_path, monkeypatch, overlay):
-    """Every walk is cut short at once (a 'persistent obstacle'): each failed spot is recorded with a category and
-    never re-chosen while avoided; after max_goal_failures roam pauses with a reason."""
+    """Every walk is cut short at once (hard terrain): each failed spot is recorded as 'terrain' (operator
+    2026-11-24: uneven ground is not inaccessible) and not re-chosen before its retry wait."""
     original = R.RoamSession._end_walk
 
     def cut_short(self, now, pose, how):
@@ -62,9 +62,11 @@ def test_failed_walks_are_recorded_and_not_repeated(tmp_path, monkeypatch, overl
     monkeypatch.setattr(R.RoamSession, '_end_walk', cut_short)
     _, summary, robot, _ = roam(tmp_path, cfg=cfg(), stop_after=150)
     failed = [e for e in summary['events'] if e['event'] == 'destination_failed']
-    assert failed and all(e['category'] == 'persistent' for e in failed)
-    walks = [(e['x'], e['y']) for e in summary['events'] if e['event'] == 'walk']
-    repeats = [(a, b) for i, a in enumerate(walks) for b in walks[i + 1:] if math.hypot(a[0] - b[0], a[1] - b[1]) < 0.3]
+    assert failed and all(e['category'] == 'terrain' for e in failed)
+    from lite3_movement_tests.exploration_record import TERRAIN_RETRY_S
+    walks = [(e['t_s'], e['x'], e['y']) for e in summary['events'] if e['event'] == 'walk']
+    repeats = [(a, b) for i, a in enumerate(walks) for b in walks[i + 1:]
+               if math.hypot(a[1] - b[1], a[2] - b[2]) < 0.3 and b[0] - a[0] < TERRAIN_RETRY_S]
     assert not repeats, f'same destination re-chosen: {repeats}'
     assert summary['exploration']['failures'] >= 1
     assert any(e['event'] == 'paused' for e in summary['events']) or len(failed) < summary['config']['max_goal_failures']
@@ -162,7 +164,7 @@ def test_marker_array_starts_with_deleteall_and_converts_every_spec():
     assert all(m.header.frame_id == 'map' for m in msg.markers)
     texts = [m.text for m in msg.markers if m.type == Marker.TEXT_VIEW_FACING]
     assert any('frontier' in t for t in texts) and any(t.startswith('#1 M03') for t in texts)
-    assert any(t.startswith('J1') for t in texts) and any('x1 persistent' in t for t in texts)
+    assert any(t.startswith('J1') for t in texts) and any('x1 terrain' in t for t in texts)
     r.reset(1.0, 'map reset')
     cleared = markers_to_msg(build_markers(r), Time(sec=2))
     assert cleared.markers[0].action == Marker.DELETEALL

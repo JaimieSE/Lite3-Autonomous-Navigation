@@ -107,6 +107,11 @@ class RoamRobot(NavRobot):
             (time.monotonic(), m.data)), qos_profile_sensor_data)
         scene_pub = node.create_publisher(String, SCENE_REQUEST_TOPIC, 10)
         self.publish_scene_request = lambda text: scene_pub.publish(String(data=text))
+        # Nav2's global plan (the path the current walk will take): checked against closed wall gaps (wall_gaps.py)
+        from nav_msgs.msg import Path as NavPath
+        self.nav_plan = None
+        node.create_subscription(NavPath, '/plan', lambda m: setattr(self, 'nav_plan', (
+            time.monotonic(), [(p.pose.position.x, p.pose.position.y) for p in m.poses])), 5)
         # Stair / curtain advisory (teammate's ~/stair_curtain detector): latest message, stamped on arrival
         from .advisory import ADVISORY_TOPIC
         self.advisory = None

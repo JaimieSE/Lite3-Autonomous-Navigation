@@ -143,8 +143,7 @@ def test_repeated_dead_ends_go_down_the_ladder_and_pauses_resume_by_themselves(t
     assert 'stuck' in n and 'auto_resumed' in n
     pauses = [e for e in summary['events'] if e['event'] == 'paused']
     assert pauses and all('auto_resume_s' in p for p in pauses)
-    if len(pauses) > 1:
-        assert pauses[1]['auto_resume_s'] > pauses[0]['auto_resume_s']              # backs off
+    assert all(p['auto_resume_s'] == 10.0 for p in pauses)                        # always the same countdown
     failed = [e for e in summary['events'] if e['event'] == 'destination_failed']
     assert all(e['attempts'] <= 3 for e in failed)                                 # bounded retries
     assert outcome == 'STOPPED' and summary['course_grid'] is not None
@@ -343,7 +342,38 @@ def test_auto_resume_accepts_a_robot_standing_and_stepping_in_place(tmp_path, mo
         n = names(summary)
         assert 'paused' in n
         if resumes:
-            assert 'auto_resumed' in n
+            assert 'auto_resumed' in n and 'resume_scan' in n
         else:
             assert 'auto_resumed' not in n and 'tilt' in first(summary, 'auto_resume_refused')['reason']
             assert first(summary, 'resume_refused_posture')['reasons'][-1] == 'body tilt exceeds limit'
+
+
+def test_after_resuming_it_turns_round_to_scan_first(tmp_path):
+    """Operator 2026-11-24: resuming after a pause rotates to scan the surroundings; the countdown is 15 s."""
+    _, summary, _, _ = roam(tmp_path, script=[(10, 'pause', None), (14, 'resume', None)], stop_after=70, cfg=cfg())
+    ev, n = summary['events'], names(summary)
+    i = n.index('resume_scan')
+    assert first(summary, 'resume_scan')['turns_deg'] == [R.LOOK_STEP_DEG] * 8
+    after = [e for e in ev[i + 1:] if e['event'] in ('spin', 'walk')]
+    assert after and after[0]['event'] == 'spin'                                  # turns before it walks on
+    assert R.RoamConfig().auto_resume_s == 0.0
+    assert R.build_config(R.parse(['run', '--speed-limit', '0.5']), {'MAX_SPEED': '0.5'}).auto_resume_s == 15.0
+
+
+def test_a_nav2_path_through_a_wall_gap_is_cancelled(tmp_path, monkeypatch):
+    import types
+    import numpy as np
+    from lite3_movement_tests import wall_gaps as WG
+    s = R.RoamSession(types.SimpleNamespace(now=lambda: 10.0), cfg(), 'sim', types.SimpleNamespace(),
+                      log=lambda *_: None)
+    gaps = np.zeros((40, 40), dtype=bool)
+    gaps[:, 20] = True                                                           # a closed gap line at x = 1.0
+    s.wall_gaps = (gaps, (0.05, 0.0, 0.0))
+    s.goal, s.goal_sent_at = {'kind': 'walk', 'x': 1.8, 'y': 0.5}, 5.0
+    s.robot.nav_plan = (6.0, [(0.2, 0.5), (1.0, 0.5), (1.8, 0.5)])
+    assert s._plan_through_wall(10.0)
+    s._plan_check_t, s.robot.nav_plan = -1e9, (6.0, [(0.2, 0.5), (0.9, 0.5)])
+    assert not s._plan_through_wall(10.0)
+    s._plan_check_t, s.robot.nav_plan = -1e9, (4.0, [(0.2, 0.5), (1.8, 0.5)])   # plan older than this walk
+    assert not s._plan_through_wall(10.0)
+    assert WG.crosses(gaps, (0.05, 0.0, 0.0), [(0.2, 0.5), (1.8, 0.5)])

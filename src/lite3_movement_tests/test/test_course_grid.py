@@ -111,3 +111,14 @@ def test_map_reset_clears_memory_and_markers_are_bounded():
     assert s['cells_visited'] == 1 and s['blocked_connections'] == 1
     g.reset('b')
     assert g.cells == {} and g.edge_failures == {} and g.session == 'b'
+
+
+def test_a_visited_cell_is_explored_never_a_place_to_come_back_to():
+    slam = grid_of(free=[(-0.5, 2.5, -0.5, 0.5)])
+    g = CourseGrid(0.0, 0.0, 0.0)
+    g.update(slam, CameraCoverage((0.0, 0.0), 4.0), breadcrumbs=[(1.0, 0.0)])
+    assert not g.unfinished((1, 0)) and g.unfinished((2, 0))       # walked through (1, 0); (2, 0) not yet
+    g.note_failure(0.0, (0.0, 0.0), (1.0, 0.0), 'terrain')
+    for t in (1.0, 100.0, 1000.0):
+        g.note_failure(t, (0.0, 0.0), (1.0, 0.0), 'terrain')
+    assert g.connection((0, 0), (1, 0), 5000.0) == 'open'           # terrain trouble never blocks for good

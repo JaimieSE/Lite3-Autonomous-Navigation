@@ -44,6 +44,12 @@ TEMP_RETRY_AFTER_S = 10.0            # temporary failure: retry after this ...
 TEMP_MAX_ATTEMPTS = 3                # ... at most this many attempts
 PERSIST_AVOID_S = 120.0              # persistent failure: avoid this long ...
 PERSIST_MAX_ATTEMPTS = 2             # ... and for good after this many
+# Operator 2026-11-24: "difficulty crossing the terrain should not indicate inaccessible as the walls are blatantly
+# left there as a proper guide". Terrain trouble (standoff, terrain hold, no progress, Nav2 abort) is 'terrain':
+# retried after a growing wait, never given up. Spots on or next to the walked path are reachable by definition.
+TERRAIN_RETRY_S = 20.0               # terrain failure: retry after this, doubling per attempt ...
+TERRAIN_RETRY_MAX_S = 160.0          # ... up to this; never for good
+WALKED_NEAR_M = 0.5                  # a destination this close to the walked path has been reached before
 MAX_FAILURES = 200
 
 INSPECTION_ARRIVE_M = 0.35           # at the viewpoint
@@ -57,17 +63,28 @@ MAX_INSPECTIONS = 50
 MAP_RESET_FRACTION = 0.5             # known map area below this fraction of its peak ...
 MAP_RESET_MIN_PEAK_M2 = 4.0          # ... (once the peak is meaningful) = the map was reset
 
-TEMPORARY_HINTS = ('rejected', 'cancellation', 'stale', 'telemetry', 'link', 'hold', 'status_', 'did not acknowledge')
-PERSISTENT_HINTS = ('obstacle', 'standoff', 'no progress', 'aborted', 'walk ended after', 'timeout', 'blocked')
+TEMPORARY_HINTS = ('rejected', 'cancellation', 'stale', 'telemetry', 'link', 'status_', 'did not acknowledge')
+WALL_HINTS = ('wall',)                # only walls make a destination inaccessible
+TERRAIN_HINTS = ('obstacle', 'standoff', 'no progress', 'aborted', 'walk ended after', 'timeout', 'hold', 'terrain',
+                 'stuck', 'spin stalled')
 
 
 def classify_failure(reason):
-    """'temporary' (telemetry, link, navigation server hiccups: retry soon) or 'persistent' (something physical in
-    the way: avoid). Unknown reasons count as persistent (the safe side for goal selection)."""
+    """'persistent' (a wall: avoid), 'temporary' (telemetry, link, navigation server hiccups: retry soon) or
+    'terrain' (uneven ground made it hard: retry after a growing wait, never given up). Unknown reasons count as
+    persistent (the safe side for goal selection)."""
     text = str(reason).lower()
+    if any(h in text for h in WALL_HINTS):
+        return 'persistent'
     if any(h in text for h in TEMPORARY_HINTS):
         return 'temporary'
+    if any(h in text for h in TERRAIN_HINTS):
+        return 'terrain'
     return 'persistent'
+
+
+def terrain_wait(attempts):
+    return min(TERRAIN_RETRY_MAX_S, TERRAIN_RETRY_S * 2 ** max(0, attempts - 1))
 
 
 def _wrap(a):
@@ -245,10 +262,14 @@ class ExplorationRecord:
 
     def fail(self, now, x, y, reason, category=None):
         category = category or classify_failure(reason)
+        if category == 'persistent' and 'wall' not in str(reason).lower() and self.walked_near(x, y):
+            category = 'terrain'                         # been there: reachable, only hard going
         k = self._fkey(x, y)
         f = self.failures.get(k) or {'x': x, 'y': y, 'attempts': 0}
         f.update(reason=str(reason), category=category, last=now, attempts=f['attempts'] + 1)
-        if category == 'temporary':
+        if category == 'terrain':
+            f['retry'] = f'retry after {terrain_wait(f["attempts"]):.0f} s'
+        elif category == 'temporary':
             f['retry'] = (f'retry after {TEMP_RETRY_AFTER_S:.0f} s' if f['attempts'] < TEMP_MAX_ATTEMPTS
                           else f'given up after {f["attempts"]} attempts')
         else:
@@ -260,6 +281,9 @@ class ExplorationRecord:
             del self.failures[oldest]
         self._changed()
         return f
+
+    def walked_near(self, x, y, radius=WALKED_NEAR_M):
+        return any(math.hypot(x - bx, y - by) <= radius for bx, by in self.breadcrumbs)
 
     def succeeded(self, x, y):
         if self.failures.pop(self._fkey(x, y), None) is not None:
@@ -273,7 +297,11 @@ class ExplorationRecord:
                 f = self.failures.get((k[0] + dx, k[1] + dy))
                 if f is None or math.hypot(x - f['x'], y - f['y']) > FAIL_KEY_M:
                     continue
-                if f['category'] == 'temporary':
+                wall = f['category'] == 'persistent' and 'wall' in f['reason'].lower()
+                if f['category'] == 'terrain' or (not wall and self.walked_near(f['x'], f['y'])):
+                    if now - f['last'] < terrain_wait(f['attempts']):
+                        return True                    # walked there before: only a growing wait, never for good
+                elif f['category'] == 'temporary':
                     if f['attempts'] >= TEMP_MAX_ATTEMPTS or now - f['last'] < TEMP_RETRY_AFTER_S:
                         return True
                 elif f['attempts'] >= PERSIST_MAX_ATTEMPTS or now - f['last'] < PERSIST_AVOID_S:
