@@ -327,3 +327,23 @@ def test_after_the_climb_the_stairs_behind_do_not_stop_it_again(tmp_path, monkey
     done = first(summary, 'stairs_done')['t_s']
     later = [e for e in summary['events'] if e['event'] == 'pi_obstacle_stop' and done < e['t_s'] < done + R.STAIR_COOLDOWN_S]
     assert not later
+
+
+def test_auto_resume_accepts_a_robot_standing_and_stepping_in_place(tmp_path, monkeypatch):
+    """Physical 2026-11-24: rug_hstep keeps stepping in place while standing, so 'joints still moving' refused every
+    auto-resume. Standing with moving joints resumes; a tilted body still refuses, with the posture logged."""
+    from lite3_movement_tests.runner import SequenceRunner
+    no_goal_until(monkeypatch, 1e9)
+    monkeypatch.setattr(R.RoamSession, '_grid_returns', lambda self, now, pose, relaxed=False: [])
+    monkeypatch.setattr(R.RoamSession, '_backtrack', lambda self, now, pose: False)
+    for reasons, resumes in ((['joints still moving'], True), (['joints still moving', 'body tilt exceeds limit'], False)):
+        monkeypatch.setattr(SequenceRunner, '_standing_precondition', lambda self, require_still=True, r=reasons: (
+            False, {'posture': {'posture': 'standing', 'reasons': list(r), 'tilt_rad': None, 'extensions_m': {}}}))
+        _, summary, _, _ = roam(tmp_path, stop_after=150, cfg=cfg(auto_resume_s=5.0))
+        n = names(summary)
+        assert 'paused' in n
+        if resumes:
+            assert 'auto_resumed' in n
+        else:
+            assert 'auto_resumed' not in n and 'tilt' in first(summary, 'auto_resume_refused')['reason']
+            assert first(summary, 'resume_refused_posture')['reasons'][-1] == 'body tilt exceeds limit'

@@ -2618,7 +2618,17 @@ class RoamSession:
             return f'not resumed: {why}'
         ok, pre = self.runner._standing_precondition(require_still=False)
         if not ok and self.robot.can_actuate:
-            return 'not resumed: robot not verified standing'
+            # Physical 2026-11-24 10:18: every auto-resume was refused while the robot stood in rug_hstep, which
+            # keeps stepping in place - the joints never settle. For a resume, standing with moving joints is fine;
+            # tilt, disagreeing legs, invalid IMU or not standing still refuse.
+            from .geometry import STANDING
+            posture = pre.get('posture', {})
+            others = [r for r in posture.get('reasons', []) if r != 'joints still moving']
+            if not (posture.get('posture') == STANDING and not others):
+                self.event('resume_refused_posture', posture=posture.get('posture'), reasons=posture.get('reasons'),
+                           tilt_rad=posture.get('tilt_rad'), extensions_m=posture.get('extensions_m'))
+                return (f'not resumed: robot not verified standing ({posture.get("posture")}: '
+                        f'{", ".join(posture.get("reasons", [])) or "uncertain"})')
         problem = self._set_speed(self.speed_mode)
         if problem:
             return f'not resumed: {problem}'
