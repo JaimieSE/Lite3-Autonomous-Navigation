@@ -17,6 +17,9 @@ import math
 import numpy as np
 
 GAP_M = 0.40                 # holes narrower than this in a wall are closed (Lite3 body ~0.39 m wide)
+MIN_WALL_CELLS = 7           # occupied blobs smaller than this (~0.35 m of wall) are speckles, not walls (runs 17:07
+                             # and 17:17: 1375 of 1427 blobs were <= 5 cells; closing joined them into fake walls)
+MAX_FILL_M = 0.5             # a closed gap is thin (a hole in a wall); a filled blob wider than this both ways is not
 WALKED_CLEAR_M = 0.25        # never close a gap within this of the walked path
 MAX_BOXES = 30
 
@@ -33,9 +36,20 @@ def gap_mask(grid, walked=(), gap_m=GAP_M):
     data = np.asarray(grid.data, dtype=np.int16).reshape(grid.height, grid.width)
     res = grid.resolution
     occupied = data > 50
+    labels, _ = ndimage.label(occupied, structure=np.ones((3, 3)))
+    sizes = np.bincount(labels.ravel())
+    keep = sizes >= MIN_WALL_CELLS
+    keep[0] = False
+    walls = keep[labels]                                   # speckles dropped: only real wall segments are joined
     r = max(1, int(round(gap_m / 2 / res)))
-    closed = ndimage.binary_closing(occupied, structure=_disc(r), iterations=1)
+    closed = ndimage.binary_closing(walls, structure=_disc(r), iterations=1)
     gaps = closed & ~occupied
+    if gaps.any():                                         # keep thin holes in walls, drop filled blobs
+        glab, _ = ndimage.label(gaps, structure=np.ones((3, 3)))
+        limit = int(round(MAX_FILL_M / res))
+        for k, sl in enumerate(ndimage.find_objects(glab), start=1):
+            if sl is not None and (sl[0].stop - sl[0].start) > limit and (sl[1].stop - sl[1].start) > limit:
+                gaps[sl] &= glab[sl] != k
     if walked:
         free = np.zeros_like(gaps)
         for x, y in walked:
