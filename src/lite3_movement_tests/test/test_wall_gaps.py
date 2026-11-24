@@ -59,3 +59,12 @@ def test_unmapped_floor_next_to_the_course_floor_is_a_frontier_goal():
     geo = (0.05, g.origin_x, g.origin_y)
     assert WG.in_course(data, reach, geo, 1.3, 0.0)                   # 0.3 m into the unknown: a frontier
     assert not WG.in_course(data, reach, geo, 2.5, 0.0)               # far into the unknown: no
+
+
+def test_speckles_are_not_joined_into_walls():
+    """Runs 2026-11-24 17:07 / 17:17: LiDAR speckles 0.2-0.4 m apart were closed into 'walls' (8372 gap cells)."""
+    import numpy as np
+    speckles = [(x, y, x + 0.05, y + 0.05) for x in np.arange(-1.0, 1.0, 0.3) for y in np.arange(-1.0, 1.0, 0.3)]
+    g = grid_of(free=[(-2.0, 2.0, -2.0, 2.0)], occupied=[(x0, x1, y0, y1) for x0, y0, x1, y1 in speckles])
+    gaps, geo = WG.gap_mask(g)
+    assert gaps.sum() == 0 and not WG.crosses(gaps, geo, [(-1.5, 0.0), (1.5, 0.0)])
