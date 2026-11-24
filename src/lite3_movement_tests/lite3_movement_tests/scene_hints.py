@@ -79,7 +79,8 @@ def parse_scene_hints(text):
 def pi_stair_curtain(text):
     """The detector reading inside one Pi detections message, as the advisory JSON roam already acts on (same
     detector as ~/stair_curtain on the Pi: obstacle, reason, distance_m, distance_reference,
-    heading_correction_deg), plus "capture_stamp_ns" of the frame. None if the message has no such reading."""
+    heading_correction_deg), plus "capture_stamp_ns": the reading's own frame
+    (stair_curtain.stamp_ns). None if the message has no such reading."""
     try:
         msg = json.loads(text)
     except (TypeError, ValueError):
@@ -87,7 +88,9 @@ def pi_stair_curtain(text):
     sc = msg.get('stair_curtain') if isinstance(msg, dict) else None
     if not isinstance(sc, dict):
         return None
-    stamp = msg.get('capture_stamp_ns', sc.get('stamp_ns'))
+    # stair_curtain.stamp_ns is the colour frame the reading came from (Pi session 2026-11-24); the top-level
+    # capture_stamp_ns belongs to the YOLO frame and can be newer. Fall back to it only when stamp_ns is missing.
+    stamp = sc.get('stamp_ns') if type(sc.get('stamp_ns')) is int else msg.get('capture_stamp_ns')
     return json.dumps(dict(sc, capture_stamp_ns=stamp if type(stamp) is int else None))
 
 

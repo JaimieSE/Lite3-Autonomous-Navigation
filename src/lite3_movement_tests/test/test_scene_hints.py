@@ -30,3 +30,15 @@ def test_scene_prompt_fields_and_openings_map_regions_to_bearings():
 def test_request_format():
     r = json.loads(scene_request('s1', 'stuck', (1.0, 2.0, 0.5), 'run-1', 12.0))
     assert r['request_id'] == 's1' and r['pose'] == {'x': 1.0, 'y': 2.0, 'yaw': 0.5} and r['map_session'] == 'run-1'
+
+
+def test_pi_reading_uses_its_own_frame_stamp_not_the_yolo_frame():
+    from lite3_movement_tests.scene_hints import pi_stair_curtain
+    msg = {'capture_stamp_ns': 2_000, 'stair_curtain': {'obstacle': 'stairs', 'reason': 'confirmed', 'stamp_ns': 1_000,
+                                                         'distance_m': 0.8, 'distance_reference': 'base_link_forward',
+                                                         'heading_correction_deg': 3.0}}
+    out = json.loads(pi_stair_curtain(json.dumps(msg)))
+    assert out['capture_stamp_ns'] == 1_000 and out['reason'] == 'confirmed'
+    del msg['stair_curtain']['stamp_ns']
+    assert json.loads(pi_stair_curtain(json.dumps(msg)))['capture_stamp_ns'] == 2_000
+    assert pi_stair_curtain(json.dumps({'frame': 1})) is None
