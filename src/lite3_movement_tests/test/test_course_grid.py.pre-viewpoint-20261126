@@ -1,0 +1,234 @@
+import math
+
+import pytest
+
+from lite3_locomotion.frontiers import Grid
+from lite3_movement_tests.course_grid import CourseGrid
+from lite3_movement_tests.coverage import CameraCoverage
+
+RES = 0.05
+
+
+def grid_of(free=(), occupied=(), x0=-3.0, y0=-3.0, size_m=8.0):
+    """SLAM grid: unknown everywhere except the free / occupied rectangles (x0, x1, y0, y1)."""
+    n = int(size_m / RES)
+    data = [-1] * (n * n)
+    for rects, val in ((free, 0), (occupied, 100)):
+        for ax, bx, ay, by in rects:
+            for j in range(n):
+                y = y0 + (j + 0.5) * RES
+                if ay <= y <= by:
+                    for i in range(n):
+                        x = x0 + (i + 0.5) * RES
+                        if ax <= x <= bx:
+                            data[j * n + i] = val
+    return Grid(n, n, RES, data, x0, y0)
+
+
+def test_alignment_follows_the_start_pose_not_the_map_axes():
+    g = CourseGrid(1.0, 2.0, math.radians(90))
+    assert g.cell(1.0, 2.0) == (0, 0)
+    assert g.cell(1.0, 3.0) == (1, 0)                # +X of the grid is the start heading (map +Y here)
+    assert g.cell(0.0, 2.0) == (0, 1)
+    x, y = g.centre(2, 0)
+    assert math.isclose(x, 1.0, abs_tol=1e-9) and math.isclose(y, 4.0, abs_tol=1e-9)
+    with pytest.raises(ValueError):
+        CourseGrid(0, 0, 0, cell_m=0.1)
+
+
+def test_mapped_visited_and_seen_are_distinct():
+    slam = grid_of(free=[(-0.5, 2.5, -0.5, 0.5)])
+    cov = CameraCoverage((0.0, 0.0), 4.0)
+    g = CourseGrid(0.0, 0.0, 0.0)
+    g.update(slam, cov, breadcrumbs=[(0.0, 0.0)])
+    a, b = g.cells[(0, 0)], g.cells[(2, 0)]
+    assert a['visited'] and not b['visited']
+    assert a['mapped'] > 0.9 and b['mapped'] > 0.4
+    assert a['seen'] == 0.0 and b['seen'] == 0.0      # mapped and walked, but the camera saw nothing yet
+    cov.update((0.0, 0.0, 0.0), slam)                 # look along +X
+    g.update(slam, cov, breadcrumbs=[(0.0, 0.0)])
+    assert g.cells[(2, 0)]['seen'] > 0.5 and not g.cells[(2, 0)]['visited']   # seen without being walked
+
+
+def test_unfinished_means_unseen_floor_or_an_open_way_into_unmapped_space():
+    slam = grid_of(free=[(-0.5, 1.8, -0.5, 0.5)])     # the floor runs on past the cell edge into (2, 0)
+    cov = CameraCoverage((0.0, 0.0), 4.0)
+    g = CourseGrid(0.0, 0.0, 0.0)
+    g.update(slam, cov)
+    assert g.unfinished((1, 0))                       # not seen yet
+    for yaw in (0.0, math.pi / 2, math.pi, -math.pi / 2):
+        for x in (0.0, 1.0):
+            cov.update((x, 0.0, yaw), slam)
+    g.update(slam, cov)
+    assert g.cells[(1, 0)]['seen'] >= 0.7
+    assert g.cells[(2, 0)]['mapped'] < 0.5
+    assert g.unfinished((1, 0))                       # seen, but open floor runs on into mostly unmapped (2, 0)
+    walled = grid_of(free=[(-0.5, 1.4, -0.5, 0.5)], occupied=[(1.4, 1.6, -0.6, 0.6), (-0.6, 1.6, 0.5, 0.65),
+                                                              (-0.6, 1.6, -0.65, -0.5), (-0.65, -0.5, -0.6, 0.6)])
+    cov2 = CameraCoverage((0.0, 0.0), 4.0)
+    for yaw in (0.0, math.pi / 2, math.pi, -math.pi / 2):
+        for x in (0.0, 1.0):
+            cov2.update((x, 0.0, yaw), walled)
+    g.update(walled, cov2)
+    assert g.unfinished((1, 0))                      # looked at but never walked: still to explore (2026-11-24)
+    g.update(walled, cov2, breadcrumbs=[(1.0, 0.0)])
+    assert not g.unfinished((1, 0))                  # walked through: explored
+
+
+def test_connection_states_and_failure_memory():
+    slam = grid_of(free=[(-0.5, 1.5, -0.5, 0.5)], occupied=[(-0.5, 1.5, 0.48, 0.6)])
+    g = CourseGrid(0.0, 0.0, 0.0)
+    g.update(slam)
+    assert g.connection((0, 0), (1, 0), 0.0) == 'open'
+    assert g.connection((0, 0), (0, 1), 0.0) == 'blocked'           # wall along the shared edge
+    assert g.connection((1, 0), (2, 0), 0.0) == 'unknown'
+    g.note_failure(0.0, (0.0, 0.0), (1.0, 0.0), 'temporary')
+    assert g.connection((0, 0), (1, 0), 1.0) == 'blocked'
+    assert g.connection((0, 0), (1, 0), 11.0) == 'open'             # temporary: retried after 10 s
+    g.note_failure(20.0, (0.0, 0.0), (2.5, 0.2), 'persistent')      # far goal: blocks the first connection
+    assert g.connection((0, 0), (1, 0), 21.0) == 'blocked'
+    g.note_failure(200.0, (0.0, 0.0), (1.0, 0.0), 'persistent')
+    assert g.connection((0, 0), (1, 0), 1000.0) == 'blocked'        # bounded: 2 persistent failures -> stays
+
+
+def test_return_point_moves_off_a_blocked_centre():
+    slam = grid_of(free=[(1.0, 3.0, -1.0, 1.0)], occupied=[(1.9, 2.1, -0.1, 0.1)])   # pillar on the centre
+    g = CourseGrid(0.0, 0.0, 0.0)
+    g.update(slam)
+    p = g.return_point((2, 0))
+    assert p is not None and math.dist(p, (2.0, 0.0)) > 0.2
+    assert g.return_point((5, 5)) is None
+
+
+def test_map_reset_clears_memory_and_markers_are_bounded():
+    slam = grid_of(free=[(-0.5, 3.5, -0.5, 0.5)])
+    g = CourseGrid(0.0, 0.0, 0.0, session='a')
+    g.update(slam, breadcrumbs=[(0.0, 0.0)])
+    g.note_failure(0.0, (0.0, 0.0), (1.0, 0.0), 'persistent')
+    m = g.markers(0.0, robot_xy=(0.0, 0.0))
+    assert {x['type'] for x in m} >= {'cube_list', 'line_list', 'text'}
+    assert sum(1 for x in m if x['type'] == 'text') <= 5
+    assert all(len(x['text']) <= 20 for x in m)
+    s = g.summary()
+    assert s['cells_visited'] == 1 and s['blocked_connections'] == 1
+    g.reset('b')
+    assert g.cells == {} and g.edge_failures == {} and g.session == 'b'
+
+
+def test_a_visited_cell_is_explored_never_a_place_to_come_back_to():
+    slam = grid_of(free=[(-0.5, 2.5, -0.5, 0.5)])
+    g = CourseGrid(0.0, 0.0, 0.0)
+    g.update(slam, CameraCoverage((0.0, 0.0), 4.0), breadcrumbs=[(1.0, 0.0)])
+    assert g.unfinished((1, 0))                                    # walked, but the camera has not covered it
+    g.note_inspection((1, 0))
+    g.note_inspection((1, 0))
+    assert not g.unfinished((1, 0)) and g.unfinished((2, 0))       # two inspection visits: done; (2, 0) not yet
+    g.note_failure(0.0, (0.0, 0.0), (1.0, 0.0), 'terrain')
+    for t in (1.0, 100.0, 1000.0):
+        g.note_failure(t, (0.0, 0.0), (1.0, 0.0), 'terrain')
+    assert g.connection((0, 0), (1, 0), 5000.0) == 'open'           # terrain trouble never blocks for good
+
+
+def test_cells_outside_the_course_walls_are_never_come_back_targets():
+    from lite3_movement_tests import wall_gaps as WG
+    slam = grid_of(free=[(-0.5, 3.5, -0.5, 0.5)], occupied=[(1.45, 1.55, -0.6, 0.6)])   # wall at x = 1.5
+    reach = WG.reachable_mask(slam, (0.0, 0.0))
+    g = CourseGrid(0.0, 0.0, 0.0)
+    g.update(slam, CameraCoverage((0.0, 0.0), 4.0), reach=reach)
+    assert g.unfinished((1, 0)) and not g.cells[(3, 0)]['reachable'] and not g.unfinished((3, 0))
+
+
+def test_explored_means_walked_through_not_just_seen():
+    """Operator 2026-11-24 (grid runs): everything the camera saw counted as explored and the dog stopped 1.4 m out."""
+    slam = grid_of(free=[(-0.5, 3.5, -0.5, 0.5)])
+    cov = CameraCoverage((0.0, 0.0), 5.0)
+    for yaw in (0.0, 3.14159):
+        cov.update((0.0, 0.0, yaw), slam)
+    g = CourseGrid(0.0, 0.0, 0.0)
+    g.update(slam, cov, breadcrumbs=[(0.0, 0.0)])
+    assert g.cells[(2, 0)]['seen'] > 0.7 and g.unfinished((2, 0))
+    assert 0.5 <= g.pull(2.0, 0.0) < 1.0                  # seen but not walked: still half the pull
+    assert g.inspected((0, 0)) == (g.cells[(0, 0)]['seen'] >= 0.5)   # walked: inspected once the camera covered it
+
+
+# ---------------------------------------------------------------------------------- operator 2026-11-25
+def _room_map(open_side=True):
+    """Floor x -0.5..2.5, y -0.5..0.5; cell (2, 0) walled on three sides (top, bottom, far end), open to (1, 0)."""
+    walls = [(-0.6, 2.6, 0.5, 0.6), (-0.6, 2.6, -0.6, -0.5), (2.5, 2.6, -0.6, 0.6)]
+    if not open_side:
+        walls.append((1.47, 1.53, -0.6, 0.6))
+    return grid_of(free=[(-0.5, 2.5, -0.5, 0.5)], occupied=walls)
+
+
+def test_three_walls_round_a_cell_make_a_room_read_from_its_open_side():
+    g = CourseGrid(0.0, 0.0, 0.0)
+    g.update(_room_map())
+    assert g.cells[(2, 0)]['walls'] == 3 and g.is_room((2, 0)) and (2, 0) in g.rooms_unread()
+    x, y, yaw = g.room_viewpoint((2, 0))
+    assert math.dist((x, y), g.centre(1, 0)) < 0.2 and abs(yaw) < 0.3      # middle of (1, 0), facing the room
+    g.mark_room_read((2, 0), 'kitchen')
+    assert (2, 0) not in g.rooms_unread() and g.summary()['rooms_read'] == {'2,0': 'kitchen'}
+    texts = [m['text'] for m in g.markers() if m['ns'] == 'grid_rooms']
+    assert 'ROOM read' in texts
+
+
+def test_a_passage_that_opens_is_reported_once():
+    g = CourseGrid(0.0, 0.0, 0.0)
+    g.update(_room_map(open_side=False))
+    assert g.edges[frozenset(((1, 0), (2, 0)))] == 'blocked'
+    g.update(_room_map(open_side=True))
+    assert frozenset(((1, 0), (2, 0))) in g.reopened
+    g.update(_room_map(open_side=True))
+    assert g.reopened == []
+
+
+def test_goal_points_are_the_middle_of_the_cell_when_it_is_free():
+    g = CourseGrid(0.0, 0.0, 0.0)
+    g.update(grid_of(free=[(-0.5, 3.5, -1.5, 1.5)]))
+    p = g.return_point((1, 0))
+    assert math.dist(p, (1.0, 0.0)) <= 0.15 and math.dist(g.centre_point((1, 0)), (1.0, 0.0)) <= 0.15
+    blocked = grid_of(free=[(-0.5, 3.5, -1.5, 1.5)], occupied=[(0.9, 1.1, -0.1, 0.1)])
+    g.update(blocked)
+    assert g.centre_point((1, 0)) is None and math.dist(g.return_point((1, 0)), (1.0, 0.0)) > 0.15
+
+
+def test_pending_mission_evidence_keeps_a_walked_cell_uninspected():
+    g = CourseGrid(0.0, 0.0, 0.0)
+    g.update(grid_of(free=[(-0.5, 2.5, -0.5, 0.5)]), breadcrumbs=[(1.0, 0.0)])
+    g.note_inspection((1, 0))
+    g.note_inspection((1, 0))
+    g.mark_pending((1, 0), 'survivor: QR not read yet')
+    assert g.unfinished((1, 0))
+    g.resolve((1, 0))
+    assert not g.unfinished((1, 0))
+    g.block_cell((2, 0), 0.0, 20.0)
+    assert not g.unfinished((2, 0), 5.0) and g.unfinished((2, 0), 25.0)
+
+
+def test_a_prop_beside_a_cell_is_not_a_wall_and_a_visited_cell_is_never_a_room():
+    """Operator 2026-11-25 (Arena B 18:04 SGT): the start cell between the kitchen set and another prop was read as a
+    room. A wall runs along >= 80 % of a side; a visited cell (the start cell included) is never a room."""
+    walls = [(-0.6, 2.6, 0.5, 0.6), (-0.6, 2.6, -0.6, -0.5)]               # long walls above and below
+    prop = grid_of(free=[(-0.5, 2.5, -0.5, 0.5)], occupied=walls + [(2.5, 2.6, -0.2, 0.2)])   # 0.4 m prop at the end
+    g = CourseGrid(0.0, 0.0, 0.0)
+    g.update(prop)
+    assert g.side_cover((2, 0), (3, 0)) < 0.8 and g.cells[(2, 0)]['walls'] == 2       # the prop is not a wall
+    g.update(_room_map())
+    assert g.side_cover((2, 0), (3, 0)) >= 0.8 and g.cells[(2, 0)]['walls'] == 3 and g.is_room((2, 0))
+    g.update(_room_map(), breadcrumbs=[(2.0, 0.0)])
+    assert not g.is_room((2, 0))
+
+
+def test_two_walls_make_a_room_operator_2026_11_26():
+    """Operator 2026-11-26: a cell walled on 2 sides is a room (was 3). A corner counts, and so does a corridor
+    cell between two parallel walls; a cell with one wall does not."""
+    from lite3_movement_tests.course_grid import ROOM_WALLS
+    assert ROOM_WALLS == 2
+    corner = grid_of(free=[(-0.5, 2.5, -1.5, 0.5)], occupied=[(-0.6, 2.6, 0.5, 0.6), (2.5, 2.6, -1.6, 0.6)])
+    g = CourseGrid(0.0, 0.0, 0.0)
+    g.update(corner)
+    assert g.cells[(2, 0)]['walls'] == 2 and g.is_room((2, 0))              # top + far end: a corner
+    assert g.cells[(1, -1)]['walls'] == 0 and not g.is_room((1, -1))
+    assert g.cells[(1, 0)]['walls'] == 1 and not g.is_room((1, 0))          # one wall only
+    g.update(_room_map())
+    assert g.cells[(1, 0)]['walls'] == 2 and g.is_room((1, 0))              # corridor: walls above and below

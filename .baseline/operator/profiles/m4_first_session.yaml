@@ -1,0 +1,16 @@
+# First supervised M4 session: slower, shorter, and stricter on sensing than the defaults.
+# Put the obstacle 0.8-1.0 m ahead (it is then tracked from the first step, which also arms the
+# odometry budget to it, independent of the LiDAR).
+description: First session - 0.03 m/s, up to 1.0 m, stricter sensor freshness
+m4:
+  approach_speed: 0.03
+  max_travel: 1.0
+  max_duration: 45
+  detection_range: 1.5
+  max_sensor_age: 0.25
+  min_lidar_hz: 9
+  detect_scans: 3
+  track_tolerance: 0.15
+  lost_track_scans: 2
+  suppression_proof: 1.0
+  response_limit: 0.25

@@ -16,9 +16,10 @@ import math
 
 import numpy as np
 
-GAP_M = 0.40                 # holes narrower than this in a wall are closed (Lite3 body ~0.39 m wide)
-MIN_WALL_CELLS = 7           # occupied blobs smaller than this (~0.35 m of wall) are speckles, not walls (runs 17:07
-                             # and 17:17: 1375 of 1427 blobs were <= 5 cells; closing joined them into fake walls)
+GAP_M = 0.40                 # closing disc diameter; on the 5 cm SLAM grid this closes holes up to ~0.2-0.25 m only
+                             # (0.30-0.35 closes nothing at all). Operator 2026-11-25 "more lenient": see MIN_WALL_CELLS
+MIN_WALL_CELLS = 10          # occupied blobs smaller than this (~0.5 m of wall) are not walls (was 7, ~0.35 m; runs
+                             # 17:07 / 17:17: 1375 of 1427 blobs were <= 5 cells; closing joined them into fake walls)
 MAX_FILL_M = 0.5             # a closed gap is thin (a hole in a wall); a filled blob wider than this both ways is not
 WALKED_CLEAR_M = 0.25        # never close a gap within this of the walked path
 MAX_BOXES = 30
@@ -28,6 +29,23 @@ def _disc(radius_cells):
     r = int(radius_cells)
     yy, xx = np.mgrid[-r:r + 1, -r:r + 1]
     return xx * xx + yy * yy <= r * r + r
+
+
+def speckle_mask(data, res=0.05, gap_m=GAP_M):
+    """Bool mask of LiDAR speckle: occupied cells whose cluster stays smaller than MIN_WALL_CELLS even after joining
+    every occupied cell within gap_m (a small object barely in the scan slice, a stray return). A wall mapped with
+    holes is many short pieces within gap_m of each other, so it joins into one large cluster and is never speckle.
+    data: SLAM array (height, width), -1/0..100."""
+    from scipy import ndimage
+    occupied = np.asarray(data) > 50
+    if not occupied.any():
+        return occupied
+    joined = ndimage.binary_dilation(occupied, structure=_disc(max(1, int(round(gap_m / 2 / res)))))
+    labels, _ = ndimage.label(joined, structure=np.ones((3, 3)))
+    counts = np.bincount(labels[occupied], minlength=labels.max() + 1)
+    small = counts < MIN_WALL_CELLS
+    small[0] = False
+    return occupied & small[labels]
 
 
 def gap_mask(grid, walked=(), gap_m=GAP_M):

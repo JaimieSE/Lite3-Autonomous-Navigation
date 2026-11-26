@@ -23,6 +23,9 @@ OUTPUT = Path(__file__).resolve().parents[1] / 'params' / 'nav2_lite3.yaml'
 SHARE_PLACEHOLDER = '__LITE3_LOCOMOTION_SHARE__'
 
 MAX_VX = 1.00     # hard ceiling (2026-11-18, was 0.50); every runner caps the session speed below it, verified
+SPIN_WZ = 0.50    # in-place turns (Nav2 Spin: look-arounds, search turns, resume scans). Operator 2026-11-25 (fix 3,
+                  # after the 15:36 SGT flip during a look-around turn at 0.886 rad/s on uneven ground). Walking
+                  # turns (MPPI) keep MAX_WZ.
 MAX_WZ = 1.50     # manufacturer navigation-mode limit (Motion Host Communication Interface 1.2.12, 0x0141: [-1.5, 1.5] rad/s)
 # Perception reach for up to 1.0 m/s: the collision boundary can reach 3.0 m from the nose (3.3 m from
 # base_link), so costmaps must see beyond it.
@@ -99,7 +102,7 @@ def patches():
         ('behavior_server.ros__parameters.robot_base_frame', 'base_link'),
         ('behavior_server.ros__parameters.transform_tolerance', 0.1),
         ('behavior_server.ros__parameters.simulate_ahead_time', 2.0),
-        ('behavior_server.ros__parameters.max_rotational_vel', MAX_WZ),
+        ('behavior_server.ros__parameters.max_rotational_vel', SPIN_WZ),
         ('behavior_server.ros__parameters.min_rotational_vel', 0.1),
         ('behavior_server.ros__parameters.rotational_acc_lim', 0.5),
         ('bt_navigator.ros__parameters.default_nav_to_pose_bt_xml',

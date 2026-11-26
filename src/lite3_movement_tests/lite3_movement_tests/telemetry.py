@@ -100,7 +100,7 @@ class Telemetry:
 
     STREAMS = ('joints', 'odom', 'imu', 'handle', 'system_cmd', 'terrain', 'clearance', 'nav_cmd',
                'lidar_odom', 'terrain_stop', 'mux_out', 'cm_events', 'hazard_age', 'raw_cloud',
-               'lio_cloud')
+               'lio_cloud', 'ultrasound')
 
     def __init__(self):
         self.joints = Stream()
@@ -119,6 +119,7 @@ class Telemetry:
         self.hazard_age = Stream(rate_hint=20)    # local receipt time - hazard cloud header stamp
         self.raw_cloud = Stream(rate_hint=20)     # /livox/points receipt -> serialized bytes (M10)
         self.lio_cloud = Stream(rate_hint=20)     # /cloud_registered_body receipt -> bytes: Fast-LIO alive (M10)
+        self.ultrasound = Stream(rate_hint=200)   # /us_publisher/ultrasound_distance (m, robot's front sensor)
         self.sensor_alive = {}
         self._alive_lock = threading.Lock()
 
@@ -134,6 +135,9 @@ class Telemetry:
         self.imu.add(stamp, ImuSample(
             tilt[0] if tilt else math.nan, tilt[1] if tilt else math.nan,
             tilt is not None, tuple(gyro), tuple(acc)))
+
+    def on_ultrasound(self, stamp, distance_m):
+        self.ultrasound.add(stamp, float(distance_m))
 
     def on_handle(self, stamp, vx, vy, wz):
         self.handle.add(stamp, TwistSample(vx, vy, wz))

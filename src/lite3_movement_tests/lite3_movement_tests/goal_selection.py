@@ -12,8 +12,10 @@ from dataclasses import dataclass, field
 
 # Starting weights; tune on saved maps (--weights "info=1,camera=0.8,..."). Gains are capped at GAIN_CAP_M2.
 DEFAULT_WEIGHTS = {'info': 1.0, 'camera': 0.8, 'grid': 1.5, 'continue': 0.5, 'agree': 0.3, 'scene': 2.0,
-                   'travel': 0.4, 'turn': 0.3, 'terrain': 1.0, 'revisit': 1.0, 'fail': 2.0}
-GAINS = ('info', 'camera', 'grid', 'continue', 'scene')
+                   'travel': 0.4, 'turn': 0.3, 'terrain': 1.0, 'revisit': 1.0, 'fail': 2.0, 'phase': 2.0}
+# phase (operator 2026-11-25): 1 for goals that serve the current phase - search (unfinished cells, unread rooms)
+# while any are left; move on (frontier, corridors, patrol) once every reachable cell is inspected and room read.
+GAINS = ('info', 'camera', 'grid', 'continue', 'scene', 'phase')
 COSTS = ('travel', 'turn', 'terrain', 'revisit', 'fail')
 GAIN_CAP_M2 = 4.0
 MERGE_M = 0.5

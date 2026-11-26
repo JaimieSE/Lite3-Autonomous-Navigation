@@ -23,15 +23,20 @@ timeout 15 python3 "$OPERATOR_DIR/lite3ops.py" cancel-goals || true
 
 echo "== Stopping process group(s): $(echo $PGIDS)"
 for g in $PGIDS; do kill -INT -- "-$g" 2>/dev/null; done
-for _ in $(seq 1 20); do
+# 2026-11-26 (start-up time): 4 s for Ctrl-C (was 10 s; the Nav2 container and sensor relay always ignore it)
+for _ in $(seq 1 8); do
   alive=""; for g in $PGIDS; do pgrep -g "$g" >/dev/null && alive="$alive $g"; done
   [ -z "$alive" ] && break; sleep 0.5
 done
 if [ -n "$alive" ]; then
   # Known: the Nav2 component container often ignores SIGINT. twist_mux (the only command path)
   # has already exited by now; escalate for the rest.
-  echo "   still running after 10 s ($(ps -o comm= -g "$(echo $alive | tr ' ' ',')" 2>/dev/null | sort -u | tr '\n' ' ')); sending SIGTERM"
-  for g in $alive; do kill -TERM -- "-$g" 2>/dev/null; done; sleep 5
+  echo "   still running after 4 s ($(ps -o comm= -g "$(echo $alive | tr ' ' ',')" 2>/dev/null | sort -u | tr '\n' ' ')); sending SIGTERM"
+  for g in $alive; do kill -TERM -- "-$g" 2>/dev/null; done
+  for _ in $(seq 1 10); do                            # poll up to 5 s (was a fixed 5 s sleep)
+    still=""; for g in $alive; do pgrep -g "$g" >/dev/null && still="$still $g"; done
+    [ -z "$still" ] && break; sleep 0.5
+  done
   for g in $alive; do pgrep -g "$g" >/dev/null && { echo "   SIGKILL group $g"; kill -KILL -- "-$g"; }; done
 fi
 for g in $PGIDS; do
@@ -44,5 +49,5 @@ done
 RUN_DIR=$(sed -n 's/^RUN_DIR=//p' "$STATE_FILE" 2>/dev/null)
 rm -f "$STATE_FILE"
 echo "   all workflow processes stopped"
-timeout 40 python3 "$OPERATOR_DIR/lite3ops.py" graph-clear --timeout 25 || true
+timeout 20 python3 "$OPERATOR_DIR/lite3ops.py" graph-clear --timeout 10 || true   # was 25 s (2026-11-26)
 echo "Stopped. Logs kept in: ${RUN_DIR:-$LOG_ROOT}"

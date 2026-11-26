@@ -1,5 +1,7 @@
 # Lite3 roaming cheat sheet (remote / STOP in hand whenever the robot is armed)
 
+Official competition runs (Pi, RViz, scoring reporter, dashboard): [COMPETITION_MANUAL.md](COMPETITION_MANUAL.md).
+
 ```bash
 cd ~/lite3_ws                                     # FAST-LIO runs locally by default (LITE3_LIO_SOURCE=system for the system host)
 operator/build.sh                                  # after code changes

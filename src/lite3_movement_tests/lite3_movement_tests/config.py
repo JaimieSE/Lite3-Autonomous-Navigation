@@ -352,10 +352,15 @@ class TelemetryRequirements:
     max_accel_norm: float = 10.8
 
 
+# Operator 2026-11-26: one body pitch/tilt limit everywhere - 35 degrees (roam runner, stair routine, curtain crossing,
+# test sequences). The independent roam watchdog stays 0.05 rad looser as the backstop.
+MAX_PITCH_RAD = math.radians(35.0)     # 0.611 rad
+
+
 @dataclass(frozen=True)
 class SafetyLimits:
     geofence_radius_m: float = 0.5
-    max_tilt_rad: float = 0.35
+    max_tilt_rad: float = MAX_PITCH_RAD
     command_period_s: float = 0.05
     zero_seconds: float = 2.0
     stop_timeout_s: float = 6.0
@@ -363,7 +368,7 @@ class SafetyLimits:
 
     def __post_init__(self):
         _finite(self.geofence_radius_m, 'geofence_radius_m', 0.05, 2.0)
-        _finite(self.max_tilt_rad, 'max_tilt_rad', 0.05, 0.6)
+        _finite(self.max_tilt_rad, 'max_tilt_rad', 0.05, 0.7)        # roam runs at 0.61 (35 deg, 2026-11-26)
         _finite(self.command_period_s, 'command_period_s', 0.02, 0.1)
         _finite(self.zero_seconds, 'zero_seconds', 1.0, 5.0)
         _finite(self.stop_timeout_s, 'stop_timeout_s', 2.0, 15.0)

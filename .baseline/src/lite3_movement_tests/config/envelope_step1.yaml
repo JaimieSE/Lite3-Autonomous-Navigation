@@ -1,0 +1,106 @@
+# Step-1 locomotion envelope characterization (physical, bounded).
+# Forward/backward pairs return the robot near its start. Each move is followed by a
+# verified stop. A move that only misses its displacement range is recorded and the
+# sweep continues, but only if the next stop_verify proves rest. The final move tests
+# what happens when commands simply stop (as if Nav2/twist_mux died): fallback zeros
+# are sent if the robot does not come to rest by itself.
+name: lite3_envelope_step1
+description: Speed sweep 0.05-0.10 m/s fwd/back, turn in place +-0.2 rad/s, silence-stop test.
+
+telemetry:
+  min_rate_hz: 50.0
+  max_age_s: 0.25
+  required_sensor_alive: [imu, joint, odom2]
+  max_handle_axis: 0.05
+
+safety:
+  geofence_radius_m: 0.5      # per move, from its start
+  max_tilt_rad: 0.35
+  command_period_s: 0.05
+  zero_seconds: 2.0
+  stop_timeout_s: 6.0
+  stop_hold_s: 1.5
+
+steps:
+  - {id: readiness, type: readiness, timeout_s: 10, quiet_s: 2.0}
+  - {id: telemetry_contract, type: telemetry_validation, timeout_s: 5, window_s: 2.0}
+  - {id: initial_rest, type: stationary_check, timeout_s: 6, hold_s: 2.0}
+  - {id: stand, type: posture_transition, target: standing, timeout_s: 12, hold_s: 1.5}
+  - {id: verify_standing, type: posture_check, expect: standing, timeout_s: 8, hold_s: 2.0}
+  - id: fwd_005
+    type: velocity_move
+    vx: 0.05
+    wz: 0.0
+    duration_s: 3.0
+    continue_on_range_failure: true
+    expect: {forward_m: [0.045, 0.3], lateral_m: [-0.10, 0.10], yaw_change_rad: [-0.25, 0.25]}
+  - {id: stop_fwd_005, type: stop_verify, timeout_s: 6, hold_s: 1.5, zero_min_s: 1.0}
+  - id: back_005
+    type: velocity_move
+    vx: -0.05
+    wz: 0.0
+    duration_s: 3.0
+    continue_on_range_failure: true
+    expect: {forward_m: [-0.3, -0.045], lateral_m: [-0.10, 0.10], yaw_change_rad: [-0.25, 0.25]}
+  - {id: stop_back_005, type: stop_verify, timeout_s: 6, hold_s: 1.5, zero_min_s: 1.0}
+  - id: fwd_008
+    type: velocity_move
+    vx: 0.08
+    wz: 0.0
+    duration_s: 2.5
+    continue_on_range_failure: true
+    expect: {forward_m: [0.06, 0.4], lateral_m: [-0.10, 0.10], yaw_change_rad: [-0.25, 0.25]}
+  - {id: stop_fwd_008, type: stop_verify, timeout_s: 6, hold_s: 1.5, zero_min_s: 1.0}
+  - id: back_008
+    type: velocity_move
+    vx: -0.08
+    wz: 0.0
+    duration_s: 2.5
+    continue_on_range_failure: true
+    expect: {forward_m: [-0.4, -0.06], lateral_m: [-0.10, 0.10], yaw_change_rad: [-0.25, 0.25]}
+  - {id: stop_back_008, type: stop_verify, timeout_s: 6, hold_s: 1.5, zero_min_s: 1.0}
+  - id: fwd_010
+    type: velocity_move
+    vx: 0.1
+    wz: 0.0
+    duration_s: 2.0
+    continue_on_range_failure: true
+    expect: {forward_m: [0.06, 0.4], lateral_m: [-0.10, 0.10], yaw_change_rad: [-0.25, 0.25]}
+  - {id: stop_fwd_010, type: stop_verify, timeout_s: 6, hold_s: 1.5, zero_min_s: 1.0}
+  - id: back_010
+    type: velocity_move
+    vx: -0.1
+    wz: 0.0
+    duration_s: 2.0
+    continue_on_range_failure: true
+    expect: {forward_m: [-0.4, -0.06], lateral_m: [-0.10, 0.10], yaw_change_rad: [-0.25, 0.25]}
+  - {id: stop_back_010, type: stop_verify, timeout_s: 6, hold_s: 1.5, zero_min_s: 1.0}
+  - id: turn_left_02
+    type: velocity_move
+    vx: 0.0
+    wz: 0.2
+    duration_s: 3.0
+    continue_on_range_failure: true
+    expect: {yaw_change_rad: [0.18, 1.2], forward_m: [-0.10, 0.10], lateral_m: [-0.10, 0.10]}
+  - {id: stop_turn_left_02, type: stop_verify, timeout_s: 6, hold_s: 1.5, zero_min_s: 1.0}
+  - id: turn_right_02
+    type: velocity_move
+    vx: 0.0
+    wz: -0.2
+    duration_s: 3.0
+    continue_on_range_failure: true
+    expect: {yaw_change_rad: [-1.2, -0.18], forward_m: [-0.10, 0.10], lateral_m: [-0.10, 0.10]}
+  - {id: stop_turn_right_02, type: stop_verify, timeout_s: 6, hold_s: 1.5, zero_min_s: 1.0}
+  - id: silence_stop_005
+    type: velocity_move
+    vx: 0.05
+    wz: 0.0
+    duration_s: 2.0
+    end_mode: silence          # stop publishing; robot must come to rest by itself
+    silence_timeout_s: 3.0
+    continue_on_range_failure: true
+    expect: {forward_m: [0.03, 0.25], lateral_m: [-0.10, 0.10], yaw_change_rad: [-0.25, 0.25]}
+  - {id: stop_silence_stop_005, type: stop_verify, timeout_s: 6, hold_s: 1.5, zero_min_s: 1.0}
+
+finalize:
+  - {id: lie_down, type: posture_transition, target: lying, timeout_s: 12, hold_s: 1.5}

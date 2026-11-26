@@ -46,18 +46,19 @@ import time
 
 import yaml
 
+from .odom_jumps import JumpFreeOdom
 from .ros_io import AI_OPTIONS, GAITS
 from .advisory import parse_advisory
 from .coverage import CameraCoverage
 from .course_grid import CourseGrid
 from . import goal_selection as GS
-from .scene_hints import active_hold, parse_scene_hints, scene_request
+from .scene_hints import active_hold, capture_ack, capture_request, parse_scene_hints, room_scan_result, scene_request
 from . import wall_gaps as WG
 from .exploration_record import (ExplorationRecord, INSPECTION_ARRIVE_M, INSPECTION_WAIT_S,
                                  INSPECTION_YAW_TOL_DEG, build_markers, classify_failure)
 from .mission_events import parse_mission_event
 from .stairs import Action, AiModeStairs, HStepGaitStairs, StairConfig, StairRoutine
-from .config import (ConfigError, HARD_MAX_NAV_GEOFENCE_M, HARD_MAX_SPEED_M_S,
+from .config import (MAX_PITCH_RAD, ConfigError, HARD_MAX_NAV_GEOFENCE_M, HARD_MAX_SPEED_M_S,
                      HARD_MIN_ABORT_CLEARANCE_M, HARD_MIN_ROAM_STOP_DISTANCE_M, NAV2_MAX_YAW_RATE_RAD_S, NOSE_OFFSET_M,
                      authorization_template, check_authorization, load_authorization,
                      load_sequence)
@@ -77,8 +78,9 @@ HARD_MAX_ROAM_MINUTES = 120.0          # supervision / battery bound; roaming ot
 HARD_MIN_GEOFENCE_M = 1.0
 HARD_MAX_MAP_AGE_S = 30.0              # SLAM publishes every 2 s
 HARD_MAX_SENSOR_AGE_S = 0.5            # = terrain_stop lock timeout
-HARD_MIN_LIDAR_HZ = 6.0               # was 8.0; course 12:37 safety stop at 7.4 Hz (terrain_monitor 7-9 Hz
-                                       # walking the course; LiDAR raw 10 Hz)
+HARD_MIN_LIDAR_HZ = 1.0               # operator 2026-11-26: keep roaming while the rate is down (passing a curtain
+                                       # cuts the LiDAR) as long as >= 1 Hz averaged over 5 s; was 6.0, 8.0 (course
+                                       # 12:37 safety stop at 7.4 Hz; terrain_monitor 7-9 Hz walking; raw 10 Hz)
 HARD_MAX_WATCHDOG_S = 3.0
 HARD_MAX_GOAL_S = 300.0                # was 240 (operator 2026-11-23: longer to think before giving up)
 DEFAULT_ROAM_SPEED = 0.50
@@ -94,13 +96,44 @@ COVERAGE_PERIOD_S = 0.3                # camera coverage update interval (covera
 LOOK_RADIUS_M = 2.5                    # look-around: unseen mapped floor within this of the robot ...
 LOOK_SIDE_HALF_DEG = 60.0              # ... in the sector +-60 deg around 90 deg left / right ...
 LOOK_MIN_SIDE_M2 = 0.6                 # ... at least this much on a side: turn 90 deg to look at it
-LOOK_STEP_DEG = 45.0                   # look-arounds turn in steps this size (overlapping 80 deg views) ...
+LOOK_STEP_DEG = 90.0                   # scan heading increment; Nav2 turn speed is unchanged
 LOOK_DWELL_S = 1.2                     # ... and stand still this long facing each step (YOLO ~1 frame/s)
+# Operator 2026-11-26: the look-around twists the body in pose mode (posture) instead of turning. Manual mode first
+# (pose-mode axis commands are controller commands, Comm Interface s1.2.3/s1.2.7), then pose mode, body yaw held to
+# each side, back to centre, move mode, navigation mode. The yaw axis range is not in the PDF export: value is config.
+POSTURE_LOOK_YAW_AXIS = 24000          # past the +-9553 dead zone, <= 32767
+POSTURE_LOOK_HOLD_S = 2.5              # hold each side (twist + YOLO ~1 frame/s)
+POSTURE_LOOK_CENTRE_S = 1.0            # yaw 0 this long before leaving pose mode
+# Operator 2026-11-26: at a wall (a pocket cell), do the posture look 3 times with a 3 s pause between rounds
+# (body centred, still in pose mode), then leave pose mode.
+POSTURE_LOOK_ROUNDS = 3
+# Operator 2026-11-26: "engage long enough that YOLO has time": each posture view (each side and the centre)
+# holds until the Pi has delivered POSTURE_LOOK_FRAMES frames captured after the body settled there (the Pi
+# runs ~0.6-0.8 frames/s; since 17:18 one sighting triggers Claude, and the Pi sends Claude a frame taken >= 1 s
+# after the dog last moved, so 2 frames leave margin for a blurred first frame). At least the old hold time,
+# at most POSTURE_LOOK_MAX_S (a silent Pi never freezes the dog).
+POSTURE_LOOK_SETTLE_S = 1.0
+POSTURE_LOOK_FRAMES = 2
+POSTURE_LOOK_MAX_S = 8.0
+# Operator 2026-11-26: after a backtrack, face where it was stuck and engage the pose (posture look) there, in
+# case it was a scene.
+BACKTRACK_SCAN_FACE_DEG = 20.0         # turn to face the stuck spot first when it is further off than this
+POSTURE_LOOK_GAP_S = 3.0
 COVER_MAX_YAW_RATE = 0.5               # rad/s: count camera coverage only while turning slower (no blur, frames)
 SPIN_DRIFT_RETURN_M = 0.10             # after a turn, ended this far BEHIND where it started: step forward again
 NUDGE_SPEED_M_S = 0.15                 # ... at this speed (own odometry), at most NUDGE_MAX_M / NUDGE_MAX_S
 NUDGE_MAX_M = 0.40
 NUDGE_MAX_S = 4.0
+# Operator 2026-11-26 (18:14 run: half on a block edge, tilted 21 deg, every turn / back-off refused - the block counts as
+# an obstacle inside the footprint): keep going while tilted. Standing still tilted this long: step straight off it,
+# slowly, outside Nav2 - toward the lower side first, then the other way - until level. Never pauses for the tilt.
+TILT_ESCAPE_DEG = 10.0                 # tilted more than this ...
+TILT_ESCAPE_HOLD_S = 2.0               # ... for this long while choosing: work off the tilt
+TILT_LEVEL_DEG = 6.0                   # level again below this
+TILT_ESCAPE_M = 0.3                    # each attempt at most this far (NUDGE_SPEED_M_S; reverse = the back-off speed)
+TILT_ESCAPE_TRIES = 4                  # attempts per spot (alternating forward / back), then the normal choice
+TILT_ESCAPE_GAP_S = 2.0                # between attempts
+TILT_ESCAPE_REAR_M = 0.15              # reversing stops this near a known obstacle behind (the block itself is close)
 NUDGE_CLEAR_M = 0.30                   # only with nothing (terrain monitor) within the nudge + this ahead
 LOOK_ABANDON_AFTER = 2                 # look-around steps in a row reaching < half their angle: give up the rest
 LOOK_SPACING_M = 1.2                   # no new look-around within this of an earlier one
@@ -125,12 +158,84 @@ TRAIL_SPACING_M = 0.5                 # breadcrumbs (walk start points) at least
 EXIT_CHECK_PERIOD_S = 2.0
 # Automatic stairs (operator 2026-11-21: "at the steps it should switch to AI mode, on its own"). Course ledge
 # lip ~0.10-0.12 m; competition stairs ~0.05 m. Triggered from terrain_monitor's nearest step in the corridor.
+# Operator 2026-11-24 (Arena run, screenshot): "explore cells where there is minor speckling ... a small object barely
+# in range of the lidar slice ... the robot is capable of moving until it detects a surface 5 cm in front of it, then
+# it would resume regular roam". Occupied SLAM blobs smaller than wall_gaps.MIN_WALL_CELLS are speckle: roam's own
+# map view treats them as floor (goals, open directions, grid cells, reachable floor), and the Nav2 costmap veto
+# round them is ignored unless a real wall is near. A walk that fails by a speckle becomes a probe: face the goal,
+# walk straight towards it until the terrain monitor sees a surface 5 cm ahead of the nose (or a step to cross, or
+# the goal), then roam carries on as usual. Nav2's own costmaps are unchanged.
+SPECKLE_ZONE_M = 0.25                  # costmap veto within this of a speckle is the speckle's, not a wall's ...
+SPECKLE_WALL_KEEP_M = 0.30             # ... unless a real wall (blob >= MIN_WALL_CELLS) is within this
+PROBE_MAX_M = 1.5                      # a probe walks at most this far
+PROBE_SPEED_M_S = 0.25
+PROBE_TURN_RATE = 0.5                  # rad/s while facing the goal first
+PROBE_TURN_TOL_RAD = math.radians(8)
+PROBE_TURN_MAX_S = 8.0
+CENTRE_LANE_MIN_STEP_M = 0.40          # a centre-lane target nearer than this is where the dog already stands: walk
+                                       # the real goal (Arena B 19:17: 35 lane walks "reached" after 0.00 m, 160 s)
+REACHED_MIN_MOVE_M = 0.10              # "reached" after less than this is no progress and resolves nothing
+ON_BLOCK_TOL_DEG = 30.0                # fix 3: after a crossing up, goals within this of the climb heading ...
+ON_BLOCK_CLEAR_M = 0.7                 # ... until the dog has walked this far from where it ended (off the block)
+ON_BLOCK_MAX_S = 45.0                  # ... or this long has passed
+WORK_MARGIN_M = 6.0                    # heartbeat fixes 2-3: roam's map view = walked area + this, inside the geofence
+WORK_MIN_CELLS = 200_000               # ... used once the SLAM grid is larger than this (40k = 10 x 10 m at 5 cm)
+HEARTBEAT_STEP_S = 0.5                 # fix 1: write the heartbeat between heavy steps at least this often
+APPROACH_SPEED_M_S = 0.20              # operator 2026-11-25 (item 8): walk this slowly for the last metre before a
+APPROACH_STEP_M = 1.0                  # step to cross, and the last APPROACH_STOP_M before a stop to read a scene,
+APPROACH_STOP_M = 0.6                  # so the dog arrives steady and square (never faster than the speed mode)
+STEP_SQUARE_TOL_DEG = 8.0              # item 3: square up to the grid axis before a crossing when further off than this
+STEP_SQUARE_REPEAT_S = 15.0            # ... once per step (then cross as it stands)
+# Operator 2026-11-26: "if it has no space to turn, walk backwards till there is space". Straight back, at the dead-end
+# probe's back-off speed and inside its reverse allowance (reverse_ok_until; the watchdog's back-off limits), until
+# there is room to turn (hazard clearance >= TURN_ROOM_CLEAR_M and no known obstacle within the turn radius on the raw
+# map), at most BACK_FOR_ROOM_MAX_M, stopping PASSAGE_PROBE_REAR_CLEAR_M before anything the LiDAR map shows behind.
+BACK_FOR_ROOM_MAX_M = 0.8
+TURN_ROOM_CLEAR_M = 0.20
+BACK_FOR_ROOM_REPEAT_S = 10.0          # one back-off per spot and turn attempt (no reversing loops)
+TURN_PRESSED_M = 0.05                  # skip a look-around turn while the hazard-cloud clearance is under this
+CRAWL_WINDOW_S = 25.0                  # a walk that moves less than CRAWL_MIN_M in this long has stalled (Arena B
+CRAWL_MIN_M = 0.25                     # 18:57: Nav2 crept 0.005 m/s for 60 s; each 0.10 m reset the 40 s check)
+STEP_START_M = 0.45                    # operator 2026-11-24 (b): start crossings from about this far back, so the
+                                       # dog meets the step square and with room (run 17:32 started at 0.28 m and
+                                       # aborted at 26 deg pitch). Reversing is not allowed (existing rule: no rear
+                                       # sensing), so a step first seen nearer than STEP_START_M - 0.05 is not crossed
+                                       # from there: roam walks on and meets it again from farther back
+STEP_BACKOFF_REPEAT_S = 20.0           # still that close this long after: cross anyway (never skipped for good)
 STEP_PAST_M = 0.45                     # step crossing: walked this far = past the step (wall check)
 STAIR_TRIGGER_M = 0.6                  # nearest step this close to base_link (nose ~0.3 m from it) ...
 STAIR_MIN_RISE_M = 0.04                # ... and between these heights (up or down)
 STAIR_MAX_RISE_M = 0.18                # = terrain max_step_m / max_drop_m (course lips 0.10-0.15 m)
 STAIR_CONTINUE_M = 0.9                 # another lip this close when the routine would exit: stay in AI mode
 STAIR_MAX_AI_S = 120.0                 # ... but at most this long per crossing
+# Operator 2026-11-26: once in AI mode, stay in it at least this long (counted from the switch-in command, so it
+# includes the 3 s settle). Run 03:05 26 Nov: AI mode on at the first step, the robot slid back off it while settling,
+# and the routine switched out 0.4 s into the climb. Normal exits wait; aborts (attitude, IMU) and pauses do not.
+STAIR_AI_MIN_HOLD_S = 10.0
+# ---- --arena-holds (operator 2026-11-26, test command operator/arena_holds.sh; off in the competition command)
+ARENA_FACE_TOL_DEG = 6.0               # facing the next cell within this: walk; else turn in place first
+ARENA_BEHIND_DEG = 135.0               # target further round than this: two quarter-turns (needs turning room)
+ARENA_MAX_TURNS = 3                    # turns per grid step (two quarter-turns + one correction), then hold
+ARENA_HOLD_S = 2.0                     # hold this long, then reconsider (turn stopped early, lane left)
+ARENA_BLOCK_CELL_S = 20.0              # the refused neighbour cell is not chosen again for this long
+POST_STAIR_WAIT_MAX_S = 12.0           # after the stairs: fresh map / costmap / steady pose within this, else hold
+POST_STAIR_STEADY_S = 1.0              # map pose steady this long ...
+POST_STAIR_STEADY_M, POST_STAIR_STEADY_DEG = 0.03, 1.5   # ... within these
+POST_STAIR_LEVEL_RAD = 0.08            # body level (not still on a step)
+POST_STAIR_CENTRE_TOL_M = 0.12         # aligned: this close to the cell centre ...
+POST_STAIR_HEADING_TOL_DEG = 5.0       # ... and this close to a grid direction
+POST_STAIR_EDGE_MARGIN_M = 0.5         # correction point at least this far from the stair place
+POST_STAIR_MAX_CORRECTIONS = 2
+POSTURE_VIEW_MIN_DEG = 3.0             # posture look-around view: heading moved at least this toward the side ...
+POSTURE_VIEW_STEADY_DEG = 1.5          # ... and held steady within this over the last second
+# Operator 2026-11-26: faster in AI mode - forward joystick value 22000 (was 18000, 12000; dead zone 6553, max 32767).
+AI_AXIS_FORWARD = 22000
+STAIR_AI_COMMAND_PERIOD_S = 1.0 / 25.0
+# Operator 2026-11-26: in AI mode walk straight on until the robot's front ultrasound reads this close, then leave
+# AI mode (SLAM is paused in AI mode, so the LiDAR terrain view is not used). A reading older than this is no reading.
+STAIR_AI_OBSTACLE_STOP_M = 0.10
+STAIR_AI_WALK_M = 1.5                  # operator 2026-11-26: the climb is 1.5 m (or less, at an obstacle)
+ULTRASOUND_MAX_AGE_S = 0.3
 STAIR_COOLDOWN_S = 15.0                # no new trigger this long after a crossing (same edge behind the feet)
 STAIR_MODES = ('ai', 'hstep')
 ADVISORY_MODES = ('act', 'log', 'off')  # teammate's stair/curtain advisory: act on it, only log it, or ignore it
@@ -155,16 +260,23 @@ CURTAIN_SPEED_M_S = 0.15               # slow straight crossing ("request_slow_c
 CURTAIN_MAX_S = 20.0                   # at least; or twice the time the crossing takes at the speed
 CURTAIN_STALL_S = 3.0                  # no CURTAIN_STALL_M of progress this long: blocked (not a curtain)
 CURTAIN_STALL_M = 0.05
-CURTAIN_MAX_TILT_RAD = 0.35
+CURTAIN_MAX_TILT_RAD = MAX_PITCH_RAD   # 35 deg like every tilt limit (operator 2026-11-26; was 0.35)
 CURTAIN_COOLDOWN_S = 20.0
 PASSAGE_ADVISORY_WAIT_S = 10.0         # default for --passage-wait (was 3): at a blocked passage, wait for a
                                        # curtain confirmation or for the map to open a way on before pausing
+# Dead-end probe (operator 2026-11-26): no curtain confirmation and no way on after the wait -> walk into the passage
+# as a curtain crossing (same speed and limits). The robot moving through = curtain; legs or SLAM not getting
+# anywhere = a wall: reverse back along the probe path (ground it just walked) and explore on, no pause.
+PASSAGE_PROBE_BACK_MAX_M = 1.5         # reverse at most this far (the probe path: standoff + curtain + margin)
+PASSAGE_PROBE_BACK_SPEED_M_S = NUDGE_SPEED_M_S
+PASSAGE_PROBE_REAR_CLEAR_M = 0.35       # stop reversing: known obstacle this near behind (as the nudge's 0.60 - 0.25)
 # Uneven course (physical 2026-11-21, operator-authorised loosening): balance steps on lips read 0.15 m/s of
 # leg odometry while idle in slow mode (limit was 0.10) and stopped 5 sessions at start; a 0.15 m lip tilts
 # the 0.35 m hip base ~0.44 rad (limit was 0.35). The robot's own fall-down protection stays the last resort.
 ODOM_MARGIN_M_S = 0.25                 # leg-odometry limit = max(2 x mode speed, mode + this); was 0.05
-ROAM_MAX_TILT_RAD = 0.55               # runner body-tilt limit while roaming; was 0.35
-WATCHDOG_MAX_TILT_RAD = 0.60           # independent watchdog (looser than the runner); was 0.40
+ROAM_MAX_TILT_RAD = MAX_PITCH_RAD      # runner body-tilt limit while roaming: 35 deg = 0.611 rad (operator 2026-11-26; was 0.55
+                                       # = 31.5 deg, Arena B 23:41 SGT stopped at 0.565 rad = 32.4 deg; before that 0.35)
+WATCHDOG_MAX_TILT_RAD = MAX_PITCH_RAD + 0.05   # independent watchdog, 0.05 rad looser than the runner: 37.9 deg
 OWN_AXIS_GRACE_S = 1.0                 # remote-takeover check skips /handle_state this long after our axis cmd
 SCENE_MIN_CONFIDENCE = 0.5            # scene detections below this are ignored
 SCENE_REPEAT_S = 10.0                 # the same label/QR is logged again only after this long
@@ -178,9 +290,9 @@ DEFAULT_MODES = {'slow': (0.05, 0.15), 'normal': (0.08, NAV2_MAX_YAW_RATE_RAD_S)
                  'fast': (0.10, NAV2_MAX_YAW_RATE_RAD_S)}
 SPEED_GRACE_S = 2.0                    # after lowering the speed, the smoother ramps down
 STRATEGIES = ('scan_walk', 'frontier')
-SCAN_STEP_RAD = math.radians(30)
-# Relative 30-degree steps: look up to 60 degrees to the preferred side, then 60 to the other.
-SCAN_STEPS = (1, 1, -1, -1, -1, -1)
+SCAN_STEP_RAD = math.radians(90)
+# Operator 2026-11-26: every search turn is 90 degrees - to the preferred side, back to straight on, to the other side.
+SCAN_STEPS = (1, -1, -1)
 # behavior_server Spin publishes nav_cmd_vel directly (NOT through the velocity_smoother cap), at
 # up to its max_rotational_vel = 0.2 rad/s = the validated turn rate. While spinning the robot-side
 # yaw check therefore allows this instead of the selected mode's yaw rate.
@@ -203,8 +315,70 @@ CAMERA_GAIN_RADIUS_M = 2.0
 SCENE_TURN_MIN_DEG = 10.0
 PLAN_CHECK_PERIOD_S = 1.0              # while walking, check Nav2's planned path against closed wall gaps
 STRAIGHT_SOURCES = ('straight_on', 'corridor', 'corridor_walked')   # goals walked in a straight line
-PROTECTED_ENDS = ('inspection', 'passage', 'stairs', 'scene', 'exit', 'backtrack')   # never reselected
-LADDER = ('look', 'make_room', 'scene', 'grid_return', 'clear_costmaps', 'backtrack', 'pause')
+PROTECTED_ENDS = ('inspection', 'passage', 'stairs', 'scene', 'exit', 'backtrack', 'room')
+# --stairs-pi-only (operator 2026-11-26): the Pi's stairs YOLO alone starts the stair handover (approach -> AI mode),
+# with no RGB-D, VLM or terrain reconfirmation. One turn first when the stairs are off to the side.
+PI_STAIRS_MIN_CONFIDENCE = 0.90
+PI_STAIRS_FX_PX = 461.0               # Pi Orbbec colour fx at 640 x 480 (camera_info 2026-11-26)
+PI_STAIRS_FACE_DEG = 8.0              # stairs further off-centre than this: turn to face them, then hand over
+PI_STAIRS_ALIGN = False               # operator 2026-11-26: facing turn switched off for now ("not doing much");
+                                      # True puts it back
+PI_STAIRS_MAX_ROTATED_DEG = 8.0       # operator 2026-11-26: a sighting from a frame taken before the robot turned more
+                                      # than this is not handed over (run 05:50: seen mid-turn, 64 deg off the stairs) ...
+PI_STAIRS_SETTLE_S = 5.0              # ... it stops the robot instead and waits this long for a frame taken while still
+                                      # (run 05:56: ignoring them let it walk on onto the stairs; frames ~1.7 s apart)
+PI_STAIRS_TURN_MAX_S = 15.0           # the facing turn may take this long; then hand over anyway
+PI_STAIRS_CY_PX = 237.9               # Pi colour principal point row
+PI_CAMERA_HEIGHT_M, PI_CAMERA_PITCH_DEG = 0.15, 15.0    # the Pi service's --height-m / --pitch-deg
+PI_STAIRS_SAME_M = 1.2                # a sighting this close to stairs already handed over is the same flight   # never reselected
+# Operator 2026-11-25: frontier is not top priority at all times. SEARCH while any reachable cell is uninspected or a
+# room unread (grid / room goals score the phase term); MOVE ON with frontier goals only once all are done.
+SEARCH_SOURCES = ('grid_return', 'room')
+MOVE_ON_SOURCES = ('frontier', 'patrol', 'exit', 'straight_on', 'corridor', 'corridor_walked', 'unseen')
+# Operator 2026-11-26: before walking into a room, stop at the doorway facing into it and take a picture: a camera
+# capture request (same round trip as inside: Claude answer, stored for the reporter) and still time for the Pi's
+# YOLO frames (the mission reporter labels and reports them under its rules). The capture inside the room still runs.
+ROOM_ENTRY_MAX_S = 8.0                 # hold at most this long for the Pi frames and the capture ack
+ROOM_CANDIDATES = 2                    # nearest unread rooms offered per decision
+ROOM_FACE_TOL_DEG = 20.0               # turn to face into the room first when further off than this
+ROOM_READ_TIMEOUT_S = 8.0              # wait this long for the Pi's scene answer, then count the room as looked at
+REJECT_SHOW_S = 12.0                   # RViz: why each opening/cell was rejected, shown this long
+REJECT_MAX = 12
+REOPEN_CLEAR_M = 0.8                   # a reopened passage clears failure memory this close to either cell centre
+CAPTURE_TIMEOUT_S = 12.0               # item 7: wait this long for the capture ack, then move off anyway
+CAPTURE_LEVEL_RAD = 0.10               # no camera stop while the body is tilted more than this (on / onto a block) ...
+CAPTURE_STEP_CLEAR_M = 0.8             # ... or with a step / block edge within this ahead (Arena B 23:41 SGT: the stop
+                                       # cut a walk partway up a 0.3 m block, pitch rose to 0.565 rad, tilt stop)
+# Operator 2026-11-26: room scan = posture look left then right (one round); at each side, once the view has
+# settled, the Pi captures a fresh still photo (capture_request with scan_id / view_id) and acks it. A view that
+# gets no ack is requested again once; the Pi sends both views to Claude in one request. In the centre roam waits
+# for the scan result and, when Claude asks for it, looks once more toward that side (qr_only: QR close-up).
+# Operator 2026-11-26 (evening): the dog does NOT step into a room (a dead end). It walks to the cell in front of
+# the room's open side (CourseGrid.room_viewpoint), faces into the room, stands still, and the Pi takes ONE forward
+# photo: Claude reads the room and the mission candidates, OpenCV decodes any QR code Claude saw. A missing or
+# blurry photo is requested once more; if it still fails the room is tried again later (never entered).
+ROOM_VIEW_SETTLE_S = 1.0               # standing still this long before the photo (measured on the NUC, below)
+# Operator 2026-11-26: the NUC decides "no movement", not the Pi. The Pi only guessed it from the absence of
+# navigation commands; roam measures it: leg odometry and IMU gyro below the rest thresholds for STILL_S. A photo is
+# requested only then, marked still=true with the moment it became still, so the Pi captures at once.
+STILL_S = 1.0
+STILL_MAX_SPEED_M_S = 0.04             # = telemetry.StationaryCriteria (rest noise <= 0.015)
+STILL_MAX_YAW_RATE = 0.05
+STILL_MAX_GYRO = 0.15
+STILL_WAIT_MAX_S = 6.0                 # a stop that never becomes still: ask anyway after this (marked still=false)
+ROOM_VIEW_LEVEL_WAIT_S = 5.0           # ... and at most this much longer for the body to be level and clear
+ROOM_VIEW_ATTEMPTS = 2                 # photo requests per visit (one retry for no ack / timeout / blurry)
+ROOM_SCAN_VIEW_WAIT_S = 8.0            # per attempt; the Pi times a view out after 6 s
+ROOM_SCAN_VIEW_ATTEMPTS = 2
+ROOM_SCAN_RESULT_WAIT_S = 10.0         # centred, waiting for Claude's answer (also bounds the dog's stop)
+ROOM_SCAN_EXTRA_VIEWS = 1
+CAPTURE_RETRY_S = 60.0                 # a pocket whose capture got no ack is tried again after this
+GOAL_EDGE_CLEAR_M = 0.30               # item 6: goal points need this much raw-map clearance (off block edges)
+FEATURE_EVENTS = ('stairs_pi_seen', 'stairs_detected', 'advisory', 'curtain_crossing', 'curtain_detected',
+                  'curtain_confirmed')   # mark the cell grey in RViz (stairs / curtain detected there)
+SURVIVOR_LABELS = ('survivor', 'person')   # mission evidence: a survivor marks its cell pending until a QR is read
+LADDER = ('look', 'grid_return', 'make_room', 'scene', 'clear_costmaps', 'backtrack', 'pause')
+# operator 2026-11-25 (item 4): straight to an unfinished cell after looking; making room and the scene come after
 # Make room (operator 2026-11-24, run 14:20): the dog stood a few cm from a wall panel; Nav2 refused every turn
 # ("Collision Ahead - Exiting Spin", 15 of 16), the LiDAR cannot see the floor within ~0.5 m and SLAM adds scans only
 # on movement, so the map stayed ~3 m2 and nothing was worth walking to. Blocked turns -> step straight away first.
@@ -242,13 +416,14 @@ class RoamConfig:
                  stack_max_speed=0.10, strategy='frontier', gait=None, docs_stops=False, heartbeat=False,
                  rough_gait=ROUGH_GAIT, ai_options=(), exit_open_radius_m=1.5, exit_min_area_m2=6.0,
                  exit_min_from_start_m=2.0, stop_at_exit=True, stair_mode='ai', auto_stairs=False,
-                 ai_axis_forward=12000, advisory='act', map_session=None,
+                 ai_axis_forward=AI_AXIS_FORWARD, advisory='act', map_session=None,
                  step_crossing=True, step_min_rise_m=0.12, step_max_rise_m=0.30, step_trigger_m=0.6,
                  step_speed_m_s=0.20, goal_time_factor=5.0, goal_time_base_s=60.0,
                  spin_stall_s=SPIN_STALL_S, passage_wait_s=PASSAGE_ADVISORY_WAIT_S,
                  decision='sequence', weights=None, min_score=GS.MIN_SCORE, grid_cell_m=1.0, grid_origin=None,
                  grid_heading_deg=None, stuck_window_s=60.0, scene_max=6, scene_interval_s=60.0,
-                 scene_timeout_s=20.0, auto_resume_s=0.0, reselect=True, auto_mode=False, pi_advisory=True):
+                 scene_timeout_s=20.0, auto_resume_s=0.0, reselect=True, auto_mode=False, pi_advisory=True,
+                 passage_probe=True):
         self.speed_limit = _finite(speed_limit, 'speed_limit', 0.02, min(HARD_MAX_SPEED_M_S, stack_max_speed))
         modes = {**DEFAULT_MODES, **(modes or {})}         # unspecified modes keep their defaults
         self.modes = {}
@@ -321,6 +496,7 @@ class RoamConfig:
         self.goal_time_base_s = _finite(goal_time_base_s, 'goal_time_base', 10.0, 180.0)
         self.spin_stall_s = _finite(spin_stall_s, 'spin_stall', 5.0, 60.0)
         self.passage_wait_s = _finite(passage_wait_s, 'passage_wait', 0.0, 60.0)
+        self.passage_probe = bool(passage_probe)   # dead end: probe the blocked passage instead of pausing
         # One goal-selection system (operator 2026-11-24). 'unified': every source proposes, one evaluator decides,
         # course grid as memory, stuck ladder (look around -> scene understanding -> unfinished cell). 'sequence':
         # the earlier fixed order (kept for comparison and the older tests).
@@ -743,7 +919,8 @@ class ScanWalk:
         rays = []
         self.open_headings = []
         reach = min(self.cfg.frontier_radius_m, self.cfg.geofence_m * 2) + self.spin_radius()
-        obstacles = self.known_obstacles(grid, costmap, pose[:2], reach)
+        raw = getattr(self, 'raw_maps', None)              # turn room: the RAW map - small blocks count (2026-11-25)
+        obstacles = self.known_obstacles(*(raw() if raw else (grid, costmap)), pose[:2], reach)
         self.spin_blocked = 0
         base = self.heading(pose)
         # Nearest turns first: 0, +10, -10, +20, -20 ... deg from the HELD heading.
@@ -949,7 +1126,7 @@ class WatchdogLogic:
     # Was 0.5 s / 1.0 s, which ordinary link hiccups exceeded. Kept just above the observed worst
     # case: the watchdog is the backstop; collision_monitor and the terrain lock act on obstacles.
     TELEMETRY_AGE_S = 1.0
-    RAW_LIDAR_AGE_S = 1.25
+    RAW_LIDAR_AGE_S = 3.25         # watchdog: no raw cloud this long trips (was 1.25; 2026-11-26 curtains, roam 3.0 s)
 
     def __init__(self, speed_limit, geofence_m, max_tilt=WATCHDOG_MAX_TILT_RAD, telemetry_age=TELEMETRY_AGE_S,
                  heartbeat_s=2.0, raw_lidar_age=RAW_LIDAR_AGE_S):
@@ -959,7 +1136,9 @@ class WatchdogLogic:
         self.telemetry_age = telemetry_age
         self.raw_lidar_age = raw_lidar_age
         self.heartbeat_s = heartbeat_s
-        self.origin = None
+        self.origin = None                # leg-odometry start (set before the first reading to fix it)
+        self.odom = None                  # JumpFreeOdom: the geofence ignores odometry jumps (run 26 Nov 04:24)
+        self.notes = []                   # dropped jumps, for the watchdog log
         self.fast_since = None
 
     def evaluate(self, telemetry, now, runner_status=None, wall_now=None):
@@ -973,23 +1152,43 @@ class WatchdogLogic:
             reasons.append('IMU tilt beyond limit or orientation invalid')
         odom = telemetry.odom.latest()
         if odom is not None:
-            if self.origin is None:
-                self.origin = (odom[1].x, odom[1].y)
-            d = math.hypot(odom[1].x - self.origin[0], odom[1].y - self.origin[1])
+            if self.odom is None:
+                self.odom = JumpFreeOdom(origin=self.origin)
+            jump = self.odom.update(odom[0], odom[1].x, odom[1].y)
+            self.origin = self.odom.origin
+            if jump is not None:
+                self.notes.append(f'leg-odometry jump of {jump:.2f} m ignored (more than the robot can move)')
+            d = self.odom.distance()
             if d > self.geofence_m + 0.75:
                 reasons.append(f'leg-odometry distance {d:.2f} m beyond geofence {self.geofence_m} m + 0.75')
         raw = getattr(telemetry, 'raw_cloud', None)
         if raw is not None and raw.total:
             if raw.age(now) > self.raw_lidar_age:
                 reasons.append(f'raw LiDAR /livox/points stale ({_r(raw.age(now), 2)} s)')
-            elif max((n for _, n in raw.window(now, 1.0)), default=0) < MIN_RAW_BYTES:
-                reasons.append('raw LiDAR nearly empty (sensor blind or blocked)')
+            elif raw.window(now, RAW_LIDAR_EMPTY_S) and \
+                    now - min(t for t, _ in raw.window(now, RAW_LIDAR_EMPTY_S)) >= RAW_LIDAR_EMPTY_S - 0.5 and \
+                    max((n for _, n in raw.window(now, RAW_LIDAR_EMPTY_S)), default=0) < MIN_RAW_BYTES:
+                reasons.append(f'raw LiDAR nearly empty for {RAW_LIDAR_EMPTY_S:.0f} s (sensor blind or blocked)')
         moving = max(2.0 * self.speed_limit, self.speed_limit + 0.05)
         if sustained_planar_overspeed(telemetry, now, moving):
             reasons.append(f'leg-odometry speed above {moving:.2f} m/s for 0.5 s (runaway)')
         cmds = telemetry.system_cmd.window(now, 0.5)
+        # Reverse (operator 2026-11-26): only the dead-end probe's back-off reverses, along the path it just walked.
+        # Independently of the runner, and deliberately lenient (operator: "does not have to be that strict"): no
+        # faster than the session limit + 0.05 m/s, and no farther (leg odometry since the reverse began) than the
+        # back-off cap + 0.5 m.
+        back_v = self.speed_limit + 0.05
         fast = [c for _, c in cmds if c.vx > self.speed_limit + 0.02 or abs(c.wz) > NAV2_MAX_YAW_RATE_RAD_S + 0.05
-                or c.vx < -0.01]
+                or c.vx < -back_v]
+        reversing = any(c.vx < -0.01 for _, c in cmds)
+        if not reversing:
+            self.reverse_from = None
+        elif odom is not None:
+            if getattr(self, 'reverse_from', None) is None:
+                self.reverse_from = (odom[1].x, odom[1].y)
+            back = math.hypot(odom[1].x - self.reverse_from[0], odom[1].y - self.reverse_from[1])
+            if back > PASSAGE_PROBE_BACK_MAX_M + 0.5:
+                reasons.append(f'reversed {back:.2f} m (more than the {PASSAGE_PROBE_BACK_MAX_M} m back-off)')
         if fast:
             self.fast_since = self.fast_since or now
             if now - self.fast_since >= 0.3:
@@ -1028,9 +1227,11 @@ ROAM_TELEMETRY_AGE_S = 1.0      # joints/IMU/leg odometry silence that stops roa
                                 # independent watchdog's limit). 2026-11-19 13:48: a link stall (all robot
                                 # streams gapped 0.3-0.75 s at once) aborted the stand at 0.5 s.
 ROAM_MAX_ODOM_LAG_S = 1.0       # LiDAR odometry lag accepted at readiness (was 0.5)
-ROAM_RAW_LIDAR_STALE_S = 1.0    # single raw-cloud gap that ends roaming (was max_sensor_age_s, 0.5)
+RAW_LIDAR_EMPTY_S = 3.0                # operator 2026-11-26 (curtains): "nearly empty" only after this long of nothing
+                                       # but near-empty clouds (was 1 s); never during a curtain crossing (roam)
+ROAM_RAW_LIDAR_STALE_S = 3.0    # operator 2026-11-26 (curtains): no cloud this long ends roaming (was 1.0, 0.5)
 HAZARD_STALE_S = 0.5                   # full stop layers: hazard cloud older than this = clearance unknown
-HAZARD_STALE_DOCS_S = 1.0              # docs-only stops (was 0.5, as above): match the terrain-status limit.
+HAZARD_STALE_DOCS_S = 3.0              # operator 2026-11-26 (curtains): hazard cloud may be 3 s old, like the LiDAR (was 1.0, 0.5)
                                        # 2026-11-23 14:33 and 14:43 safety stops were 0.64-0.66 s LiDAR
                                        # gaps on the robot link, inside the 1.0 s the terrain status allows
 TERRAIN_FLOOR_MAX_AGE_S = 1.0   # terrain grid used as "seen free" floor only while this fresh
@@ -1110,6 +1311,9 @@ class RoamSession:
         self.ladder_pending = None               # reason: start the ladder at the next decision
         self.scene_wait = None                   # scene request awaiting Pi hints
         self.scene_task = None                   # acting on a scene hint (face it, then cross / walk)
+        self.room_task = None                    # (unused since item 7: rooms are read on entry by a capture)
+        self.capture_task = None                 # stopped in a pocket: camera capture requested, waiting for the ack
+        self.on_block = None                     # after a crossing up: where and which way (fix 3)
         self.scene_requests = []                 # times of scene requests (bounded per run)
         self.stuck_window = []                   # [(t, x, y, area)] for the no-progress check
         self._reselect_t = -math.inf
@@ -1129,6 +1333,10 @@ class RoamSession:
         self.mission_log = []
         self._coverage_t = -math.inf
         self.look = []                           # pending look-around turns (rad)
+        self.posture_look = None                 # body-yaw look-around in pose mode (operator 2026-11-26)
+        self._grid_face = None                   # --arena-holds: turning to face the next grid cell
+        self._post_stair = None                  # --arena-holds: grid alignment check after the stairs
+        self._arena_hold_until = -math.inf       # --arena-holds: standing still before reconsidering
         self.look_spots = []                     # where look-arounds happened
         self.look_check = False                  # a walk just ended: consider a look-around
         self.nudge = None                        # step forward after sliding back during a turn
@@ -1151,28 +1359,161 @@ class RoamSession:
         self.anchor = None
         self.explorer = None
         self.map = None
+        self.speckle = None                      # (speckle zone, real walls, geo) of the latest map (_despeckle)
         self.area0 = None
         self.last_pose = None
         self.t_roam = None
 
     # -------------------------------------------------------------- helpers
     def event(self, name, **detail):
+        if name in FEATURE_EVENTS:
+            self._note_feature(name, detail)
         t = self.robot.now() - (self.t_roam or self.robot.now())
         self.events.append({"t_s": _r(t, 2), "event": name, **detail})
         self.log(f"[{name}] {detail}" if detail else f"[{name}]")
 
+    def _note_feature(self, name, d):
+        """Operator 2026-11-26: grey RViz cells where stairs or a curtain were detected. Uses the event's place, else
+        the robot pose plus the reported distance / bearing ahead."""
+        try:
+            kind = 'curtain' if 'curtain' in name else 'stairs'
+            if name == 'advisory':
+                kind = d.get('obstacle')
+                if kind not in ('stairs', 'curtain'):
+                    return
+            course, pose = getattr(self, 'course', None), getattr(self, 'last_pose', None)
+            if course is None:
+                return
+            place = d.get('place')
+            if place is None and pose is not None:
+                dist = next((d[k] for k in ('ahead_m', 'distance_m', 'range_m', 'curtain_m') if d.get(k) is not None), 0.0)
+                yaw = pose[2] + math.radians(d.get('bearing_deg') or d.get('heading_deg') or 0.0)
+                place = (pose[0] + dist * math.cos(yaw), pose[1] + dist * math.sin(yaw))
+            if place is not None:
+                course.mark_feature(course.cell(place[0], place[1]), kind)
+        except Exception:  # noqa: BLE001 - display only
+            pass
+
     def _grid(self):
         item = self.robot.map_grid()
-        if item is not None:
-            self.map = item
+        if item is not None and item is not getattr(self, '_map_raw', None):
+            self._map_raw = item
+            self.map = self._despeckle(item)
         return self.map
+
+    def _despeckle(self, item):
+        """Roam's view of the SLAM map (operator 2026-11-26, heartbeat fixes 2-3): a WINDOW round the course (the
+        walked area + WORK_MARGIN_M, inside the geofence) - SLAM maps 41 x 43 m (700k cells) with the far LiDAR
+        returns, and every map step scaled with that (0.32 s cleanup, ~0.9 s evaluation -> 2 s heartbeat trips). In
+        the window, speckle (wall_gaps.speckle_mask) is floor. Keeps self.speckle = (speckle-zone mask, real-wall
+        mask, geo) for the costmap view and probes; the full raw map stays in _map_raw for turn checks."""
+        import numpy as np
+        self.speckle = None
+        try:
+            g = item[1]
+            data = np.asarray(g.data, dtype=np.int16).reshape(g.height, g.width)
+            ox, oy = g.origin_x, g.origin_y
+            win = self._work_window(g)
+            if win is not None:
+                i0, j0, i1, j1 = win
+                data = data[j0:j1, i0:i1]
+                ox, oy = g.origin_x + i0 * g.resolution, g.origin_y + j0 * g.resolution
+            self.stats['map_view_cells'] = int(data.size)
+            mask = WG.speckle_mask(data, g.resolution)
+            clean = data
+            if mask.any():
+                from scipy import ndimage
+                res = g.resolution
+                walls = (data > 50) & ~mask
+                zone = ndimage.binary_dilation(mask, structure=WG._disc(max(1, int(round(SPECKLE_ZONE_M / res)))))
+                near_wall = ndimage.binary_dilation(walls, structure=WG._disc(max(1, int(round(SPECKLE_WALL_KEEP_M / res)))))
+                clean = data.copy()
+                clean[mask] = 0
+                self.speckle = (zone & ~near_wall, walls, (res, ox, oy))
+                self.stats['speckle_cells'] = int(mask.sum())
+            elif win is None:
+                return item
+            return (item[0], _fast_grid(g, clean, ox, oy))
+        except Exception as exc:  # noqa: BLE001 - a view only: fall back to the raw map
+            self.event('speckle_error', error=str(exc)[:120])
+            return item
+        finally:
+            self._beat_if_due()
+
+    def _work_window(self, g):
+        """(i0, j0, i1, j1) cells of g round the walked course, or None (no anchor yet / rotated map / small map)."""
+        anchor = getattr(self, 'anchor', None)
+        if anchor is None or g.origin_yaw or g.width * g.height <= WORK_MIN_CELLS:
+            return None
+        rec = getattr(self, 'record', None)
+        pts = [anchor] + (list(rec.breadcrumbs) if rec is not None else [])
+        xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+        lim = self.cfg.geofence_m + 1.0
+        x0, x1 = max(min(xs) - WORK_MARGIN_M, anchor[0] - lim), min(max(xs) + WORK_MARGIN_M, anchor[0] + lim)
+        y0, y1 = max(min(ys) - WORK_MARGIN_M, anchor[1] - lim), min(max(ys) + WORK_MARGIN_M, anchor[1] + lim)
+        r = g.resolution
+        i0, i1 = max(0, int((x0 - g.origin_x) / r)), min(g.width, int(math.ceil((x1 - g.origin_x) / r)))
+        j0, j1 = max(0, int((y0 - g.origin_y) / r)), min(g.height, int(math.ceil((y1 - g.origin_y) / r)))
+        if i1 - i0 < 2 or j1 - j0 < 2 or (i1 - i0) * (j1 - j0) >= g.width * g.height:
+            return None
+        return i0, j0, i1, j1
+
+    def _beat_if_due(self, period=HEARTBEAT_STEP_S):
+        """Fix 1 (2026-11-26): heartbeat between heavy steps, at most every period s (the watchdog allows 2 s)."""
+        now = time.monotonic()
+        if now - getattr(self, '_beat_t', -math.inf) >= period and getattr(self, 'channel', None) is not None:
+            self._beat_t = now
+            self._beat()
+
+    def _speckle_zone(self, x, y):
+        """(x, y) lies where only speckle (no real wall) makes the costmap vetoed."""
+        sp = getattr(self, 'speckle', None)
+        if sp is None:
+            return False
+        zone, _, (res, gx, gy) = sp
+        i, j = int(math.floor((x - gx) / res)), int(math.floor((y - gy) / res))
+        return 0 <= j < zone.shape[0] and 0 <= i < zone.shape[1] and bool(zone[j, i])
 
     def _pose(self):
         return self.robot.map_pose()
 
     def _costmap(self):
         item = self.robot.costmap_grid() if hasattr(self.robot, 'costmap_grid') else None
-        return None if item is None or self.robot.now() - item[0] > 10.0 else item[1]
+        if item is None or self.robot.now() - item[0] > 10.0:
+            return None
+        sp = getattr(self, 'speckle', None)
+        if sp is None:
+            return item[1]
+        key = (id(item), id(sp))
+        if getattr(self, '_cost_key', None) != key:
+            self._cost_key, self._cost_clean = key, self._costmap_despeckled(item[1], sp)
+            self._beat_if_due()
+        return self._cost_clean
+
+    @staticmethod
+    def _costmap_despeckled(cost, sp):
+        """The Nav2 global costmap as roam reads it: veto cells in a speckle zone (no real wall near) lowered below
+        COSTMAP_VETO. Nav2 keeps its own costmap; this only lets roam choose goals there and probe."""
+        import numpy as np
+        try:
+            zone, _, (res, gx, gy) = sp
+            data = np.asarray(cost.data, dtype=np.int16).reshape(cost.height, cost.width)
+            jj, ii = np.nonzero(data >= COSTMAP_VETO)
+            if ii.size == 0:
+                return cost
+            wx = cost.origin_x + (ii + 0.5) * cost.resolution
+            wy = cost.origin_y + (jj + 0.5) * cost.resolution
+            si, sj = np.floor((wx - gx) / res).astype(int), np.floor((wy - gy) / res).astype(int)
+            ok = (si >= 0) & (sj >= 0) & (si < zone.shape[1]) & (sj < zone.shape[0])
+            hit = np.zeros(ii.size, dtype=bool)
+            hit[ok] = zone[sj[ok], si[ok]]
+            if not hit.any():
+                return cost
+            data = data.copy()
+            data[jj[hit], ii[hit]] = COSTMAP_VETO - 49
+            return _fast_grid(cost, data, cost.origin_x, cost.origin_y)
+        except Exception:  # noqa: BLE001 - a view only
+            return cost
 
     def lidar_violation(self, now):
         """Raw point clouds, independent of the terrain monitor's processing: the LiDAR is
@@ -1185,12 +1526,14 @@ class RoamSession:
         if raw.age(now) > ROAM_RAW_LIDAR_STALE_S:
             return f'raw LiDAR /livox/points stale ({_r(raw.age(now), 2)} s)'
         window = ROAM_LIDAR_RATE_WINDOW_S
-        if now - self.t_roam > window and len(raw.window(now, window)) / window < self.cfg.min_lidar_hz - 0.5:
+        if now - self.t_roam > window and len(raw.window(now, window)) / window < self.cfg.min_lidar_hz:
             return (f'raw LiDAR rate {len(raw.window(now, window)) / window:.1f} Hz < {self.cfg.min_lidar_hz} Hz '
                     f'over {window:.0f} s')
-        scans = raw.window(now, 1.0)
-        if scans and max(n for _, n in scans) < MIN_RAW_BYTES:
-            return f'raw LiDAR nearly empty ({max(n for _, n in scans)} bytes/scan): sensor blind or blocked'
+        scans = raw.window(now, RAW_LIDAR_EMPTY_S)
+        if scans and self.crossing is None and now - min(t for t, _ in scans) >= RAW_LIDAR_EMPTY_S - 0.5 and \
+                max(n for _, n in scans) < MIN_RAW_BYTES:      # not under a curtain: it covers the LiDAR on purpose
+            return (f'raw LiDAR nearly empty for {RAW_LIDAR_EMPTY_S:.0f} s ({max(n for _, n in scans)} bytes/scan): '
+                    'sensor blind or blocked')
         lio = self.robot.telemetry.lio_cloud
         if lio.total and lio.age(now) > 1.0:
             return f'Fast-LIO sensor output stale ({_r(lio.age(now), 2)} s): SLAM odometry lost'
@@ -1246,7 +1589,7 @@ class RoamSession:
         window = ROAM_LIDAR_RATE_WINDOW_S
         if now - self.t_roam > window:
             hz = len(t.terrain.window(now, window)) / window
-            if hz < self.cfg.min_lidar_hz - 0.5:
+            if hz < self.cfg.min_lidar_hz:
                 return f'LiDAR/terrain rate {hz:.1f} Hz < {self.cfg.min_lidar_hz} Hz over {window:.0f} s'
         if self.map is None or now - self.map[0] > self.cfg.max_map_age_s:
             return 'SLAM map not updating'
@@ -1259,8 +1602,11 @@ class RoamSession:
                 why = command_above_mode(c.vx, c.wz, v, w, self.speed_mode)
                 if why:
                     return why
+        # Only exception: backing off a wall found by a dead-end probe, along the path it just walked (operator
+        # 2026-11-26), up to the back-off speed + 0.05 m/s and only while that back-off runs (+0.5 s for the stop).
+        backing = now <= getattr(self, 'reverse_ok_until', -math.inf)
         for _, c in t.system_cmd.window(now, 0.3):
-            if c.vx < -0.005:
+            if c.vx < -0.005 and not (backing and c.vx >= -(PASSAGE_PROBE_BACK_SPEED_M_S + 0.05)):
                 return 'reverse command reached the robot (no rear sensing)'
         # Actual motion (leg odometry) must match what is commanded: a runaway gait or slipping
         # estimator is caught even while every command is within limits.
@@ -1300,7 +1646,7 @@ class RoamSession:
             self.explorer.block(goal['x'], goal['y'], now, 60)
             self._goal_failed(now, 'Nav2 rejected the goal')
             return
-        self.robot.set_speed_limit(self.cfg.mode_speed(self.speed_mode)[0])   # after the MPPI reset
+        self.robot.set_speed_limit(self._speed_target(now))                  # after the MPPI reset
         self.explorer.sent(goal)
         self.goal = goal
         self.goal_sent_at = now
@@ -1318,7 +1664,230 @@ class RoamSession:
             return True
         return now - getattr(self, '_spin_ended', -math.inf) < 1.0
 
+    def _speed_target(self, now):
+        """Speed limit for Nav2: the speed mode, or APPROACH_SPEED_M_S while closing on a step to cross or on a stop
+        where the camera reads the scene (operator 2026-11-25, item 8)."""
+        base = self.cfg.mode_speed(self.speed_mode)[0]
+        goal, pose = self.goal, self.last_pose
+        if goal is None or goal.get('kind') != 'walk':
+            return base
+        sample = self._terrain_now(now)
+        c = self.cfg
+        if sample is not None and getattr(sample, 'step_ahead_m', None) is not None and \
+                getattr(sample, 'step_rise_m', None) is not None and sample.step_ahead_m <= APPROACH_STEP_M and \
+                c.step_min_rise_m <= abs(sample.step_rise_m) <= c.step_max_rise_m:
+            return min(base, APPROACH_SPEED_M_S)
+        if pose is not None and goal.get('ends_at') in ('room', 'scene') and \
+                math.hypot(goal['x'] - pose[0], goal['y'] - pose[1]) <= APPROACH_STOP_M:
+            return min(base, APPROACH_SPEED_M_S)
+        if getattr(self, 'capture_task', None) is None and self._pocket_ahead(pose):
+            return min(base, APPROACH_SPEED_M_S)
+        return base
+
+    # ---- camera capture in pockets (operator 2026-11-25, items 6 and 7)
+    def _pocket_ahead(self, pose):
+        """An uncaptured pocket cell starts within APPROACH_STOP_M ahead (walk in slowly, item 8)."""
+        if pose is None or self.course is None or not self.course.cells:
+            return False
+        here = self.course.cell(*pose[:2])
+        ahead = self.course.cell(pose[0] + APPROACH_STOP_M * math.cos(pose[2]),
+                                 pose[1] + APPROACH_STOP_M * math.sin(pose[2]))
+        return ahead != here and self.course.is_pocket(ahead) and ahead not in self.course.captured
+
+    def _capture_tick(self, now, pose):
+        """Walking into a pocket: stop, ask for a camera capture, wait for the ack, then carry on with the same goal.
+        True while stopped for it."""
+        task = self.capture_task
+        if task is not None and task.get('scan'):
+            if self.posture_look is not None:
+                return True                                  # the scan runs inside the posture look
+            self.capture_task = None
+            scan = getattr(self, '_last_scan', None) or {}
+            views = scan.get('views', {})
+            got = sorted(v for v, s in views.items() if s.get('status') == 'captured')
+            cell = tuple(task['cell'])
+            result = scan.get('result') or {}
+            room = (result.get('room') or {}).get('type')
+            summary = (room if room and room != 'unknown' else f"room scan {','.join(got) or 'no views'}")[:120]
+            if got:
+                self.course.mark_captured(cell, summary)
+                self.stats['captures'] = self.stats.get('captures', 0) + 1
+            else:
+                retry = getattr(self, '_capture_retry', None)
+                if retry is None:
+                    retry = self._capture_retry = {}
+                retry[cell] = now + CAPTURE_RETRY_S
+            self.event('room_scan_done', scan_id=task['id'], cell=list(cell), views=got,
+                       failed=sorted(v for v, s in views.items() if s.get('status') != 'captured'),
+                       room=(result.get('room') or {}).get('type'), waited_s=_r(now - task['t'], 1))
+            goal = task.get('resume')
+            if goal is not None and not self._goal_invalid(goal) and \
+                    math.hypot(goal['x'] - pose[0], goal['y'] - pose[1]) > 0.3:
+                self._start_walk(now, pose, dict(goal, centre_lane_skip=True))
+            else:
+                self.choose_after = now
+            return True
+        if task is not None and task.get('phase') == 'settle':
+            # Operator 2026-11-26: the NUC decides the dog is standing still, then asks for the photo
+            if not self._still_enough(now) and now - task['t'] < STILL_WAIT_MAX_S:
+                self.robot.send_velocity(0.0, 0.0)
+                return True
+            publish = getattr(self.robot, 'publish_capture_request', None)
+            cell = tuple(task['cell'])
+            publish(capture_request(task['id'], cell, pose, self.record.session if self.record else None,
+                                    'room' if self.course.is_room(cell) else 'pocket', **self._still_fields(now)))
+            task.update(phase='ack', t=now)
+            self.event('capture_request', request_id=task['id'], cell=list(cell),
+                       walls=self.course.cells.get(cell, {}).get('walls'), still=self._still_enough(now))
+            return True
+        if task is not None:
+            acks = getattr(self.robot, 'capture_acks', None) or []
+            ack = next((a for t, text in list(acks) if t >= task['t'] for a in [capture_ack(text, task['id'])] if a),
+                       None)
+            if ack is None and now - task['t'] < CAPTURE_TIMEOUT_S:
+                return True
+            self.capture_task = None
+            result = (ack.get('summary') or ack.get('status') or 'received')[:120] if ack else 'no ack'
+            cell = tuple(task['cell'])
+            if ack is not None:
+                self.course.mark_captured(cell, result)
+                self.stats['captures'] = self.stats.get('captures', 0) + 1
+            else:
+                retry = getattr(self, '_capture_retry', None)
+                if retry is None:
+                    retry = self._capture_retry = {}
+                retry[cell] = now + CAPTURE_RETRY_S
+            self.event('capture_done', cell=list(cell), result=result, waited_s=_r(now - task['t'], 1),
+                       stored=bool(ack and ack.get('stored')))
+            goal = task.get('resume')
+            if goal is not None and not self._goal_invalid(goal) and \
+                    math.hypot(goal['x'] - pose[0], goal['y'] - pose[1]) > 0.3:
+                self._start_walk(now, pose, dict(goal, centre_lane_skip=True))    # move off: same goal
+            else:
+                self.choose_after = now
+            return True
+        publish = getattr(self.robot, 'publish_capture_request', None)
+        if publish is None or self.course is None or self.stairs or self.nudge or \
+                (self.goal is not None and self.goal.get('kind') != 'walk'):
+            return False
+        cell = self.course.cell(*pose[:2])
+        if not self.course.is_pocket(cell) or cell in self.course.captured or \
+                getattr(self, '_capture_retry', {}).get(cell, -math.inf) > now:
+            return False
+        uneven = self._capture_uneven(now)
+        if uneven:                                      # wait until level and clear; tried again every tick
+            if now - getattr(self, '_capture_wait_note', -math.inf) > 5.0:
+                self._capture_wait_note = now
+                self.event('capture_deferred', cell=list(cell), why=uneven)
+            return False
+        resume = self.goal
+        if self.goal is not None:
+            self.robot.nav_cancel(timeout_s=0.5)                                 # dog stops
+            self.goal, self.cancel_request = None, None
+        if self.course.is_room(cell) and hasattr(self.robot, 'send_axis') and self.posture_look is None:
+            sid = f'scan-{len(self.course.captured) + 1}-{cell[0]}_{cell[1]}-{int(now)}'
+            self.posture_look = {'sides': ['left', 'right'], 'phase': 'enter', 't': None, 'max_rounds': 1,
+                                 'scan': {'id': sid, 'cell': list(cell), 'pose': list(pose[:3]), 'views': {},
+                                          'extra': 0}}
+            self.capture_task = {'id': sid, 'cell': list(cell), 't': now, 'resume': resume, 'scan': True}
+            self.stats['room_scans'] = self.stats.get('room_scans', 0) + 1
+            self.event('room_scan_start', scan_id=sid, cell=list(cell))
+            return True
+        rid = f'cap-{len(self.course.captured) + 1}-{cell[0]}_{cell[1]}-{int(now)}'
+        self.robot.send_velocity(0.0, 0.0)
+        self.capture_task = {'id': rid, 'cell': list(cell), 't': now, 'resume': resume, 'phase': 'settle'}
+        self.stats['capture_requests'] = self.stats.get('capture_requests', 0) + 1
+        return self._capture_tick(now, pose)              # asks at once if already still, else waits to be still
+
+    def _capture_uneven(self, now):
+        """Why a camera stop must wait here (None if level and clear): body tilted, or a step / block edge just ahead."""
+        tilt = self.robot.telemetry.current_tilt()
+        if tilt is not None and max(abs(tilt[0]), abs(tilt[1])) > CAPTURE_LEVEL_RAD:
+            return f'tilted {math.degrees(max(abs(tilt[0]), abs(tilt[1]))):.0f} deg'
+        sample = self._terrain_now(now)
+        if sample is not None and getattr(sample, 'step_ahead_m', None) is not None and \
+                getattr(sample, 'step_rise_m', None) is not None and sample.step_ahead_m <= CAPTURE_STEP_CLEAR_M and \
+                abs(sample.step_rise_m) >= self.cfg.step_min_rise_m:
+            return f'step {sample.step_rise_m:+.2f} m at {sample.step_ahead_m:.2f} m'
+        return None
+
+    def _raw_clear(self, x, y, radius=GOAL_EDGE_CLEAR_M):
+        """No occupied cell of the RAW SLAM map within radius of (x, y): off block edges (item 6)."""
+        grid = self._raw_maps()[0]
+        if grid is None:
+            return True
+        cx, cy = grid.cell(x, y)
+        r = int(math.ceil(radius / grid.resolution))
+        for j in range(max(0, cy - r), min(grid.height, cy + r + 1)):
+            for i in range(max(0, cx - r), min(grid.width, cx + r + 1)):
+                if grid.value((i, j)) > 50 and math.hypot((i - cx) * grid.resolution, (j - cy) * grid.resolution) <= radius:
+                    return False
+        return True
+
+    def _room_to_turn(self, pose):
+        """Room to turn in place here: hazard clearance >= TURN_ROOM_CLEAR_M and the raw map clear within the turn
+        radius (Explorer.spin_clear)."""
+        t = self.robot.telemetry
+        item = t.clearance.latest() if hasattr(t, 'clearance') else None
+        if item is not None and item[1] < TURN_ROOM_CLEAR_M:
+            return False
+        grid, cost = self._raw_maps()
+        if grid is None:
+            return True
+        r = self.explorer.spin_radius()
+        return self.explorer.spin_clear(pose[0], pose[1], self.explorer.known_obstacles(grid, cost, pose[:2], r + 0.1))
+
+    def _back_for_room(self, now, pose, why):
+        """Start walking straight back until there is room to turn (see BACK_FOR_ROOM_MAX_M). False if it cannot:
+        dry run, no odometry, something close behind, or it already backed off here just now."""
+        if not self.robot.can_actuate or pose is None or self.nudge is not None or self.stairs:
+            return False
+        odom = self.robot.telemetry.odom.latest()
+        last = getattr(self, '_back_room_last', None)
+        if odom is None or (last is not None and now - last[0] < BACK_FOR_ROOM_REPEAT_S and
+                            math.hypot(pose[0] - last[1], pose[1] - last[2]) < 0.3):
+            return False
+        behind = self._rear_obstacle()
+        if behind < PASSAGE_PROBE_REAR_CLEAR_M + 0.1:
+            self.event('back_for_room_impossible', why=why[:60], behind_m=_r(behind, 2))
+            return False
+        length = min(BACK_FOR_ROOM_MAX_M, behind - PASSAGE_PROBE_REAR_CLEAR_M)
+        self._back_room_last = (now, pose[0], pose[1])
+        if self.goal is not None:
+            self.robot.nav_cancel(timeout_s=0.5)
+            self.goal, self.cancel_request = None, None
+        self.nudge = {'origin': (odom[1].x, odom[1].y), 't': now, 'length': length, 'progress': (now, 0.0),
+                      'sign': -1, 'end_event': 'back_for_room_end', 'until_room': True,
+                      'max_s': length / PASSAGE_PROBE_BACK_SPEED_M_S + 4.0}
+        self.stats['back_for_room'] = self.stats.get('back_for_room', 0) + 1
+        self.event('back_for_room', why=why[:60], max_m=_r(length, 2), behind_m=_r(behind, 2))
+        return True
+
+    def _pressed(self, now):
+        """The dog is touching something: hazard-cloud clearance under TURN_PRESSED_M. Operator 2026-11-25 (15:36 SGT
+        flip: four look-around turns at 2-3 cm clearance, the fifth flipped it); narrowed on request."""
+        t = self.robot.telemetry
+        item = t.clearance.latest() if hasattr(t, 'clearance') else None
+        if item is not None and item[1] < TURN_PRESSED_M:
+            return f'clearance {item[1]:.2f} m'
+        return None
+
     def _start_spin(self, now, pose, angle, reason='search turn'):
+        # Narrow (operator 2026-11-25): only the OPTIONAL look-around / resume-scan turns are skipped, and only while
+        # touching something. Every other turn goes to Nav2 as before; Nav2's own Spin collision check still runs.
+        pressed = self._pressed(now)
+        if pressed and self._back_for_room(now, pose, f'no space to turn ({pressed})'):
+            if reason.startswith('look-around'):
+                self.look.insert(0, angle)           # the same look-around turn, once there is room
+            return                                   # backing up; the turn is asked for again once there is room
+        if not reason.startswith('look-around'):
+            pressed = None
+        if pressed:
+            self.look = []
+            self.stats['turns_skipped_pressed'] = self.stats.get('turns_skipped_pressed', 0) + 1
+            self.event('turn_skipped', reason=reason[:60], pressed=pressed, degrees=_r(math.degrees(angle), 0))
+            self.choose_after = now + MAP_SETTLE_S
+            return
         # behavior_server min_rotational_vel 0.1 rad/s; the approach action never slows turning in place
         allowance = abs(angle) / 0.1 + 20.0
         if not self.robot.nav_spin(angle, allowance):
@@ -1344,6 +1913,10 @@ class RoamSession:
             self.spins_blocked = 0
         looking = bool(self.goal and self.goal.get('look'))
         spin = self.goal or {}
+        if spin.get('grid_face') and how != 'done' and self._grid_face is not None:
+            self._arena_hold(now, f'turn to the next cell stopped early ({how}, '
+                                  f'{math.degrees(spun or 0.0):.0f} of {math.degrees(spin.get("angle", 0.0)):.0f} deg)',
+                             self._grid_face['lane'][1])
         self.goal = None
         self._spin_ended = now
         if looking and spin.get('angle'):                # look-around that keeps failing: stop shuffling
@@ -1352,7 +1925,12 @@ class RoamSession:
             if self.look_short >= LOOK_ABANDON_AFTER and self.look:
                 self.event('look_abandoned', remaining=len(self.look), reason='turns cut short near obstacles')
                 self.look, self.look_short = [], 0
-        self._drift_check(now, spin)
+        if spin.get('stair_centring'):
+            stair = getattr(self, '_pending_stair', None)
+            if stair is not None:
+                stair['centred_after'] = now
+        else:
+            self._drift_check(now, spin)
         self.choose_after = now if how == 'opening' else now + (LOOK_DWELL_S if looking and self.look else MAP_SETTLE_S)
 
     def _drift_check(self, now, spin):
@@ -1385,13 +1963,25 @@ class RoamSession:
         n = self.nudge
         odom = self.robot.telemetry.odom.latest()
         done = None
-        if odom is None:
+        if n.get('yaw') is not None and not n.get('aligned') and odom is not None:
+            pose = self._pose()                    # a probe faces its goal first
+            err = None if pose is None else math.atan2(math.sin(n['yaw'] - pose[2]), math.cos(n['yaw'] - pose[2]))
+            if err is not None and abs(err) > PROBE_TURN_TOL_RAD and now - n['t'] <= PROBE_TURN_MAX_S:
+                self.robot.send_velocity(0.0, math.copysign(min(PROBE_TURN_RATE, max(0.2, 1.5 * abs(err))), err))
+                return
+            if err is None or abs(err) > PROBE_TURN_TOL_RAD:
+                done = 'could not face the goal'
+            else:
+                n.update(aligned=True, origin=(odom[1].x, odom[1].y), t=now, progress=(now, 0.0))
+        if done is not None:
+            pass
+        elif odom is None:
             done = 'no odometry'
         else:
             moved = math.hypot(odom[1].x - n['origin'][0], odom[1].y - n['origin'][1])
             if moved >= n['length']:
                 done = 'done'
-            elif now - n['t'] > NUDGE_MAX_S:
+            elif now - n['t'] > n.get('max_s', NUDGE_MAX_S):
                 done = 'timeout'
             elif moved > n['progress'][1] + 0.03:
                 n['progress'] = (now, moved)
@@ -1399,17 +1989,44 @@ class RoamSession:
                 done = 'no progress'
         sample = self._terrain_now(now)
         if done is None and n.get('sign', 1) > 0 and sample is not None and sample.obstacle_ahead_m is not None \
-                and sample.obstacle_ahead_m < NUDGE_CLEAR_M:
-            done = 'obstacle ahead'
+                and sample.obstacle_ahead_m < n.get('stop_m', NUDGE_CLEAR_M):
+            done = 'surface 5 cm ahead' if n.get('probe') else 'obstacle ahead'
+        if done is None and n.get('probe') and sample is not None and sample.step_ahead_m is not None and \
+                sample.step_rise_m is not None and sample.step_ahead_m <= STEP_START_M and \
+                self.cfg.step_min_rise_m <= abs(sample.step_rise_m) <= self.cfg.step_max_rise_m:
+            done = 'step ahead'                     # roam's step crossing takes it from here
+        if n.get('probe') and self.record is not None:
+            pose = self._pose()
+            if pose is not None:
+                self.record.add_breadcrumb(pose[0], pose[1])
         sign = n.get('sign', 1)
-        if done is None and sign < 0 and self._rear_obstacle() < MAKE_ROOM_REAR_CLEAR_M - 0.25:
+        if done is None and n.get('tilt') is not None:
+            tilt = self.robot.telemetry.current_tilt()
+            cur = None if tilt is None else max(abs(tilt[0]), abs(tilt[1]))
+            if cur is not None and cur < math.radians(TILT_LEVEL_DEG):
+                done = 'level'
+        if done is None and sign < 0 and self._rear_obstacle() < n.get('rear_m', PASSAGE_PROBE_REAR_CLEAR_M):
             done = 'obstacle behind'
+        if done is None and n.get('until_room') and odom is not None:
+            pose = self._pose()
+            moved = math.hypot(odom[1].x - n['origin'][0], odom[1].y - n['origin'][1])
+            if pose is not None and moved >= 0.10 and self._room_to_turn(pose):
+                done = 'room to turn'
         if done is None:
-            self.robot.send_velocity(sign * min(NUDGE_SPEED_M_S, self.cfg.mode_speed(self.speed_mode)[0]), 0.0)
+            speed = PROBE_SPEED_M_S if n.get('probe') else NUDGE_SPEED_M_S
+            if sign < 0:
+                speed = PASSAGE_PROBE_BACK_SPEED_M_S
+                self.reverse_ok_until = now + 0.5         # the back-off allowance (roam_violation, watchdog limits)
+            self.robot.send_velocity(sign * min(speed, self.cfg.mode_speed(self.speed_mode)[0]), 0.0)
             return
         self.robot.send_velocity(0.0, 0.0)
         self.nudge = None
         self.choose_after = now + 0.5
+        if n.get('probe'):
+            moved = 0.0 if odom is None else math.hypot(odom[1].x - n['origin'][0], odom[1].y - n['origin'][1])
+            self.stats['speckle_probes'] = self.stats.get('speckle_probes', 0) + 1
+            self.event(n['end_event'], how=done, walked_m=_r(moved, 2))
+            return
         self.event(n.get('end_event', 'drift_correction_end'), how=done)
 
     def _rear_obstacle(self):
@@ -1417,11 +2034,21 @@ class RoamSession:
         pose = self._pose()
         if pose is None or self.map is None:
             return 0.0
-        return self.explorer.ray(self.map[1], self._costmap(), pose, pose[2] + math.pi)[2]
+        return self.explorer.ray(*self._raw_maps(), pose, pose[2] + math.pi)[2]
+
+    def _raw_maps(self):
+        """(SLAM grid, Nav2 costmap) WITHOUT the speckle cleanup: for turning and stepping near obstacles. Operator
+        2026-11-25: speckle-as-floor is for choosing goals only (07:36 flip: small blocks hidden from turn checks)."""
+        raw = getattr(self, '_map_raw', None)
+        m = getattr(self, 'map', None)
+        grid = raw[1] if raw is not None else (m[1] if m is not None else None)
+        item = self.robot.costmap_grid() if hasattr(self.robot, 'costmap_grid') else None
+        cost = None if item is None or self.robot.now() - item[0] > 10.0 else item[1]
+        return grid, cost
 
     def _make_room(self, now, pose):
-        """Turns keep being blocked: step MAKE_ROOM_M straight forward if clear (terrain monitor and SLAM), else
-        straight back if SLAM shows it clear behind. True if a step started."""
+        """Turns keep being blocked: step MAKE_ROOM_M straight forward if clear (terrain monitor and SLAM).
+        Forward when clear; otherwise walk back until there is room to turn (operator 2026-11-26). True if started."""
         if not self.robot.can_actuate or self.map is None:
             return False
         odom = self.robot.telemetry.odom.latest()
@@ -1429,13 +2056,14 @@ class RoamSession:
             return False
         sample = self._terrain_now(now)
         ahead_terrain = None if sample is None else sample.obstacle_ahead_m
-        ahead_map = self.explorer.ray(self.map[1], self._costmap(), pose, pose[2])[2]
+        ahead_map = self.explorer.ray(*self._raw_maps(), pose, pose[2])[2]
         behind = self._rear_obstacle()
         if (ahead_terrain is None or ahead_terrain >= MAKE_ROOM_M + NUDGE_CLEAR_M) and \
                 ahead_map >= MAKE_ROOM_M + MAKE_ROOM_FRONT_CLEAR_M:
             sign, way = 1, 'forward'
-        elif behind >= MAKE_ROOM_M + MAKE_ROOM_REAR_CLEAR_M:
-            sign, way = -1, 'back'
+        elif self._back_for_room(now, pose, 'turns blocked, no room ahead'):
+            self.spins_blocked = 0
+            return True                         # operator 2026-11-26: walk back until there is room to turn
         else:
             self.event('make_room_impossible', ahead_terrain_m=_r(ahead_terrain, 2), ahead_map_m=_r(ahead_map, 2),
                        behind_m=_r(behind, 2))
@@ -1485,7 +2113,19 @@ class RoamSession:
         return goal
 
     def _backtrack(self, now, pose):
-        """Dead end: walk back along the breadcrumb trail (known reachable) and avoid this spot."""
+        """Dead end: walk back along the breadcrumb trail (known reachable) and avoid this spot.
+        Unified decision (operator 2026-11-25): backtrack ONLY when a room is still unread - then go back (Nav2 over
+        known reachable floor) to that room's viewpoint and read it. No unread room: no backtrack."""
+        if self.cfg.decision == 'unified' and self.course is not None:
+            goals = self._room_goals(now, pose)
+            if not goals:
+                self.event('backtrack_skipped', reason='no unread room')
+                return False
+            goal = dict(goals[0], backtrack_from=[pose[0], pose[1]])
+            self.stats['backtracks'] = self.stats.get('backtracks', 0) + 1
+            self.event('backtrack', to=[_r(goal['x'], 2), _r(goal['y'], 2)], room=goal['cell'])
+            self._start_walk(now, pose, goal)
+            return True
         if self.backtracks >= MAX_BACKTRACKS:
             return False
         while self.trail and math.hypot(self.trail[-1][0] - pose[0], self.trail[-1][1] - pose[1]) < BACKTRACK_MIN_M:
@@ -1499,7 +2139,8 @@ class RoamSession:
         self.event('backtrack', to=[_r(x, 2), _r(y, 2)], consecutive=self.backtracks)
         self.scan_index = 0
         self._start_walk(now, pose, {'kind': 'walk', 'x': x, 'y': y, 'yaw': math.atan2(y - pose[1], x - pose[0]),
-                                     'score': 0.0, 'free_m': None, 'ends_at': 'backtrack'})
+                                     'score': 0.0, 'free_m': None, 'ends_at': 'backtrack',
+                                     'backtrack_from': [pose[0], pose[1]]})
         return True
 
     def _take_mission(self, pose):
@@ -1521,8 +2162,26 @@ class RoamSession:
                         'event_id': ev['event_id']}
             self.sightings.append(sighting)
             self.stats['mission_events'] = self.stats.get('mission_events', 0) + 1
+            self._mission_evidence(ev, pose)
             self.event('mission', **sighting)
             self._log_mission(ev, sighting, text)
+
+    def _mission_evidence(self, ev, pose):
+        """Operator 2026-11-25: pending mission evidence keeps its cell uninspected - a survivor stays pending until a
+        QR is read in or next to its cell (the QR names the survivor's location)."""
+        if self.course is None:
+            return
+        at = ev['location'] or (pose[:2] if pose else None)
+        if at is None:
+            return
+        c = self.course.cell(*at)
+        if ev['type'] == 'observation' and ev['value'].lower() in SURVIVOR_LABELS:
+            self.course.mark_pending(c, 'survivor: QR not read yet')
+            self.event('evidence_pending', cell=list(c), reason='survivor: QR not read yet')
+        elif ev['type'] == 'qr':
+            for p in [p for p in self.course.pending if abs(p[0] - c[0]) <= 1 and abs(p[1] - c[1]) <= 1]:
+                self.course.resolve(p)
+                self.event('evidence_resolved', cell=list(p), by='qr')
 
     def _take_scene(self, now, pose):
         """Hook: detections from the teammate's scene node, tagged with the robot's map pose."""
@@ -1637,14 +2296,86 @@ class RoamSession:
         ahead = math.hypot(p['x'] - pose[0], p['y'] - pose[1])
         self.passages_done.append((p['x'], p['y']))
         self.passage = None
+        if self.cfg.passage_probe and self._probe_passage(now, pose, p, ahead):
+            return
         self.stats['passage_stops'] = self.stats.get('passage_stops', 0) + 1
         self._pause(f'stopped in front of a blocked passage (possible curtain) {ahead:.2f} m ahead; '
                     'resume to explore on')
+
+    def _probe_passage(self, now, pose, p, ahead):
+        """Operator 2026-11-26: no confirmation came - find out by walking into it as a curtain crossing (facing
+        it already). True if the probe started."""
+        if not self.robot.can_actuate:             # no curtain cooldown here: passages_done already keeps one
+            return False                           # passage from being probed twice
+        odom = self.robot.telemetry.odom.latest()
+        if odom is None:
+            return False
+        err = math.atan2(math.sin(p['yaw'] - pose[2]), math.cos(p['yaw'] - pose[2]))
+        if abs(err) > math.radians(15):
+            self.event('passage_probe_skipped', reason=f'not facing it ({math.degrees(err):.0f} deg off)')
+            return False
+        self.crossing = {'origin': (odom[1].x, odom[1].y), 't': now, 'length': ahead + CURTAIN_PAST_M,
+                         'progress': (now, 0.0), 'probe': True, 'wall': (p['x'], p['y']),
+                         'slam_origin': (pose[0], pose[1]), 'slam_progress': (now, 0.0)}
+        self.stats['passage_probes'] = self.stats.get('passage_probes', 0) + 1
+        self.event('passage_probe', wall_m=_r(ahead, 2), length_m=_r(self.crossing['length'], 2),
+                   heading_deg=_r(math.degrees(p['yaw']), 0))
+        return True
+
+    def _tilted(self):
+        """Body tilted more than TILT_ESCAPE_DEG (roll or pitch)."""
+        tilt = self.robot.telemetry.current_tilt()
+        return tilt is not None and max(abs(tilt[0]), abs(tilt[1])) > math.radians(TILT_ESCAPE_DEG)
+
+    def _tilt_escape_tick(self, now, pose):
+        """Operator 2026-11-26: keep going while tilted. Standing still tilted for TILT_ESCAPE_HOLD_S: step straight
+        off it (lower side first - nose up: back; else forward), alternating, until level. True while it took over."""
+        if self.nudge is not None or self.stairs or not self.robot.can_actuate or pose is None:
+            return False
+        if not self._tilted():
+            self._tilt_since = None
+            return False
+        since = getattr(self, '_tilt_since', None)
+        if since is None:
+            self._tilt_since = now
+            return False
+        if now - since < TILT_ESCAPE_HOLD_S:
+            return False
+        st = getattr(self, '_tilt_escape', None)
+        if st is None or math.hypot(pose[0] - st['x'], pose[1] - st['y']) > 0.3:
+            st = self._tilt_escape = {'x': pose[0], 'y': pose[1], 'tries': 0, 'next': now}
+        if now < st['next'] or st['tries'] >= TILT_ESCAPE_TRIES:
+            return False                                  # between attempts / tried here: the normal choice
+        odom = self.robot.telemetry.odom.latest()
+        tilt = self.robot.telemetry.current_tilt()
+        if odom is None or tilt is None:
+            return False
+        roll, pitch = tilt
+        first = -1 if pitch < -math.radians(5.0) else 1   # nose up (pitch < 0, as on the stairs up): lower side behind
+        sign = first if st['tries'] % 2 == 0 else -first
+        st['tries'] += 1
+        max_s = TILT_ESCAPE_M / NUDGE_SPEED_M_S + 2.0
+        st['next'] = now + max_s + TILT_ESCAPE_GAP_S
+        self.nudge = {'origin': (odom[1].x, odom[1].y), 't': now, 'length': TILT_ESCAPE_M, 'progress': (now, 0.0),
+                      'sign': sign, 'end_event': 'tilt_escape_end', 'tilt': max(abs(roll), abs(pitch)),
+                      'stop_m': 0.0, 'rear_m': TILT_ESCAPE_REAR_M, 'max_s': max_s}
+        self.stats['tilt_escapes'] = self.stats.get('tilt_escapes', 0) + 1
+        self.event('tilt_escape', direction='forward' if sign > 0 else 'back', attempt=st['tries'],
+                   roll_deg=_r(math.degrees(roll), 1), pitch_deg=_r(math.degrees(pitch), 1))
+        return True
 
     def _plan_look(self, pose):
         """After a walk: turn to look at the sides that still hold unseen mapped floor (camera coverage).
         Operator 2026-11-23: look-arounds only where there is something left to see."""
         self.look_check = False
+        if getattr(self, 'on_block', None) is not None or self._tilted():
+            # Operator 2026-11-26 (18:14 run: 40 s of posture rounds on a block edge, then tilted 21 deg): no look-around
+            # on a block or while tilted.
+            self.event('look_skipped', reason='on a block' if getattr(self, 'on_block', None) else 'tilted')
+            return False
+        if self.course is not None and self.course.cells and \
+                not self.course.is_pocket(self.course.cell(*pose[:2])):
+            return False                  # operator 2026-11-25: the camera is for pockets - look around only there
         if self.coverage is None or self.map is None or \
                 any(math.hypot(pose[0] - x, pose[1] - y) < LOOK_SPACING_M for x, y in self.look_spots):
             return False
@@ -1660,10 +2391,356 @@ class RoamSession:
         if not turns:
             return False
         self.look_spots.append((pose[0], pose[1]))
-        self.look = [math.radians(a) for a in turns]
         self.stats['look_arounds'] = self.stats.get('look_arounds', 0) + 1
+        sides = (['left'] if left >= LOOK_MIN_SIDE_M2 else []) + (['right'] if right >= LOOK_MIN_SIDE_M2 else [])
+        if self.robot.can_actuate and hasattr(self.robot, 'send_axis'):
+            self.posture_look = {'sides': sides, 'phase': 'enter', 't': None}
+            self.event('look_around', left_unseen_m2=_r(left, 1), right_unseen_m2=_r(right, 1), posture=sides)
+            return True
+        self.look = [math.radians(a) for a in turns]   # dry run / simulator without axis commands: turn instead
         self.event('look_around', left_unseen_m2=_r(left, 1), right_unseen_m2=_r(right, 1), turns_deg=turns)
         return True
+
+    def _pi_frames_since(self, t0):
+        """Pi detections frames captured at or after roam time t0 (arrival minus the frame's own latency); None when
+        this robot has no Pi frame stream (simulator / dry stand-in)."""
+        frames = getattr(self.robot, 'pi_frames', None)
+        if frames is None:
+            return None
+        count = 0
+        for received, wall, stamp in list(frames):
+            latency = wall - stamp / 1e9
+            if PI_LATENCY_RANGE_S[0] <= latency <= PI_LATENCY_RANGE_S[1] and received - latency >= t0:
+                count += 1
+        return count
+
+    def _posture_view_done(self, now, p, view, min_s):
+        """One posture view (a side or the centre) is held long enough for YOLO: min_s, and POSTURE_LOOK_FRAMES Pi
+        frames captured after the body settled, or POSTURE_LOOK_MAX_S at most. Logs each finished view."""
+        held = now - p['t']
+        if held >= POSTURE_LOOK_SETTLE_S and not p.get('scan') and p.get('pictured') != (view, p.get('round', 1), p['t']) \
+                and (self._still_enough(now) or held >= min_s):
+            p['pictured'] = (view, p.get('round', 1), p['t'])
+            self._posture_picture(now, view, p)          # operator 2026-11-26: every pose takes a picture
+        if held < min_s:
+            return False
+        frames = self._pi_frames_since(p['t'] + POSTURE_LOOK_SETTLE_S)
+        if frames is not None and frames < POSTURE_LOOK_FRAMES and held < POSTURE_LOOK_MAX_S:
+            return False
+        self.event('posture_view_held', view=view, round=p.get('round', 1), held_s=_r(held, 1), pi_frames=frames,
+                   timed_out=frames is not None and frames < POSTURE_LOOK_FRAMES)
+        return True
+
+    def _backtrack_scan_tick(self, now, pose):
+        """After a backtrack walk: face where the dog was stuck, then engage the pose (posture look, both sides,
+        POSTURE_LOOK_ROUNDS rounds) there, in case it was a scene. True when it acted this tick."""
+        scan = getattr(self, 'backtrack_scan', None)
+        if scan is None or self.goal is not None or self.posture_look is not None:
+            return False
+        (sx, sy), distance = scan['at'], math.hypot(scan['at'][0] - pose[0], scan['at'][1] - pose[1])
+        if scan['phase'] == 'face':
+            scan['phase'] = 'pose'
+            turn = math.remainder(math.atan2(sy - pose[1], sx - pose[0]) - pose[2], math.tau)
+            if distance > 0.3 and abs(turn) > math.radians(BACKTRACK_SCAN_FACE_DEG):
+                self._start_spin(now, pose, turn, reason='backtrack scan: face where it was stuck')
+                if self.goal is not None:
+                    self.goal['look'] = True
+                    return True
+        self.backtrack_scan = None
+        posture = bool(self.robot.can_actuate and hasattr(self.robot, 'send_axis'))
+        self.event('backtrack_scan', stuck_at=[_r(sx, 2), _r(sy, 2)], distance_m=_r(distance, 2), posture=posture)
+        if posture:
+            self.posture_look = {'sides': ['left', 'right'], 'phase': 'enter', 't': None}
+        return True
+
+    def _posture_look_tick(self, now):
+        """One step of the body-yaw look-around: enter -> each side -> centre -> exit."""
+        from .ros_io import AXIS_YAW, MANUAL_MODE, POSE_MODE
+        p, r = self.posture_look, self.robot
+        if p['phase'] == 'enter':
+            r.send_velocity(0.0, 0.0)
+            self.event('posture_look_start', sides=p['sides'],
+                       manual=r.send_simple_command(MANUAL_MODE), pose=r.send_simple_command(POSE_MODE))
+            p.update(phase='side', index=0, t=r.now(), yaw0=self.last_pose[2] if self.last_pose else None, yaws=[],
+                     round=1)
+            return
+        self.runner.own_axis_until = now + OWN_AXIS_GRACE_S    # our axis commands echo on /handle_state
+        if p['phase'] == 'side':
+            if p['index'] < len(p['sides']) and self.last_pose is not None:
+                p.setdefault('yaws', []).append((now, self.last_pose[2]))
+            if p['index'] >= len(p['sides']):
+                p.update(phase='centre', t=now)
+            elif self._posture_view_done(now, p, p['sides'][p['index']], POSTURE_LOOK_HOLD_S) and \
+                    (p.get('scan') is None or self._scan_view_tick(now, p)):
+                if getattr(self.cfg, 'arena_holds', False):
+                    self._posture_view_check(now, p)
+                p.update(index=p['index'] + 1, t=now, yaws=[])
+            else:
+                side = p['sides'][p['index']]
+                r.send_axis(AXIS_YAW, -POSTURE_LOOK_YAW_AXIS if side == 'left' else POSTURE_LOOK_YAW_AXIS)
+                return
+        if p['phase'] == 'centre':
+            r.send_axis(AXIS_YAW, 0)
+            if not self._posture_view_done(now, p, 'centre', POSTURE_LOOK_CENTRE_S):
+                return
+            if p.get('scan') is not None and not self._scan_result_tick(now, p):
+                return
+            if p.get('round', 1) < p.get('max_rounds', POSTURE_LOOK_ROUNDS):
+                p.update(phase='gap', t=now)
+                self.event('posture_look_round_done', round=p.get('round', 1), of=POSTURE_LOOK_ROUNDS,
+                           pause_s=POSTURE_LOOK_GAP_S)
+                return
+            self._leave_posture('done')
+            return
+        if p['phase'] == 'gap':
+            r.send_axis(AXIS_YAW, 0)                           # centred and still between rounds
+            if now - p['t'] < POSTURE_LOOK_GAP_S:
+                return
+            p.update(phase='side', index=0, t=now, yaws=[], round=p.get('round', 1) + 1)
+
+    def _room_view_start(self, now, goal):
+        cell = tuple(goal['cell'])
+        self.room_view = {'cell': cell, 'scan_id': f'view-{cell[0]}_{cell[1]}-{int(now)}', 'phase': 'face',
+                          't': now, 'start': now, 'attempt': 0, 'id': None, 'tries': [],
+                          'face_yaw': goal.get('face_yaw'), 'turned': False}
+        self.robot.send_velocity(0.0, 0.0)
+        self.stats['room_views'] = self.stats.get('room_views', 0) + 1
+        self.event('room_view_start', cell=list(cell), scan_id=self.room_view['scan_id'])
+
+    def _still_since(self, now):
+        """Robot time since when the dog has been standing still (odometry and IMU at rest), or None if it is moving
+        now / no data. Measured on the NUC (operator 2026-11-26), not inferred from commands."""
+        t = getattr(self.robot, 'telemetry', None)
+        if t is None:
+            return now - STILL_S                        # no telemetry to measure (stub robot): as before, assume still
+        odom = t.odom.window(now, STILL_S)
+        if not odom:
+            return None
+        moving = [ts for ts, o in odom if math.hypot(o.vx, o.vy) > STILL_MAX_SPEED_M_S or abs(o.wz) > STILL_MAX_YAW_RATE]
+        moving += [ts for ts, m in t.imu.window(now, STILL_S)
+                   if m.gyro and max(abs(g) for g in m.gyro) > STILL_MAX_GYRO]
+        if not moving:
+            return min(ts for ts, _ in odom)
+        last = max(moving)
+        return None if now - last < 0.05 else last
+
+    def _still_fields(self, now):
+        """Request fields telling the Pi the dog is standing still (wall time it became still): capture at once."""
+        since = self._still_since(now)
+        if since is None:
+            return {'still': False}
+        return {'still': True, 'still_since_wall': round(time.time() - (now - since), 3)}
+
+    def _still_enough(self, now):
+        since = self._still_since(now)
+        return since is not None and now - since >= STILL_S - 0.05
+
+    def _room_view_tick(self, now, pose):
+        """In front of a room, facing in: settle, one forward photo (one retry), wait for the Pi's answer (Claude +
+        OpenCV QR), then mark the room read. True while it holds the dog here."""
+        rv = getattr(self, 'room_view', None)
+        if rv is None:
+            return False
+        publish = getattr(self.robot, 'publish_capture_request', None)
+        if publish is None:
+            return self._room_view_end(now, None, 'no camera link')
+        if rv['phase'] == 'face':
+            if self.goal is not None:
+                return False                                  # the slow face-the-room turn runs as a normal spin
+            turn = None if rv['face_yaw'] is None or pose is None else \
+                math.remainder(rv['face_yaw'] - pose[2], math.tau)
+            if rv['turned'] or turn is None or abs(turn) <= math.radians(ROOM_FACE_TOL_DEG):
+                rv.update(phase='settle', t=now)
+                return True
+            uneven = self._capture_uneven(now)
+            if uneven:                                        # never turn on a block or at a step edge
+                if now - rv['t'] < ROOM_VIEW_LEVEL_WAIT_S:
+                    return True
+                return self._room_view_end(now, None, f'not level to turn: {uneven}')
+            rv['turned'] = True
+            self.event('room_view_face', cell=list(rv['cell']), turn_deg=_r(math.degrees(turn), 0))
+            self._start_spin(now, pose, turn, reason='room view: face the room')
+            if self.goal is not None:
+                self.goal['fixed_turn'] = True
+            return True
+        if rv['phase'] == 'settle':
+            if not self._still_enough(now):                   # measured on the NUC: still for STILL_S
+                if now - rv['t'] < ROOM_VIEW_SETTLE_S + ROOM_VIEW_LEVEL_WAIT_S:
+                    return True
+                return self._room_view_end(now, None, 'never stood still')
+            uneven = self._capture_uneven(now)
+            if uneven:
+                if now - rv['t'] < ROOM_VIEW_SETTLE_S + ROOM_VIEW_LEVEL_WAIT_S:
+                    return True
+                return self._room_view_end(now, None, f'not level: {uneven}')
+            rv['attempt'] += 1
+            rv['id'] = f"{rv['scan_id']}-forward-{rv['attempt']}"
+            publish(capture_request(rv['id'], list(rv['cell']), pose, self.record.session if self.record else None,
+                                    'room view', scan_id=rv['scan_id'], view_id='forward', final=True,
+                                    **self._still_fields(now)))
+            rv.update(phase='ack', t=now)
+            self.event('room_view_request', cell=list(rv['cell']), request_id=rv['id'], attempt=rv['attempt'])
+            return True
+        if rv['phase'] == 'ack':
+            acks = getattr(self.robot, 'capture_acks', None) or []
+            ack = next((a for t, text in list(acks) if t >= rv['t'] for a in [capture_ack(text, rv['id'])] if a), None)
+            status = (ack or {}).get('status')
+            if ack is not None and status not in ('timeout', 'failed', 'no_frame', 'blurry'):
+                rv.update(phase='result', t=now)
+                self.event('room_view_captured', cell=list(rv['cell']), stamp=ack.get('capture_stamp_ns'),
+                           sharpness=ack.get('sharpness'))
+                return True
+            if ack is None and now - rv['t'] < ROOM_SCAN_VIEW_WAIT_S:
+                return True
+            rv['tries'].append(status or 'no ack')
+            if rv['attempt'] < ROOM_VIEW_ATTEMPTS:                # missing or blurry: settle again, ask again
+                self.event('room_view_retry', cell=list(rv['cell']), why=status or 'no ack')
+                rv.update(phase='settle', t=now)
+                return True
+            return self._room_view_end(now, None, f"photo failed: {', '.join(rv['tries'])}")
+        msgs = getattr(self.robot, 'room_scan_msgs', None) or []
+        res = next((r for t, text in reversed(list(msgs)) if t >= rv['t']
+                    for r in [room_scan_result(text, rv['scan_id'])] if r), None)
+        if res is None and now - rv['t'] < ROOM_SCAN_RESULT_WAIT_S:
+            return True
+        return self._room_view_end(now, res or {}, None)
+
+    def _room_view_end(self, now, res, failure):
+        rv, self.room_view = self.room_view, None
+        cell = rv['cell']
+        if failure is None:                                   # photo taken: the room is read (answer or not)
+            room = (res.get('room') or {}).get('type')
+            summary = room if room and room != 'unknown' else 'viewed from the front'
+            self.course.mark_captured(cell, summary)
+            self.course.mark_room_read(cell, summary)
+            self.stats['rooms_viewed'] = self.stats.get('rooms_viewed', 0) + 1
+        else:                                                 # try again later, from the front again
+            self.course.block_cell(cell, now, CAPTURE_RETRY_S)
+        self.event('room_view_done', cell=list(cell), scan_id=rv['scan_id'], failure=failure,
+                   room=((res or {}).get('room') or {}).get('type'),
+                   findings=[(f.get('kind'), f.get('label')) for f in (res or {}).get('findings') or []],
+                   qr=[q.get('text') for q in (res or {}).get('qr') or []], qr_unreadable=(res or {}).get('qr_unreadable'),
+                   waited_s=_r(now - rv['start'], 1))
+        self.choose_after = now
+        return True
+
+    def _scan_view_tick(self, now, p):
+        """Room scan: the body holds this side; ask the Pi for a fresh photo and wait for its ack (one retry).
+        True when this view is finished (captured, or given up), so the look moves on."""
+        scan, side = p['scan'], p['sides'][p['index']]
+        view_id = p.get('view_ids', {}).get(p['index'], side)
+        v = scan['views'].setdefault(view_id, {'attempt': 0, 'id': None, 't': None, 'status': None})
+        if v['status'] is not None:
+            return True
+        publish = getattr(self.robot, 'publish_capture_request', None)
+        if publish is None:
+            v['status'] = 'no publisher'
+            return True
+        if v['id'] is not None:
+            acks = getattr(self.robot, 'capture_acks', None) or []
+            ack = next((a for t, text in list(acks) if t >= v['t'] for a in [capture_ack(text, v['id'])] if a), None)
+            if ack is not None and ack.get('status') not in ('timeout', 'failed', 'no_frame'):
+                # 'captured' (Pi room scan); 'analysed' / 'pending' from the older capture service also hold a photo
+                v['status'] = 'captured'
+                self.event('room_scan_view', scan_id=scan['id'], view=view_id, attempt=v['attempt'],
+                           stamp=ack.get('capture_stamp_ns'), qr=ack.get('qr') or [])
+                return True
+            if ack is None and now - v['t'] < ROOM_SCAN_VIEW_WAIT_S:
+                return False
+            if v['attempt'] >= ROOM_SCAN_VIEW_ATTEMPTS:
+                v['status'] = 'timeout'
+                self.event('room_scan_view_failed', scan_id=scan['id'], view=view_id, attempts=v['attempt'])
+                return True
+        if not self._still_enough(now):                       # NUC-measured stillness before every photo
+            return False
+        final = p['index'] >= len(p['sides']) - 1
+        v['attempt'] += 1
+        v['id'] = f"{scan['id']}-{view_id}-{v['attempt']}"
+        v['t'] = now
+        publish(capture_request(v['id'], scan['cell'], self.last_pose or scan['pose'],
+                                self.record.session if self.record else None, 'room', scan_id=scan['id'],
+                                view_id=view_id, final=final, qr_only=bool(p.get('qr_only')),
+                                **self._still_fields(now)))
+        self.event('room_scan_request', scan_id=scan['id'], view=view_id, attempt=v['attempt'], final=final)
+        return False
+
+    def _scan_result_tick(self, now, p):
+        """Room scan, centred: wait for the Pi's result (bounded); take one more look when Claude asks for it.
+        True when the scan is finished."""
+        scan = p['scan']
+        if not any(s.get('status') == 'captured' for s in scan['views'].values()):
+            return True                                      # nothing went to Claude: nothing to wait for
+        scan.setdefault('wait_from', now)
+        msgs = getattr(self.robot, 'room_scan_msgs', None) or []
+        res = next((r for t, text in reversed(list(msgs)) if t >= scan['wait_from']
+                    for r in [room_scan_result(text, scan['id'])] if r), None)
+        if res is None and now - scan['wait_from'] < ROOM_SCAN_RESULT_WAIT_S:
+            return False
+        scan['result'] = res
+        extra = (res or {}).get('additional_view') or {}
+        side = extra.get('view_id')
+        side = side if side in ('left', 'right') else None
+        if res is not None and extra.get('needed') and side and scan['extra'] < ROOM_SCAN_EXTRA_VIEWS:
+            scan['extra'] += 1
+            scan.pop('wait_from', None)
+            unclear = [f for f in res.get('findings') or [] if not f.get('clear')]
+            qr_only = 'qr' in str(extra.get('reason', '')).lower() and all(f.get('kind') == 'qr_code' for f in unclear)
+            self.event('room_scan_extra_view', scan_id=scan['id'], side=side, reason=extra.get('reason'),
+                       qr_only=qr_only)
+            p.update(phase='side', sides=[side], index=0, t=now, yaws=[], qr_only=qr_only,
+                     view_ids={0: f'extra-{side}'})
+            return False
+        self.event('room_scan_result', scan_id=scan['id'], room=((res or {}).get('room') or {}).get('type'),
+                   findings=len((res or {}).get('findings') or []), qr=len((res or {}).get('qr') or []),
+                   timed_out=res is None)
+        return True
+
+    def _posture_view_check(self, now, p):
+        """--arena-holds: a posture view counts only if the map heading moved toward that side and held steady (the
+        SLAM map ignores turns under 0.3 rad, the live scan does not). Logged per view. Nothing marks openings or picks
+        destinations from posture views yet; anything that does later must only use accepted ones."""
+        side = p['sides'][p['index']]
+        recent = [y for t, y in p.get('yaws', []) if now - t <= 1.0]
+        if p.get('yaw0') is None or len(recent) < 3:
+            accepted, why, delta, spread = False, 'no map heading during the view', None, None
+        else:
+            rel = [math.remainder(y - p['yaw0'], math.tau) for y in recent]
+            delta, spread = sum(rel) / len(rel), max(rel) - min(rel)
+            want = 1.0 if side == 'left' else -1.0
+            if spread > math.radians(POSTURE_VIEW_STEADY_DEG):
+                accepted, why = False, 'heading not steady'
+            elif delta * want < math.radians(POSTURE_VIEW_MIN_DEG):
+                accepted, why = False, 'heading did not move toward the side'
+            else:
+                accepted, why = True, None
+        p.setdefault('views', []).append({'side': side, 'accepted': accepted})
+        self.event('posture_view', side=side, accepted=accepted, reason=why,
+                   heading_change_deg=_r(math.degrees(delta), 1) if delta is not None else None,
+                   spread_deg=_r(math.degrees(spread), 2) if spread is not None else None)
+
+    def _leave_posture(self, why):
+        """End the body-yaw look-around: yaw 0, move mode, navigation mode (also on any pause or stop)."""
+        if self.posture_look is None:
+            return
+        from .ros_io import AXIS_YAW, MOVE_MODE, NAVIGATION_MODE
+        entered = self.posture_look['phase'] != 'enter'
+        if self.posture_look.get('scan') is not None:
+            self._last_scan = self.posture_look['scan']
+        self.posture_look = None
+        if not entered:
+            return
+        r = self.robot
+        try:
+            r.send_axis(AXIS_YAW, 0)
+            move, nav = r.send_simple_command(MOVE_MODE), r.send_simple_command(NAVIGATION_MODE)
+            self.event('posture_look_end', why=why, move=move, navigation=nav)
+        except Exception as error:  # noqa: BLE001 - keep stopping; tell the operator
+            self.event('posture_look_end_failed', error=str(error))
+            self.log(f'WARNING: could not leave pose mode ({error}); use the remote / app')
+        # Run 26 Nov 05:35: back in move mode the robot was in its default flat gait, not the session's rug gait.
+        if self.cfg.gait:
+            self._switch_gait(self.cfg.gait)
+        self.choose_after = r.now() + MAP_SETTLE_S
 
     # -------------------------------------------------------------- exploration record (shared state + overlay)
     WALK_REASONS = {'straight_on': 'straight on: lane ahead not yet walked', 'obstacle': 'turn into new space',
@@ -1781,6 +2858,7 @@ class RoamSession:
                 if self.course is not None:
                     specs += self.course.markers(now, pose[:2] if pose else None)
                 specs += self._decision_markers(pose)
+                specs += self._rejection_markers(now)
                 publish(specs)
             except Exception as exc:  # noqa: BLE001 - the overlay must never stop roaming
                 if not getattr(self, '_overlay_error', None):
@@ -1793,22 +2871,75 @@ class RoamSession:
     # merges and scores them (configurable weights, logged breakdown); the course grid is memory ("this cell still
     # looks unexplored: come back"); when stuck: look around -> scene understanding -> unfinished cell.
     def _update_course(self, now):
-        if self.course is None or self.map is None or now - getattr(self, '_course_t', -math.inf) < COURSE_PERIOD_S \
-                or self.map[0] == getattr(self, '_course_map_t', None):
+        """Refresh the course grid memory (wall gaps, reachable floor, cells, connections). Operator 2026-11-25
+        (item 5): on the robot this runs in a worker thread on a snapshot - roam's loop no longer waits ~0.3 s for
+        it; the result is applied on a later tick. In simulation it runs inline (deterministic tests)."""
+        if self.course is None or self.map is None:
+            return
+        job = getattr(self, '_course_job', None)
+        if job is not None:
+            if not job.done():
+                return
+            self._course_job = None
+            try:
+                self._apply_course(now, job.result())
+            except Exception as exc:  # noqa: BLE001 - the grid is memory only: it must never stop roaming
+                self._grid_error(exc)
+            return
+        if now - getattr(self, '_course_t', -math.inf) < COURSE_PERIOD_S or \
+                self.map[0] == getattr(self, '_course_map_t', None):
             return
         self._course_t, self._course_map_t = now, self.map[0]
-        t0 = time.monotonic()
-        try:
-            self.wall_gaps = WG.gap_mask(self.map[1], self.record.breadcrumbs)
-            reach = None
-            if self.last_pose is not None:
-                reach = WG.reachable_mask(self.map[1], self.last_pose[:2], self.wall_gaps[0], self.record.breadcrumbs)
-                self.course_reach = None if reach is None else (reach, self._slam_np()[0], self.wall_gaps[1])
-            self.course.update(self.map[1], self.coverage, self.record.breadcrumbs, now, walls=self.wall_gaps[0],
-                               reach=reach)
-        except Exception as exc:  # noqa: BLE001 - the grid is memory only: it must never stop roaming
-            self._grid_error(exc)
-        self._timed('course_update', t0)
+        snap = (self.map[1], self._coverage_snapshot(), list(self.record.breadcrumbs),
+                self.last_pose[:2] if self.last_pose is not None else None, now)
+        if self.mode == MODE_SIM:
+            t0 = time.monotonic()
+            try:
+                self._apply_course(now, self._compute_course(*snap))
+            except Exception as exc:  # noqa: BLE001
+                self._grid_error(exc)
+            self._timed('course_update', t0)
+            return
+        pool = getattr(self, '_course_pool', None)
+        if pool is None:
+            from concurrent.futures import ThreadPoolExecutor
+            pool = self._course_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='course')
+        self._course_job = pool.submit(self._compute_course, *snap)
+
+    def _coverage_snapshot(self):
+        if self.coverage is None:
+            return None
+        import copy
+        cov = copy.copy(self.coverage)
+        cov.seen = self.coverage.seen.copy()
+        return cov
+
+    def _compute_course(self, grid, coverage, crumbs, start, now):
+        """Worker: everything the grid update computes, on a snapshot; touches no roam state."""
+        import numpy as np
+        gaps = WG.gap_mask(grid, crumbs)
+        reach = WG.reachable_mask(grid, start, gaps[0], crumbs) if start is not None else None
+        data = np.asarray(grid.data, dtype=np.int16).reshape(grid.height, grid.width)
+        shadow = CourseGrid(self.course.ox, self.course.oy, self.course.heading, self.course.cell_m,
+                            session=self.course.session)
+        shadow.update(grid, coverage, crumbs, now, walls=gaps[0], reach=reach)
+        return gaps, reach, data, shadow
+
+    def _apply_course(self, now, result):
+        gaps, reach, data, shadow = result
+        if shadow.session != self.course.session:
+            return                                  # the map was reset while the worker ran: drop the stale result
+        self.wall_gaps = gaps
+        self.course_reach = None if reach is None else (reach, data, gaps[1])
+        before = self.course.edges
+        for name in ('cells', 'edges', 'visited', '_data', '_geo'):
+            if hasattr(shadow, name):
+                setattr(self.course, name, getattr(shadow, name))
+        self.course.reopened = [k for k, st in self.course.edges.items()
+                                if st == 'open' and before.get(k) == 'blocked']
+        self._beat_if_due()
+        if self.course.reopened:
+            self._passage_reopened(now, self.course.reopened)
 
     def _grid_error(self, exc):
         if not getattr(self, '_grid_error_logged', None):
@@ -1863,10 +2994,15 @@ class RoamSession:
                                                        math.radians(40))
         if self.course is not None:
             t['grid'], t['revisit'] = self.course.pull(x, y, now), self.course.revisit(x, y)
+            if source == 'room' and goal.get('cell'):         # the room cell's own pull: reading it explores it
+                t['grid'], t['revisit'] = 1.0, 0.0
         if source == 'straight_on':
             t['continue'] = 1.0
-        if source == 'scene':
+        if source in ('scene', 'room'):
             t['scene'] = 1.0
+        phase = self._phase(now)
+        t['phase'] = 1.0 if (phase == 'search' and source in SEARCH_SOURCES) or \
+            (phase == 'move_on' and source in MOVE_ON_SOURCES) else 0.0
         if self.record is not None:
             t['fail'] = float(sum(f['attempts'] for f in self.record.failures.values()
                                   if math.hypot(f['x'] - x, f['y'] - y) < 0.6))
@@ -1889,8 +3025,14 @@ class RoamSession:
         out, limit = [], GRID_RETURN_MAX * (2 if relaxed else 1)
         for c in cells[:3 * limit]:
             p = self.course.return_point(c, ok=lambda x, y: self._reachable(x, y) and self._in_course(x, y) and not (
-                self.record is not None and self.record.avoided(x, y, now)))   # free, below the inscribed cost
-            if p is None or math.dist(p, pose[:2]) < GRID_RETURN_MIN_M:
+                self.record is not None and self.record.avoided(x, y, now)) and self._raw_clear(x, y))   # off edges
+            if p is None:
+                cx, cy = self.course.centre(*c)
+                why = 'failed, retry later' if self.record is not None and self.record.avoided(cx, cy, now) \
+                    else 'no free spot'
+                self._reject(now, {'x': cx, 'y': cy}, 'cell', why)
+                continue
+            if math.dist(p, pose[:2]) < GRID_RETURN_MIN_M:
                 continue
             out.append({'kind': 'walk', 'x': p[0], 'y': p[1], 'yaw': math.atan2(p[1] - pose[1], p[0] - pose[0]),
                         'score': 0.0, 'free_m': None, 'ends_at': 'grid_return', 'cell': list(c),
@@ -1922,13 +3064,22 @@ class RoamSession:
         cands = []
 
         def add(goal, source, reason):
-            if goal is None or self._goal_invalid(goal):              # endpoint: geofence, costmap, SLAM
+            if goal is None:
+                return
+            if self._goal_invalid(goal):                              # endpoint: geofence, costmap, SLAM
+                self._reject(now, goal, source, 'costmap / wall')
                 return
             if not self._in_course(goal['x'], goal['y']):
                 self.stats['outside_course_rejected'] = self.stats.get('outside_course_rejected', 0) + 1
+                self._reject(now, goal, source, 'outside course')
                 return                                                # beyond the course walls
+            if self._in_room(goal):
+                self.stats['inside_room_rejected'] = self.stats.get('inside_room_rejected', 0) + 1
+                self._reject(now, goal, source, 'inside a room')
+                return                       # operator 2026-11-26: never step into a room; it is read from outside
             if source in STRAIGHT_SOURCES and self.wall_gaps is not None and \
                     WG.crosses(self.wall_gaps[0], self.wall_gaps[1], [pose[:2], (goal['x'], goal['y'])]):
+                self._reject(now, goal, source, 'through wall gap')
                 return                                                # straight through a gap in a wall
             cands.append(self._candidate(now, pose, goal, source, reason))
         if not near and hasattr(self.explorer, 'straight_ahead'):
@@ -1938,19 +3089,145 @@ class RoamSession:
             self.record.note_decision(pose, self.explorer.open_headings)
         if corridor is not None:
             add(corridor, 'corridor', self.WALK_REASONS.get(corridor.get('ends_at'), 'turn into new space'))
+        self._beat_if_due()
         front = self._frontier_goal(now, pose)
+        self._beat_if_due()
         if front is not None:
             add(front, front['ends_at'], self.WALK_REASONS.get(front['ends_at'], front['ends_at']))
         if corridor is None:
             add(self._choose(grid, now, pose, forward_blocked=near, allow_visited=True), 'corridor_walked',
                 'walk on through walked space')
+        self._beat_if_due()
         for goal in self._grid_returns(now, pose):
             add(goal, 'grid_return', goal['reason'])
+        self._beat_if_due()
+        for goal in self._room_goals(now, pose):
+            add(goal, 'room', goal['reason'])
+        cands = self._on_block_filter(now, pose, cands)
         return GS.evaluate(cands, self.cfg.weights, self.cfg.min_score)
+
+    def _on_block_filter(self, now, pose, cands):
+        """Operator 2026-11-25 (fix 3; 18:04 SGT tilt stop: up a 0.28 m block, then sent off it at -124 deg): after
+        climbing onto a block, walk on roughly straight (+-ON_BLOCK_TOL_DEG of the climb heading) until off it -
+        never sideways. Only narrows roam's own choice; if nothing goes straight on, the normal choice stands."""
+        ob = getattr(self, 'on_block', None)
+        if ob is None:
+            return cands
+        if (now - ob['t'] > ON_BLOCK_MAX_S or math.hypot(pose[0] - ob['x'], pose[1] - ob['y']) >= ON_BLOCK_CLEAR_M) \
+                and not self._tilted():           # operator 2026-11-26: still tilted = still on the block
+            self.on_block = None
+            self.event('off_block', walked_m=_r(math.hypot(pose[0] - ob['x'], pose[1] - ob['y']), 2))
+            return cands
+        tol = math.radians(ON_BLOCK_TOL_DEG)
+        keep = []
+        for c in cands:
+            bearing = math.atan2(c.y - pose[1], c.x - pose[0])
+            if abs(math.atan2(math.sin(bearing - ob['heading']), math.cos(bearing - ob['heading']))) <= tol:
+                keep.append(c)
+            else:
+                self._reject(now, {'x': c.x, 'y': c.y}, c.source, 'on block: straight on')
+        return keep or cands
+
+    # ---- phases, rooms, rejections (operator 2026-11-25)
+    def _centred(self, now, pose, goal):
+        """Operator 2026-11-25: goals in the middle of the grid cells. Move a walk goal to its cell's centre when the
+        centre is free and reachable (room viewpoints already are; scene / stairs / backtrack goals stay put)."""
+        if self.course is None or goal.get('kind') != 'walk' or goal.get('ends_at') in PROTECTED_ENDS:
+            return goal
+        cell = self.course.cell(goal['x'], goal['y'])
+        p = self.course.centre_point(cell, ok=lambda x, y: self._reachable(x, y) and self._in_course(x, y)
+                                     and self._raw_clear(x, y))
+        if p is None or math.dist(p, pose[:2]) < GRID_RETURN_MIN_M / 2:
+            return goal
+        return dict(goal, x=p[0], y=p[1], yaw=math.atan2(p[1] - pose[1], p[0] - pose[0]), centred=list(cell))
+
+    def _passage_reopened(self, now, edges):
+        """Operator 2026-11-25: a passage that was blocked is now open - forget the rejections it caused (connection
+        failures, failed goals and avoided spots near it) and reconsider candidates at once. A valid active goal is
+        kept (reselection only replaces it when it becomes invalid or something is clearly better)."""
+        cleared = 0
+        for key in edges:
+            a, b = tuple(key)
+            if self.course.edge_failures.pop(key, None) is not None:
+                cleared += 1
+            centres = [self.course.centre(*a), self.course.centre(*b)]
+            for c in (a, b):
+                self.course.cell_blocks.pop(c, None)
+            if self.record is not None:
+                for k in [k for k, f in self.record.failures.items()
+                          if min(math.dist((f['x'], f['y']), p) for p in centres) < REOPEN_CLEAR_M]:
+                    del self.record.failures[k]
+                    cleared += 1
+            for ex in (self.explorer, self.frontiers):
+                if ex is not None and hasattr(ex, 'failed'):
+                    keep = [f for f in ex.failed if min(math.dist(f[:2], p) for p in centres) >= REOPEN_CLEAR_M]
+                    cleared += len(ex.failed) - len(keep)
+                    ex.failed = keep
+            mx, my = (centres[0][0] + centres[1][0]) / 2, (centres[0][1] + centres[1][1]) / 2
+            self._reject(now, {'x': mx, 'y': my}, 'passage', 'reopened')
+        self.stats['passages_reopened'] = self.stats.get('passages_reopened', 0) + len(edges)
+        self.event('passage_reopened', connections=[sorted(map(list, k)) for k in edges][:6], cleared=cleared)
+        if self.goal is None:
+            self.choose_after = min(getattr(self, 'choose_after', now), now)
+
+    def _phase(self, now):
+        """'search' while a reachable cell is uninspected or a room unread; else 'move_on' (frontier)."""
+        if self.course is None or not self.course.cells:
+            return 'move_on'
+        key = (now // 1.0, self._course_map_t if hasattr(self, '_course_map_t') else None)
+        if getattr(self, '_phase_key', None) != key:
+            self._phase_key = key
+            busy = any(self.course.unfinished(c, now) for c in self.course.cells) or bool(self.course.rooms_unread(now))
+            phase = 'search' if busy else 'move_on'
+            if phase != getattr(self, '_phase_now', None):
+                self._phase_now = phase
+                summary = self.course.summary(now)
+                self.event('phase', phase=phase, unfinished=summary['cells_unfinished'],
+                           rooms_unread=len(self.course.rooms_unread(now)))
+        return self._phase_now
+
+    def _room_goals(self, now, pose):
+        """Walk INTO the nearest unread rooms: the middle of the room cell (off block edges). The camera capture runs
+        when the dog enters the pocket (_capture_tick), so no goal ever asks the dog to face back into a room
+        (operator 2026-11-25, items 6 and 7; the 17:10 / 17:14 SGT flips followed such turns)."""
+        if self.course is None:
+            return []
+        out = []
+        ok = lambda x, y: self._reachable(x, y) and self._in_course(x, y) and self._raw_clear(x, y)   # noqa: E731
+        rooms = sorted(self.course.rooms_unread(now), key=lambda c: math.dist(self.course.centre(*c), pose[:2]))
+        for c in rooms[:ROOM_CANDIDATES * 2]:
+            if c in self.course.captured:
+                continue
+            v = self.course.room_viewpoint(c, ok=ok)          # the cell in front of the open side, facing in
+            if v is None:
+                self._reject(now, {'x': self.course.centre(*c)[0], 'y': self.course.centre(*c)[1]}, 'room',
+                             'room: no spot in front of it')
+                continue
+            # The walk ends facing its travel direction; the dog then faces the room with a slow in-place turn
+            # (Nav2 Spin) - a goal heading "into the room" made Nav2 swing it ~180 deg on a block (25 Nov flips).
+            travel = math.atan2(v[1] - pose[1], v[0] - pose[0])
+            out.append({'kind': 'walk', 'x': v[0], 'y': v[1], 'yaw': travel, 'face_yaw': v[2], 'score': 0.0,
+                        'free_m': None, 'ends_at': 'room', 'cell': list(c), 'room_view': True, 'doorway_done': True,
+                        'reason': f'look into room {c[0]},{c[1]} from the cell in front '
+                                  f'({self.course.cells[c]["walls"]} walls)'})
+            if len(out) >= ROOM_CANDIDATES:
+                break
+        return out
+
+    def _reject(self, now, goal, source, why):
+        """Remember why a candidate was turned down (RViz shows it; operator 2026-11-25)."""
+        rej = getattr(self, '_rejections', None)
+        if rej is None:
+            rej = self._rejections = {}
+        key = (round(goal['x'] * 2), round(goal['y'] * 2))
+        rej[key] = (now, goal['x'], goal['y'], f'{source[:10]}: {why}')
+        if len(rej) > 4 * REJECT_MAX:
+            for k in sorted(rej, key=lambda k: rej[k][0])[:len(rej) - 2 * REJECT_MAX]:
+                del rej[k]
 
     def _take_decision(self, now, pose, decision):
         c = decision.chosen
-        goal = dict(c.goal)
+        goal = self._centred(now, pose, dict(c.goal))
         goal['reason'] = (' + '.join(c.reasons) or goal.get('reason') or c.source)[:90]
         goal['sources'] = list(c.sources)
         goal['decision_score'] = _r(decision.score, 2)
@@ -1987,7 +3264,30 @@ class RoamSession:
             self._ladder_tick(now, pose)
 
     # ---- reselection while walking (hysteresis: goal_selection.Reselection)
+    def _crosses_pending_stair(self, points):
+        stair = getattr(self, '_pending_stair', None)
+        if stair is None:
+            return False
+        if stair['riser'] is None:
+            return False  # image-only sighting has no measured range
+        rx, ry = stair['riser']
+        for (ax, ay), (bx, by) in zip(points, points[1:]):
+            dx, dy = bx - ax, by - ay
+            if dx or dy:
+                t = max(0.0, min(1.0, ((rx - ax) * dx + (ry - ay) * dy) / (dx * dx + dy * dy)))
+                if t > 0 and math.hypot(ax + t * dx - rx, ay + t * dy - ry) < 0.35:
+                    return True
+        return False
+
+    def _plan_crosses_pending_stair(self):
+        plan = getattr(self.robot, 'nav_plan', None)
+        return (plan is not None and plan[0] >= self.goal_sent_at
+                and self._crosses_pending_stair(plan[1]))
+
     def _goal_invalid(self, goal):
+        if self.last_pose is not None and self._crosses_pending_stair(
+                [self.last_pose[:2], (goal['x'], goal['y'])]):
+            return True
         if not self.explorer.inside(goal['x'], goal['y'], margin=0.0):
             return True
         cost = self._costmap()
@@ -2035,7 +3335,7 @@ class RoamSession:
     # ---- stuck: detection and the recovery ladder (look around -> scene -> unfinished cell -> ...)
     def _stuck_check(self, now, pose):
         busy = (self.stairs or self.crossing or self.nudge or self.scene_wait or self.scene_task or self.ladder
-                or self.scene_hold is not None
+                or self.scene_hold is not None or self.capture_task is not None
                 or self.ladder_pending or self.hold_since is not None or self.passage is not None
                 or (self.record is not None and self.record.active_inspection))
         if busy or self.map is None:
@@ -2253,8 +3553,12 @@ class RoamSession:
         if self.stairs:
             return 'STEP CROSSING' if getattr(self, 'stairs_kind', None) == 'step' else 'STAIRS'
         if self.crossing:
-            return 'CURTAIN CROSSING'
+            if self.crossing.get('back'):
+                return 'BACKING OFF (wall)'
+            return 'PASSAGE PROBE' if self.crossing.get('probe') else 'CURTAIN CROSSING'
         if self.nudge:
+            if self.nudge.get('probe'):
+                return 'PROBE (speckle)'
             return 'MAKING ROOM' if self.nudge.get('end_event') == 'make_room_end' else 'DRIFT FIX'
         if self.hold_since is not None:
             return 'HOLD'
@@ -2266,6 +3570,8 @@ class RoamSession:
             return 'STUCK: asking scene'
         if self.scene_task is not None:
             return f'SCENE: {self.scene_task["kind"]}'
+        if getattr(self, 'capture_task', None) is not None:
+            return f'CAMERA {self.capture_task["cell"][0]},{self.capture_task["cell"][1]}'
         if self.ladder is not None:
             return f'STUCK: {self.ladder["name"]}'
         if self.record is not None and self.record.active_inspection:
@@ -2275,6 +3581,104 @@ class RoamSession:
                 return 'LOOKING' if self.goal.get('look') else 'TURNING'
             return f'GOAL: {(self.goal.get("sources") or [self.goal.get("ends_at")])[0]}'[:24]
         return 'ROAMING'
+
+    # ---- plain-words activity line (operator 2026-11-26: "the terminal should print in simple terms what is
+    # happening: scene understanding, walking to goal, rethinking, climbing stairs, entering curtains")
+    GOAL_WORDS = {'grid_return': 'an unexplored cell', 'room': 'a room to read', 'frontier': 'the edge of the map',
+                  'straight_on': 'straight ahead', 'corridor': 'open floor', 'corridor_walked': 'open floor',
+                  'unseen': 'unexplored floor', 'obstacle': 'open floor', 'range': 'open floor',
+                  'patrol': 'floor the camera has not seen', 'backtrack': 'back to an unread room',
+                  'stairs': 'the stairs', 'scene': 'where scene understanding pointed', 'exit': 'the exit',
+                  'passage': 'a passage', 'inspection': 'an inspection point', 'post_stair': 'clear floor past the stairs',
+                  'geofence': 'the edge of the allowed area'}
+    STUCK_WORDS = {'look': 'looking around', 'grid_return': 'heading back to an unfinished cell',
+                   'make_room': 'making room', 'scene': 'asking scene understanding',
+                   'clear_costmaps': 'clearing the obstacle map', 'backtrack': 'backtracking', 'pause': 'pausing'}
+
+    def _plain_activity(self, now):
+        """What the dog is doing, in plain words, for the operator's terminal."""
+        if self.state == 'PAUSED':
+            if self.auto_resume_at:
+                return f'Paused - resumes by itself in {max(0.0, self.auto_resume_at - now):.0f} s'
+            return 'Paused by the operator'
+        if self.state != 'ROAMING':
+            return f'{self.state.capitalize()}' + (f': {self.reason}' if self.reason else '')
+        if self.stairs:
+            direction = getattr(self.stairs[0], 'direction', 'up')
+            if getattr(self, 'stairs_kind', None) == 'step':
+                return f'Crossing a block ({direction}, high-step gait)'
+            return f'Climbing stairs ({direction}, AI mode)'
+        if self.crossing:
+            if self.crossing.get('back'):
+                return 'Backing off from a wall'
+            return 'Checking a passage' if self.crossing.get('probe') else 'Entering a curtain'
+        if self.nudge:
+            if self.nudge.get('probe'):
+                return 'Walking up to a small object'
+            if self.nudge.get('sign', 1) < 0:
+                return 'Backing up to make room to turn'
+            if self.nudge.get('end_event') == 'make_room_end':
+                return 'Stepping forward to make room to turn'
+            return 'Stepping forward after sliding back'
+        if self.pi_gate is not None:
+            return 'Checking stairs with the Pi camera'
+        if self.scene_hold is not None:
+            return 'Scene understanding: holding still while the Pi reads the scene'
+        if self.scene_wait is not None:
+            return 'Stuck - asking scene understanding for a way on'
+        if self.scene_task is not None:
+            return f'Following scene understanding ({self.scene_task["kind"]})'
+        task = getattr(self, 'capture_task', None)
+        if task is not None:
+            return f'Scene understanding: photographing cell {task["cell"][0]},{task["cell"][1]}'
+        if getattr(self, 'room_task', None) is not None:
+            return 'Scene understanding: reading a room'
+        if self.hold_since is not None:
+            return 'Holding still'
+        if self.goal is not None:
+            if self.goal.get('kind') == 'spin':
+                return 'Looking around' if self.goal.get('look') or self.look else 'Turning'
+            if self.ladder is not None:
+                return f'Stuck - {self.STUCK_WORDS.get(self.ladder["name"], self.ladder["name"])}: walking to ' \
+                       f'{self.GOAL_WORDS.get(self.goal.get("ends_at"), "a goal")}'
+            end = self.goal.get('ends_at')
+            if end == 'straight_on':
+                return 'Walking straight ahead'
+            return f'Walking to {self.GOAL_WORDS.get(end, "a goal (" + str(end) + ")")}'
+        if self.ladder is not None:
+            return f'Stuck - {self.STUCK_WORDS.get(self.ladder["name"], self.ladder["name"])}'
+        if self.record is not None and self.record.active_inspection:
+            return 'Inspecting'
+        return 'Rethinking: choosing where to go next'
+
+    def _say_activity(self, now):
+        """Print the plain activity line when it changes (paused countdowns only when the pause starts)."""
+        try:
+            text = self._plain_activity(now)
+        except Exception:  # noqa: BLE001 - a display line must never stop roaming
+            return
+        key = text.split(' - resumes')[0]
+        if key == getattr(self, '_said', None):
+            return
+        self._said = key
+        self.log(f'>> {now - (self.t_roam or now):6.0f}s  NOW: {text}')
+
+    def _rejection_markers(self, now):
+        """RViz: a small red X and the reason at every recently rejected opening / cell (operator 2026-11-25)."""
+        from .exploration_record import _m
+        rej = getattr(self, '_rejections', None) or {}
+        recent = sorted((v for v in rej.values() if now - v[0] <= REJECT_SHOW_S), key=lambda v: -v[0])[:REJECT_MAX]
+        out, crosses = [], []
+        for n, (_, x, y, why) in enumerate(recent):
+            r = 0.07
+            crosses += [(x - r, y - r, 0.06), (x + r, y + r, 0.06), (x - r, y + r, 0.06), (x + r, y - r, 0.06)]
+            reopened = why.endswith('reopened')
+            out.append(_m('rejected_tags', n, 'text', x, y, 0.32, scale=(0, 0, 0.06), alpha=0.9,
+                          rgb=(0.3, 1.0, 0.4) if reopened else (1.0, 0.4, 0.4), text=why[:28]))
+        if crosses:
+            out.append(_m('rejected', 0, 'line_list', scale=(0.025, 0, 0), rgb=(1.0, 0.3, 0.3), alpha=0.8,
+                          points=crosses))
+        return out
 
     def _decision_markers(self, pose):
         from .exploration_record import _m
@@ -2326,7 +3730,8 @@ class RoamSession:
         self.scan_index += 1
         self._start_spin(now, pose, angle)
 
-    def _centre_lane_ok(self, points, lane):
+    def _centre_lane_ok(self, points, lane, offset=0.0):
+        """offset: the lane's end sits this far beside the cell centre line (a blocked centre: nearest free point)."""
         source, target = lane
         axis = 0 if source[0] != target[0] else 1
         lateral = 1 - axis
@@ -2338,7 +3743,7 @@ class RoamSession:
             along = uv[axis] * direction
             # The dog may start anywhere in its cell (operator 2026-11-24: requiring it to stand on the centre line
             # first refused nearly every lane); within the first 0.4 cell the path converges onto the centre line.
-            lateral_limit = 0.5 * span if along < 0.4 * span else min(0.15, 0.2 * span)
+            lateral_limit = 0.5 * span if along < 0.4 * span else min(0.15, 0.2 * span) + abs(offset)
             if abs(uv[lateral]) > lateral_limit or not -0.5 * span <= along <= span + 0.1:
                 return False
             if along < previous - 0.08:
@@ -2369,15 +3774,31 @@ class RoamSession:
         x, y = self.course.centre(*target)
         ox, oy = self.course.centre(*source)
         original = goal
-        goal = dict(goal, x=x, y=y, yaw=math.atan2(y - oy, x - ox), centre_lane=lane)
-        if (not self._centre_lane_ok([pose[:2]], lane) or self._goal_invalid(goal)
+        goal = dict(goal, x=x, y=y, yaw=math.atan2(y - oy, x - ox), centre_lane=lane, lane_offset=0.0)
+        if self._goal_invalid(goal):
+            # Operator 2026-11-24 (grid runs: 7 of 13 lanes refused, mostly a blocked centre): aim for the free point
+            # nearest the centre in that cell instead - as central as the cell allows.
+            near = self.course.return_point(target, ok=lambda px, py: self._reachable(px, py))
+            if near is not None:
+                lateral = self.course.local(near[0], near[1], *target)[1 - axis]
+                goal = dict(goal, x=near[0], y=near[1], lane_offset=lateral)
+                self.event('centre_lane_nearest_free', cell=list(target), offset_m=_r(lateral, 2))
+        if math.hypot(goal['x'] - pose[0], goal['y'] - pose[1]) < CENTRE_LANE_MIN_STEP_M:
+            self._centre_lane_hold(now, f'centre-lane target under {CENTRE_LANE_MIN_STEP_M} m away', original, pose)
+            return
+        if (not self._centre_lane_ok([pose[:2]], lane, goal['lane_offset']) or self._goal_invalid(goal)
                 or self.course.connection(source, target, now) == 'blocked'):
+            self._grid_face = None
             self._centre_lane_hold(now, 'centre lane or target centre unavailable', original, pose)
             return
+        if getattr(self.cfg, 'arena_holds', False):
+            goal['grid_step'] = True
+            if not self._grid_faced(now, pose, goal, original, lane):
+                return
         if self.mode == MODE_SIM:
             self._start_walk(now, pose, goal)
             return
-        request = self.robot.centre_plan_request(x, y, goal['yaw'])
+        request = self.robot.centre_plan_request(goal['x'], goal['y'], goal['yaw'])
         if request is None:
             self._centre_lane_hold(now, 'Nav2 plan-only server unavailable', original, pose)
             return
@@ -2396,7 +3817,7 @@ class RoamSession:
         unsafe = (not points or math.dist(points[-1], end) > 0.15
                   or math.dist(points[0], pose[:2]) > 0.15
                   or self._goal_invalid(goal)
-                  or not self._centre_lane_ok([pose[:2], *points], goal['centre_lane'])
+                  or not self._centre_lane_ok([pose[:2], *points], goal['centre_lane'], goal.get('lane_offset', 0.0))
                   or (self.wall_gaps is not None and WG.crosses(*self.wall_gaps, points)))
         if unsafe:
             self._centre_lane_hold(now, 'Nav2 did not provide a valid centre-lane plan', original, pose)
@@ -2405,7 +3826,281 @@ class RoamSession:
         self.event('centre_lane_accepted', goal=list(end))
         self._start_walk(now, pose, goal)
 
+    # ---- --arena-holds (operator 2026-11-26; operator/arena_holds.sh). Outside the stair sequence: it only watches
+    # the stairs finish (_stairs_finished) and runs before the normal choice afterwards.
+    def _grid_faced(self, now, pose, goal, original, lane):
+        """Grid step: True when the robot faces the next cell (walk now). Else start the turn (one in-place turn onto
+        the grid direction, two quarter-turns for a cell behind) and return False; the walk is checked again after."""
+        target_yaw = self._grid_axis_yaw(goal['yaw'])
+        err = math.remainder(target_yaw - pose[2], math.tau)
+        face = self._grid_face if self._grid_face is not None and self._grid_face['lane'] == lane else None
+        if abs(err) <= math.radians(ARENA_FACE_TOL_DEG):
+            if face is not None:
+                self.event('grid_faced', heading_err_deg=_r(math.degrees(err), 1), turns=face['turns'])
+            self._grid_face = None
+            goal['yaw'] = target_yaw
+            return True
+        if face is None:
+            face = {'lane': lane, 'goal': original, 'turns': 0}
+        if face['turns'] >= ARENA_MAX_TURNS:
+            self._arena_hold(now, f'still {math.degrees(err):.0f} deg off the next cell after {face["turns"]} turns',
+                             lane[1])
+            return False
+        angle = err
+        if abs(err) > math.radians(ARENA_BEHIND_DEG):
+            if not self._spin_room(pose):
+                self._arena_hold(now, 'cell behind: no room for two quarter-turns', lane[1])
+                return False
+            angle = err / 2                                       # first of two quarter-turns
+        face['turns'] += 1
+        self._grid_face = face
+        self.event('grid_face', target_deg=_r(math.degrees(target_yaw), 0), turn_deg=_r(math.degrees(angle), 0),
+                   cell=list(lane[1]), turn=face['turns'])
+        self._start_spin(now, pose, angle, reason='grid step: face the next cell')
+        if self.goal is not None:
+            self.goal['grid_face'] = self.goal['fixed_turn'] = True
+        else:
+            self._grid_face = None
+        return False
+
+    def _arena_hold(self, now, why, cell=None):
+        """Hold ARENA_HOLD_S, then reconsider; the refused neighbour cell is left alone for a while."""
+        self.event('arena_hold', reason=why, cell=list(cell) if cell else None)
+        if cell is not None and self.course is not None:
+            self.course.block_cell(tuple(cell), now, ARENA_BLOCK_CELL_S)
+        self._grid_face = None
+        self._arena_hold_until = now + ARENA_HOLD_S
+
+    def _spin_room(self, pose):
+        """The costmap is free within the turning radius (unknown costmap = no)."""
+        cost = self._costmap()
+        if cost is None:
+            return False
+        r, step = self.explorer.spin_radius(), 0.05
+        n = int(r / step)
+        for i in range(-n, n + 1):
+            for j in range(-n, n + 1):
+                if math.hypot(i * step, j * step) > r:
+                    continue
+                c = cost.cell(pose[0] + i * step, pose[1] + j * step)
+                if cost.contains(c) and cost.value(c) >= COSTMAP_VETO:
+                    return False
+        return True
+
+    def _mark_flight_crossed(self):
+        """Operator 2026-11-26 (06:24 run: the same flight seen again from the top 1.2 m on, crossed again, aborted):
+        every point from where the stairs were seen, along the walk, to 0.8 m past the robot counts as this flight, so a
+        sighting within PI_STAIRS_SAME_M of any of them is the same stairs."""
+        crossed = getattr(self, '_pi_stairs_crossed', None)
+        pose = self._pose() or self.last_pose
+        if crossed is None or not crossed or pose is None:
+            return
+        sx, sy = crossed[-1][:2]
+        ex, ey = pose[0] + 0.8 * math.cos(pose[2]), pose[1] + 0.8 * math.sin(pose[2])
+        n = max(1, int(math.hypot(ex - sx, ey - sy) / 0.4))
+        added = [(sx + (ex - sx) * i / n, sy + (ey - sy) * i / n) for i in range(1, n + 1)]
+        crossed.extend(added)
+        self.event('stairs_flight_marked', points=len(added), end=[_r(ex, 2), _r(ey, 2)])
+
+    def _stairs_finished(self, now):
+        """Observer: the stair routine just ended. Marks the whole flight as crossed; --arena-holds: check the grid
+        alignment once it is all done."""
+        if getattr(self, 'stairs_kind', None) == 'stairs':
+            self._mark_flight_crossed()
+        if not getattr(self.cfg, 'arena_holds', False) or getattr(self, 'stairs_kind', None) != 'stairs' \
+                or self.course is None:
+            return
+        last = next((e['event'] for e in reversed(self.events)
+                     if e['event'] in ('stairs_done', 'stairs_aborted')), None)
+        if last != 'stairs_done':
+            return
+        crossed = getattr(self, '_pi_stairs_crossed', None) or []
+        self._post_stair = {'t': now, 'since': now, 'fresh_map': True, 'corrections': 0, 'poses': [],
+                            'place': tuple(crossed[-1]) if crossed else None}
+        self.event('post_stair_wait', place=[_r(v, 2) for v in crossed[-1]] if crossed else None)
+
+    def _post_stair_problem(self, now, pose, p):
+        """Why the alignment cannot be measured yet (None when it can)."""
+        if getattr(self, '_slam_paused', False):
+            return 'SLAM still paused'
+        if p['fresh_map'] and (self.map is None or self.map[0] <= p['since']):
+            return 'no map update since the stairs'
+        item = self.robot.costmap_grid() if hasattr(self.robot, 'costmap_grid') else None
+        if item is None or item[0] <= p['since']:
+            return 'no costmap update since the stairs'
+        tilt = self.robot.telemetry.current_tilt()
+        if tilt is None or max(abs(tilt[0]), abs(tilt[1])) > POST_STAIR_LEVEL_RAD:
+            return 'body not level'
+        if p['place'] is not None and math.dist(pose[:2], p['place']) < POST_STAIR_EDGE_MARGIN_M:
+            return 'not clear of the stairs'
+        poses = p['poses']
+        if not poses or now - poses[0][0] < POST_STAIR_STEADY_S:
+            return 'map pose not steady yet'
+        xs, ys, yaws = [q[1] for q in poses], [q[2] for q in poses], [q[3] for q in poses]
+        spread = max(math.remainder(y - yaws[0], math.tau) for y in yaws) - \
+            min(math.remainder(y - yaws[0], math.tau) for y in yaws)
+        if max(xs) - min(xs) > POST_STAIR_STEADY_M or max(ys) - min(ys) > POST_STAIR_STEADY_M or \
+                spread > math.radians(POST_STAIR_STEADY_DEG):
+            return 'map pose not steady yet'
+        return None
+
+    def _post_stair_point(self, pose, cell, axis, place):
+        """A clear point nearer the cell centre, inside the same cell and clear of the stairs, or the reason none."""
+        cx, cy = self.course.centre(*cell)
+        why = 'no clear point nearer the centre'
+        for f in (1.0, 0.75, 0.5):
+            x, y = pose[0] + f * (cx - pose[0]), pose[1] + f * (cy - pose[1])
+            if tuple(self.course.cell(x, y)) != tuple(cell):
+                why = 'correction would leave the cell'
+                continue
+            if place is not None and math.dist((x, y), place) < POST_STAIR_EDGE_MARGIN_M:
+                why = 'correction too near the stair edge'
+                continue
+            if self._goal_invalid({'x': x, 'y': y}):
+                why = 'correction point not clear in the costmap or map'
+                continue
+            return x, y
+        return why
+
+    def _post_stair_tick(self, now, pose):
+        p = self._post_stair
+        p['poses'] = [q for q in p['poses'] if now - q[0] <= POST_STAIR_STEADY_S + 0.2] + [(now, *pose[:3])]
+        problem = self._post_stair_problem(now, pose, p)
+        if problem:
+            if now - p['t'] > POST_STAIR_WAIT_MAX_S:
+                self._post_stair_hold(now, f'cannot verify: {problem}')
+            return
+        cell = tuple(self.course.cell(*pose[:2]))
+        cx, cy = self.course.centre(*cell)
+        offset = math.hypot(cx - pose[0], cy - pose[1])
+        axis = self._grid_axis_yaw(pose[2])
+        err = math.remainder(axis - pose[2], math.tau)
+        self.event('post_stair_check', cell=list(cell), offset_m=_r(offset, 2),
+                   heading_err_deg=_r(math.degrees(err), 1), corrections=p['corrections'])
+        if offset <= POST_STAIR_CENTRE_TOL_M and abs(err) <= math.radians(POST_STAIR_HEADING_TOL_DEG):
+            self.event('post_stair_aligned', cell=list(cell))
+            self._post_stair = None
+            return
+        if p['corrections'] >= POST_STAIR_MAX_CORRECTIONS:
+            self._post_stair_hold(now, f'still {offset:.2f} m / {math.degrees(err):.0f} deg off after '
+                                       f'{p["corrections"]} corrections')
+            return
+        p['corrections'] += 1
+        p['t'], p['since'], p['fresh_map'], p['poses'] = now, now, False, []   # after a correction: steady pose only
+        if offset <= POST_STAIR_CENTRE_TOL_M:
+            if not self._spin_room(pose):
+                self._post_stair_hold(now, 'no room to turn in place')
+                return
+            self.event('post_stair_correct', how='turn', turn_deg=_r(math.degrees(err), 1))
+            self._start_spin(now, pose, err, reason='post-stair: turn onto the grid')
+            if self.goal is None:
+                self._post_stair_hold(now, 'Nav2 rejected the turn')
+            else:
+                self.goal['fixed_turn'] = True
+            return
+        point = self._post_stair_point(pose, cell, axis, p['place'])
+        if isinstance(point, str):
+            self._post_stair_hold(now, point)
+            return
+        self.event('post_stair_correct', how='walk', x=_r(point[0], 2), y=_r(point[1], 2),
+                   yaw_deg=_r(math.degrees(axis), 0), cell=list(cell))
+        self._start_walk(now, pose, {'kind': 'walk', 'x': point[0], 'y': point[1], 'yaw': axis, 'score': 0.0,
+                                     'free_m': None, 'ends_at': 'post_stair', 'centre_lane_skip': True})
+        if self.goal is None:
+            self._post_stair_hold(now, 'Nav2 rejected the correction goal')
+
+    def _post_stair_hold(self, now, why):
+        self.event('post_stair_hold', reason=why)
+        self._post_stair = None
+        self._pause(f'post-stair alignment: {why}')
+
+    def _room_entry_start(self, now, pose, goal):
+        """Walking into a room: picture at the doorway first (ROOM_ENTRY_MAX_S). True when it took over (turning to
+        face the room, or holding for the picture); False = walk in now (no camera service, already inside, uneven)."""
+        publish = getattr(self.robot, 'publish_capture_request', None)
+        cell = tuple(goal.get('cell') or ())
+        if publish is None or self.course is None or len(cell) != 2 or pose is None:
+            return False
+        done = getattr(self, '_doorway_done', None)
+        if done is None:
+            done = self._doorway_done = set()
+        if cell in done or tuple(self.course.cell(*pose[:2])) == cell or self._capture_uneven(now):
+            return False
+        cx, cy = self.course.centre(*cell)
+        turn = math.remainder(math.atan2(cy - pose[1], cx - pose[0]) - pose[2], math.tau)
+        self._room_entry = {'goal': goal, 'cell': cell, 'phase': 'snap', 't': now}
+        if abs(turn) > math.radians(ROOM_FACE_TOL_DEG):
+            self._room_entry['phase'] = 'turn'
+            self.event('room_entry_face', cell=list(cell), turn_deg=_r(math.degrees(turn), 0))
+            self._start_spin(now, pose, turn, reason='room entry: face the room for the picture')
+            if self.goal is not None:
+                self.goal['fixed_turn'] = True
+                return True
+            self._room_entry['phase'] = 'snap'
+        self._room_entry_snap(now, pose)
+        return True
+
+    def _room_entry_snap(self, now, pose):
+        e = self._room_entry
+        self.robot.send_velocity(0.0, 0.0)
+        e.setdefault('still_wait_t', now)
+        if not self._still_enough(now) and now - e['still_wait_t'] < STILL_WAIT_MAX_S:
+            e['phase'] = 'turn'                       # re-checked every tick until the NUC measures it still
+            return
+        rid = f'entry-{e["cell"][0]}_{e["cell"][1]}-{int(now)}'
+        self.robot.publish_capture_request(capture_request(rid, e['cell'], pose,
+                                                           self.record.session if self.record else None,
+                                                           'room entry', **self._still_fields(now)))
+        e.update(phase='hold', id=rid, t=now)
+        self.stats['room_entry_captures'] = self.stats.get('room_entry_captures', 0) + 1
+        self.event('room_entry_capture', request_id=rid, cell=list(e['cell']))
+
+    def _room_entry_tick(self, now, pose):
+        e = self._room_entry
+        if e['phase'] == 'turn':                          # the face turn ended (done or not): take the picture
+            self._room_entry_snap(now, pose)
+            return
+        held = now - e['t']
+        frames = self._pi_frames_since(e['t'] + POSTURE_LOOK_SETTLE_S)
+        acks = getattr(self.robot, 'capture_acks', None) or []
+        ack = next((a for t, text in list(acks) if t >= e['t'] for a in [capture_ack(text, e['id'])] if a), None)
+        if held < ROOM_ENTRY_MAX_S and (ack is None or (frames is not None and frames < POSTURE_LOOK_FRAMES)):
+            return                                        # still: Pi frames for YOLO and the capture answer
+        self._room_entry = None
+        self._doorway_done.add(tuple(e['cell']))
+        self.event('room_entry_capture_done', request_id=e['id'], cell=list(e['cell']), held_s=_r(held, 1),
+                   pi_frames=frames, result=((ack.get('summary') or ack.get('status')) if ack else 'no ack')[:100],
+                   stored=bool(ack and ack.get('stored')))
+        self._start_walk(now, pose, dict(e['goal'], doorway_done=True))
+
+    def _posture_picture(self, now, view, p):
+        """A camera capture request for this posture view (no wait: the view's own hold gives the frame time)."""
+        publish = getattr(self.robot, 'publish_capture_request', None)
+        pose = self.last_pose
+        if publish is None or self.course is None or pose is None:
+            return
+        cell = self.course.cell(*pose[:2])
+        rid = f'pose-{cell[0]}_{cell[1]}-{view}-{p.get("round", 1)}-{int(now)}'
+        publish(capture_request(rid, cell, pose, self.record.session if self.record else None, 'posture view',
+                                view_id=view, round=p.get('round', 1), **self._still_fields(now)))
+        self.stats['posture_pictures'] = self.stats.get('posture_pictures', 0) + 1
+        self.event('posture_picture', request_id=rid, view=view, round=p.get('round', 1))
+
+    def _in_room(self, goal):
+        """The goal lies in a known room cell (3 walls). Operator 2026-11-26: the dog never steps into a room - a room
+        is looked at from the cell in front of it (room goals). Stairs and Pi scene goals are left alone."""
+        if self.course is None or goal.get('kind') != 'walk' or goal.get('ends_at') in ('stairs', 'scene'):
+            return False
+        return self.course.is_room(self.course.cell(goal['x'], goal['y']))
+
     def _start_walk(self, now, pose, goal):
+        if self._in_room(goal):                          # any source (backtrack, resume, probe, centre lane, ...)
+            self.event('walk_refused', reason='goal inside a room', x=_r(goal['x'], 2), y=_r(goal['y'], 2),
+                       ends_at=goal.get('ends_at'))
+            self._walk_failed(now, 'goal inside a room', goal)
+            return
+        if goal.get('ends_at') == 'room' and not goal.get('doorway_done') and self._room_entry_start(now, pose, goal):
+            return                                       # picture at the doorway first
         if (getattr(self.cfg, 'centre_lane', False) and self.course is not None
                 and goal.get('ends_at') not in PROTECTED_ENDS and 'centre_lane' not in goal
                 and not goal.get('centre_lane_skip')):
@@ -2415,7 +4110,7 @@ class RoamSession:
         if not self.robot.nav_send_goal(goal['x'], goal['y'], goal['yaw']):
             self._walk_failed(now, 'Nav2 rejected the walk goal', goal)
             return
-        self.robot.set_speed_limit(self.cfg.mode_speed(self.speed_mode)[0])   # after the MPPI reset
+        self.robot.set_speed_limit(self._speed_target(now))                  # after the MPPI reset
         self.explorer.sent(goal)
         self.goal = goal
         if self.record is not None:
@@ -2445,10 +4140,27 @@ class RoamSession:
         walked = math.hypot(pose[0] - self.walk_start[0], pose[1] - self.walk_start[1])
         self.look_check = True                           # new place: maybe look around (_plan_look)
         goal, self.goal = self.goal, None
+        view = how == 'reached' and bool(goal and goal.get('room_view')) and self.course is not None
+        if view:
+            self._room_view_start(now, goal)
+        if goal and goal.get('backtrack_from'):
+            self.backtrack_scan = {'at': tuple(goal['backtrack_from']), 'phase': 'face'}
+        if how == 'reached' and goal and self.course is not None and goal.get('cell'):
+            if goal.get('ends_at') == 'grid_return':
+                self.course.note_inspection(tuple(goal['cell']))
         self.choose_after = now + MAP_SETTLE_S
         if goal and goal.get('ends_at') in ('frontier', 'patrol') and self.frontiers is not None:
             self.frontiers.block(goal['x'], goal['y'], now, 60)
-        if how == 'reached' or walked >= WALK_PROGRESS_M:
+        if how == 'reached' and walked < REACHED_MIN_MOVE_M and not view:
+            # Nav2 said "reached" without the dog moving: no progress, not a resolved stuck (Arena B 19:17)
+            if self.record is not None and goal:
+                self.record.clear_destination(now, f'reached without moving ({walked:.2f} m)')
+            self.failures += 1
+            self.event('walk_end', how='reached_without_moving', walked_m=_r(walked, 2))
+            if self.failures >= self.cfg.max_goal_failures and self.cfg.decision == 'unified':
+                self.failures = 0
+                self.ladder_pending = f'{self.cfg.max_goal_failures} walks ended without moving'
+        elif how == 'reached' or walked >= WALK_PROGRESS_M:
             if self.record is not None and goal:
                 self.record.succeeded(goal['x'], goal['y'])
                 self.record.end_branch('walked', None)
@@ -2464,10 +4176,50 @@ class RoamSession:
         else:
             self._walk_failed(now, f'walk ended after {walked:.2f} m ({how})', goal)
 
+    def _speckle_probe(self, now, goal, why):
+        """A walk failed where only speckle stands in the way: probe straight at the goal (see SPECKLE_ZONE_M)."""
+        if not goal or goal.get('kind') != 'walk' or goal.get('probed') or getattr(self, 'speckle', None) is None \
+                or 'walking standoff' in why \
+                or not self.robot.can_actuate or self.nudge or self.stairs or self.crossing:
+            return False
+        pose, odom = self._pose(), self.robot.telemetry.odom.latest()
+        if pose is None or odom is None or self.map is None:
+            return False
+        dist = math.hypot(goal['x'] - pose[0], goal['y'] - pose[1])
+        if dist < 0.2:
+            return False
+        zone, walls, (res, gx, gy) = self.speckle
+        n = max(2, int(dist / 0.05))
+        speckled = False
+        for k in range(n + 1):
+            x = pose[0] + (goal['x'] - pose[0]) * k / n
+            y = pose[1] + (goal['y'] - pose[1]) * k / n
+            i, j = int(math.floor((x - gx) / res)), int(math.floor((y - gy) / res))
+            if not (0 <= j < zone.shape[0] and 0 <= i < zone.shape[1]):
+                continue
+            if walls[j, i]:
+                return False                         # a real wall on the way: not a speckle problem
+            speckled = speckled or bool(zone[j, i])
+        if not speckled or (self.wall_gaps is not None and
+                            WG.crosses(self.wall_gaps[0], self.wall_gaps[1], [pose[:2], (goal['x'], goal['y'])])):
+            return False
+        length = min(dist, PROBE_MAX_M)
+        yaw = math.atan2(goal['y'] - pose[1], goal['x'] - pose[0])
+        self.nudge = {'origin': (odom[1].x, odom[1].y), 't': now, 'length': length, 'progress': (now, 0.0),
+                      'sign': 1, 'end_event': 'speckle_probe_end', 'probe': True, 'yaw': yaw,
+                      'stop_m': ScanWalk.STANDOFF_M, 'max_s': length / PROBE_SPEED_M_S + 4.0}
+        goal['probed'] = True
+        self.event('speckle_probe', why=why[:80], x=_r(goal['x'], 2), y=_r(goal['y'], 2), length_m=_r(length, 2))
+        if self.record is not None:
+            self.record.set_destination(now, dict(goal, yaw=yaw), 'probe', 'LiDAR speckle only: walk until 5 cm')
+        return True
+
     def _walk_failed(self, now, why, goal=None):
         # goal: _end_walk clears self.goal first. Course 2026-11-21 12:25: that lost the failed spot, so
         # roam re-picked the same terrain-blocked heading after every search round (3 x, 0.02-0.06 m each).
         failed = goal or self.goal
+        if self._speckle_probe(now, failed, why):
+            return
         category = classify_failure(why)
         if self.record is not None:
             if failed and failed.get('kind') == 'walk':
@@ -2479,6 +4231,9 @@ class RoamSession:
             self.explorer.block(failed['x'], failed['y'], now, FAILED_WALK_MEMORY_S)
         if failed and failed.get('ends_at') in ('frontier', 'patrol') and self.frontiers is not None:
             self.frontiers.block(failed['x'], failed['y'], now, 90)
+        if getattr(self, 'course', None) is not None and failed and failed.get('cell') and \
+                failed.get('ends_at') in ('grid_return', 'room'):
+            self.course.block_cell(tuple(failed['cell']), now, 20.0)     # not straight back to the same cell
         if getattr(self, 'course', None) is not None and failed and failed.get('kind') == 'walk' \
                 and getattr(self, 'walk_start', None) is not None:
             try:
@@ -2531,11 +4286,23 @@ class RoamSession:
             self._pause('LiDAR/terrain status stale; check the sensors before resuming')
             return
         # (Operator 2026-11-24: the terrain proximity stop and roam's hold on it are removed - Nav2 avoids obstacles.)
-        if self._scene_hold_tick(now, pose):
+        stair_confirming = (getattr(self, '_pending_stair', None) or {}).get('confirm_since') is not None
+        if stair_confirming and active_hold(getattr(self.robot, 'scene_hold_msg', None), time.time_ns()):
+            return
+        if not stair_confirming and self._scene_hold_tick(now, pose):
             return                                    # holding for the Pi's scene check (squared up to the grid)
+        if not stair_confirming and self._room_view_tick(now, pose):
+            return                                    # in front of a room: one forward photo (never steps in)
+        if not stair_confirming and self._capture_tick(now, pose):
+            return                                    # stopped in a pocket for the camera capture round trip
         self._take_scene(now, pose)
-        self._check_exit(now, pose)
+        if getattr(self, '_pending_stair', None) is None:
+            self._check_exit(now, pose)
+        if self.state == 'ROAMING' and self._pi_stairs_only_tick(now, pose):
+            return
         if self.state == 'ROAMING' and self._advisory(now, pose):
+            return
+        if self.state == 'ROAMING' and self._stairs_on_sight_tick(now, pose, sample):
             return
         if self.state != 'ROAMING' or self._auto_stairs(now, sample):
             return
@@ -2543,6 +4310,19 @@ class RoamSession:
             self._centre_lane_tick(now, pose)
             return
         if self.goal is None:
+            if self._tilt_escape_tick(now, pose):
+                return                                   # working off a tilt (operator 2026-11-26)
+            if getattr(self, '_room_entry', None) is not None:
+                self._room_entry_tick(now, pose)
+                return
+            if self._post_stair is not None:
+                self._post_stair_tick(now, pose)
+                return
+            if now < self._arena_hold_until:
+                return                                   # --arena-holds: holding before reconsidering
+            if self._grid_face is not None and now >= self.choose_after:
+                self._centre_lane_request(now, pose, self._grid_face['goal'])     # turned: check, then walk
+                return
             if self.adv_task is not None:
                 if now >= self.choose_after:
                     self._advisory_tick(now, pose)
@@ -2561,7 +4341,13 @@ class RoamSession:
                     self._start_inspection(now, pose, insp)
                     if self.goal is not None or self.record.active_inspection:
                         return
+            if now >= self.choose_after and self._return_to_stairs(now, pose, sample):
+                return
+            if now >= self.choose_after and self._backtrack_scan_tick(now, pose):
+                return
             if now >= self.choose_after and (self.look or (self.look_check and self._plan_look(pose))):
+                if self.posture_look is not None:
+                    return                                   # body-yaw look-around: the main loop runs it
                 self._start_spin(now, pose, self.look.pop(0), reason='look-around: unseen floor to the side')
                 if self.goal is not None:
                     self.goal['look'] = True
@@ -2604,6 +4390,8 @@ class RoamSession:
                     self._end_spin(now, reason, status.get('spun_rad'))
                 elif reason in ('obstacle ahead (walking standoff)', TERRAIN_HOLD_REASON):
                     self._end_walk(now, pose, reason)
+                elif reason == 'stairs on sight':
+                    self._end_reselected(now, pose, reason)
                 elif reason.startswith('reselect'):
                     self._end_reselected(now, pose, reason)
                 else:
@@ -2614,7 +4402,9 @@ class RoamSession:
         if self.goal['kind'] == 'spin':
             spun = status.get('spun_rad') or 0.0
             if not result and self.passage is None and self.adv_task is None and not self.goal.get('look') \
-                    and self.map is not None and self.map[0] != self.scan_map_time:
+                    and not self.goal.get('fixed_turn') \
+                    and self.map is not None and self.map[0] != self.scan_map_time:   # (arena: a turn to a set
+                                                                                      # heading is never cut short)
                 self.scan_map_time = self.map[0]
                 if self.cfg.decision == 'unified' and self._heavy_tick == now:
                     self.scan_map_time = None                     # busy pass: check this map next pass
@@ -2643,27 +4433,41 @@ class RoamSession:
                 else:
                     self._pause('scan made no angular progress')
             return
-        # End an approach while there is still room to replan before the proximity lock.
-        heading_error = math.atan2(math.sin(self.goal['yaw'] - pose[2]), math.cos(self.goal['yaw'] - pose[2]))
-        approaching = (self.goal.get('ends_at') not in ('frontier', 'patrol', 'stairs', 'inspection')
-                       and abs(heading_error) <= SCAN_STEP_RAD and sample.obstacle_ahead_m is not None
-                       and sample.obstacle_ahead_m <= self.explorer.standoff())
+        # Operator 2026-11-25: roam's own "walking standoff" cancel is removed - Nav2 alone avoids obstacles while
+        # walking. It fired on terrain readings inside the dog's body (0.025-0.225 m ahead of the centre, nose at
+        # 0.305 m) when the dog stood tilted on a block, and ended open walks (Arena B 17:38 SGT and earlier).
         if math.hypot(pose[0] - self.progress[1], pose[1] - self.progress[2]) >= 0.10:
             self.progress = (now, pose[0], pose[1])
         if result == 'SUCCEEDED':
             self._end_walk(now, pose, 'reached')
         elif result:
             self._end_walk(now, pose, f'Nav2 {result}')
-        elif approaching:
-            self._cancel_scan_walk(now, 'obstacle ahead (walking standoff)')
+        elif self._plan_crosses_pending_stair():
+            self._cancel_scan_walk(now, 'Nav2 path crosses deferred stair')
+        elif self._centre_lane_changed(now) and getattr(self.cfg, 'arena_holds', False) \
+                and self.goal.get('grid_step'):
+            # --arena-holds: the walk left the lane - hold and reconsider (no failed destination, unlike 18:04)
+            lane = self.goal.get('centre_lane')
+            self.event('arena_hold', reason='walk left the lane', lane=[list(c) for c in lane] if lane else None)
+            if lane is not None:
+                self.course.block_cell(tuple(lane[1]), now, ARENA_BLOCK_CELL_S)
+            self._arena_hold_until = now + ARENA_HOLD_S
+            self._cancel_scan_walk(now, 'reselect: walk left the lane (arena holds)')
         elif self._centre_lane_changed(now):
-            self._cancel_scan_walk(now, 'Nav2 replanned outside the centre lane')
+            # Operator 2026-11-25 (fix 2): Nav2 leaving the lane is Nav2 finding a better way - keep walking; never
+            # cancel or mark the goal failed for it (18:04 SGT: two open goals failed, one avoided for 120 s).
+            lane = self.goal.pop('centre_lane', None)
+            self.goal.pop('lane_offset', None)
+            self.stats['centre_lane_left'] = self.stats.get('centre_lane_left', 0) + 1
+            self.event('centre_lane_left', lane=[list(c) for c in lane] if lane else None)
         elif self._plan_through_wall(now):
             self._cancel_scan_walk(now, 'Nav2 path goes through a gap in a wall')
         elif now - self.goal_sent_at > self.goal_timeout:
             self._cancel_scan_walk(now, 'timeout')
         elif now - self.progress[0] > self.cfg.stuck_s:
             self._cancel_scan_walk(now, f'no progress for {self.cfg.stuck_s:.0f} s')
+        elif self._crawling(now, pose):
+            self._cancel_scan_walk(now, f'Nav2 barely moving (< {CRAWL_MIN_M} m in {CRAWL_WINDOW_S:.0f} s)')
         elif self.cfg.decision == 'unified' and self.cfg.reselect and now - self._reselect_t >= RESELECT_PERIOD_S \
                 and 'centre_lane' not in self.goal and self.goal.get('ends_at') not in PROTECTED_ENDS and self.passage is None \
                 and self.scene_task is None and self._heavy_tick != now:
@@ -2676,7 +4480,7 @@ class RoamSession:
         if lane is None or plan is None or plan[0] < self.goal_sent_at or not plan[1]:
             return False
         return (math.dist(plan[1][-1], (self.goal['x'], self.goal['y'])) <= 0.2
-                and not self._centre_lane_ok(plan[1], lane))
+                and not self._centre_lane_ok(plan[1], lane, self.goal.get('lane_offset', 0.0)))
 
     def _in_course(self, x, y):
         """Inside the course walls (wall_gaps.in_course); True while the reachable floor is not known yet."""
@@ -2693,6 +4497,17 @@ class RoamSession:
             return False
         self._plan_check_t = now
         return WG.crosses(self.wall_gaps[0], self.wall_gaps[1], plan[1][::2] + plan[1][-1:])
+
+    def _crawling(self, now, pose):
+        """This walk moved less than CRAWL_MIN_M over the last CRAWL_WINDOW_S (window restarts per goal)."""
+        mark = getattr(self, '_crawl', None)
+        if mark is None or mark[3] is not self.goal:
+            self._crawl = (now, pose[0], pose[1], self.goal)
+            return False
+        if now - mark[0] < CRAWL_WINDOW_S:
+            return False
+        self._crawl = (now, pose[0], pose[1], self.goal)
+        return math.hypot(pose[0] - mark[1], pose[1] - mark[2]) < CRAWL_MIN_M
 
     def _cancel_scan_walk(self, now, reason):
         if self.robot.nav_cancel():
@@ -2757,6 +4572,14 @@ class RoamSession:
     def _hazard_max_age(self):
         return HAZARD_STALE_DOCS_S if self.cfg.docs_stops else HAZARD_STALE_S
 
+    def _ultrasound_now(self, now):
+        """The robot's front ultrasound distance (m), or None when stale or not a valid positive reading."""
+        stream = getattr(self.robot.telemetry, 'ultrasound', None)
+        item = stream.latest() if stream is not None else None
+        if item is None or now - item[0] > ULTRASOUND_MAX_AGE_S:
+            return None
+        return item[1] if math.isfinite(item[1]) and item[1] > 0 else None
+
     def _terrain_now(self, now):
         item = self.robot.telemetry.terrain.latest()
         return None if item is None or now - item[0] > max(0.5, self._terrain_max_age()) else item[1]
@@ -2808,13 +4631,35 @@ class RoamSession:
         try:
             if getattr(iface, 'active', True):
                 self.event('stairs_switch_out', evidence=iface.switch_out(), reason=why)
+                if getattr(iface, 'options_evidence', None):
+                    self.event('stairs_robot_stops', **iface.options_evidence)
         except Exception as error:  # noqa: BLE001 - keep stopping; tell the operator
             self.event('stairs_switch_out_failed', error=str(error))
             self.log(f'WARNING: could not leave the stair mode ({error}); use the remote / app to exit AI mode')
+        self._slam_pause(False, f'AI mode off ({why})')    # never raises
+
+    def _slam_pause(self, pause, why):
+        """Operator 2026-11-26: SLAM takes no new scans while the robot is in AI mode (the body pitches on the stairs
+        and leg odometry jumps on entering AI state). slam_toolbox's pause is a toggle without readback, so this
+        only toggles back what it paused itself, and only when that pause was answered."""
+        paused = getattr(self, '_slam_paused', False)
+        if pause == paused or not (self.robot.can_actuate and hasattr(self.robot, 'slam_toggle_pause')):
+            return
+        try:
+            evidence = self.robot.slam_toggle_pause()
+        except Exception as error:  # noqa: BLE001 - never stop a crossing or a stop over the map
+            evidence = {'answered': False, 'reason': str(error)}
+        if evidence.get('answered'):
+            self._slam_paused = pause
+        self.event('slam_paused' if pause else 'slam_resumed', why=why, **evidence)
+        if not evidence.get('answered') and not pause:
+            self.log(f'WARNING: SLAM may still be paused ({evidence.get("reason")}); '
+                     'ros2 service call /slam_toolbox/pause_new_measurements slam_toolbox/srv/Pause toggles it')
 
     def _pause(self, why):
         self._centre_pending = None
         self._leave_stairs(f'pause: {why}')
+        self._leave_posture(f'pause: {why}')
         self.crossing, self.adv_task, self.look, self.nudge = None, None, [], None
         if self.record is not None:
             if self.record.active_inspection:
@@ -2873,8 +4718,14 @@ class RoamSession:
             from .geometry import STANDING
             posture = pre.get('posture', {})
             # Uneven course (13:24 run): standing with one leg on a lip (extensions 0.26-0.35 m) is still standing.
-            others = [r for r in posture.get('reasons', []) if r not in ('joints still moving',
-                                                                          'leg extensions disagree beyond spread limit')]
+            ignore = ['joints still moving', 'leg extensions disagree beyond spread limit']
+            # Operator 2026-11-24 (c): on a block the dog stands tilted (run 17:32: 0.45 rad nose-up, every resume
+            # refused, then it sat down). Resume up to the tilt roam already allows while walking (ROAM_MAX_TILT_RAD),
+            # so it can walk off; beyond that, or with no IMU, still refuse.
+            tilt = posture.get('tilt_rad')
+            if tilt and max(abs(tilt[0]), abs(tilt[1])) <= ROAM_MAX_TILT_RAD:
+                ignore.append('body tilt exceeds limit')
+            others = [r for r in posture.get('reasons', []) if r not in ignore]
             if not (posture.get('posture') == STANDING and not others):
                 self.event('resume_refused_posture', posture=posture.get('posture'), reasons=posture.get('reasons'),
                            tilt_rad=posture.get('tilt_rad'), extensions_m=posture.get('extensions_m'))
@@ -2937,6 +4788,10 @@ class RoamSession:
         crossing. Returns True when it took over this tick."""
         if self.cfg.advisory == 'off':
             return False
+        if getattr(self.cfg, 'defer_stairs', False) and self.cfg.advisory == 'act':
+            history = getattr(self, '_stair_pose_history', [])
+            self._stair_pose_history = [(t, p) for t, p in history if now - t <= 4.0] + [(now, pose)]
+            self._remember_object_stairs(now)
         item = self._pick_advisory(now)
         if item == 'hold':
             return True                                   # stopped: waiting for a reading taken standing still
@@ -2951,6 +4806,9 @@ class RoamSession:
         if adv is None or self.cfg.advisory != 'act' or self.stairs or self.crossing:
             return False
         if adv['obstacle'] == 'stairs':
+            if getattr(self.cfg, 'defer_stairs', False):
+                self._remember_stairs(now, pose, adv, item[2])
+                return False
             return self._advisory_stairs(now, pose, adv)
         return self._advisory_curtain(now, pose, adv)
 
@@ -2970,6 +4828,10 @@ class RoamSession:
                 self._pi_gate_expired(now)
             return 'hold' if self.pi_gate is not None else fallback
         adv = parse_advisory(pi[2])
+        if (adv is not None and adv['obstacle'] == 'stairs'
+                and getattr(self.cfg, 'defer_stairs', False)
+                and getattr(self, '_pending_stair', None) is not None):
+            return fallback  # return confirmation uses both live feeds at the saved approach
         if self.cfg.advisory != 'act':
             return (pi[0], pi[2], 'pi') if adv is not None else fallback
         busy = (self.stairs or self.crossing or self.adv_task is not None
@@ -3011,6 +4873,411 @@ class RoamSession:
         self.event('pi_obstacle_unconfirmed', waited_s=_r(now - self.pi_gate['t'], 1))
         self.pi_gate = None
         self.pi_ignore_until = now + PI_IGNORE_S
+
+    def _object_stair_reading(self, now):
+        reading = getattr(self.robot, 'pi_stair_objects', None)
+        if not self.cfg.pi_advisory or reading is None or not 0 <= now - reading[0] <= 2.0:
+            return None
+        received, wall, text = reading
+        try:
+            msg = json.loads(text)
+            stamp = msg['capture_stamp_ns']
+            if type(stamp) is not int or stamp <= 0:
+                return None
+            latency = wall - stamp / 1e9
+            captured = received - latency
+            if not 0 <= latency <= PI_LATENCY_RANGE_S[1] or not 0 <= now - captured <= 3.0:
+                return None
+            candidates = []
+            for item in msg.get('stair_candidates', []):
+                if item.get('name') != 'stairs':
+                    continue
+                confidence = float(item['confidence'])
+                x1, x2 = (float(item['box'][k]) for k in ('x1', 'x2'))
+                if PI_STAIRS_MIN_CONFIDENCE <= confidence <= 1 and 0 <= x1 < x2 <= 640:
+                    candidates.append((confidence, (x1 + x2) / 2))
+        except (TypeError, ValueError, KeyError, AttributeError):
+            return None
+        if not candidates:
+            return None
+        _, midpoint = max(candidates)
+        # Pi Orbbec colour stream is 640 px wide. This is a steering error,
+        # not a distance estimate or a claim that the body is square to the riser.
+        return captured, (320 - midpoint) / 320
+
+    def _remember_object_stairs(self, now):
+        if (getattr(self, '_pending_stair', None) is not None or self.course is None
+                or self.record is None or now < self.stairs_until or self.stairs or self.crossing):
+            return
+        reading = self._object_stair_reading(now)
+        if reading is None:
+            return
+        captured, error = reading
+        stamp, pose = min(self._stair_pose_history, key=lambda item: abs(item[0] - captured))
+        if abs(stamp - captured) > 0.25:
+            return
+        self._pending_stair = {'riser': None, 'approach': pose[:2], 'seen_from': pose[:2],
+                               'facing': pose[2] + error * math.radians(30),
+                               'route': None, 'confirm_since': None, 'object_only': True}
+        self.event('stairs_deferred', source='pi_object_model', approach=list(pose[:2]),
+                   location='camera observation pose; riser range unmeasured')
+
+    def _centre_on_stair_object(self, now, pose, stair):
+        reading = self._object_stair_reading(now)
+        fresh_since = stair.get('centred_after', stair['confirm_since'])
+        if reading is None or reading[0] < fresh_since + PI_STILL_MARGIN_S:
+            return self._deferred_stair_wait(stair, 'waiting for fresh stairs object detection')
+        _, error = reading
+        if abs(error) <= 0.10:
+            return False
+        if stair.get('centre_turns', 0) >= 3:
+            self._hold_deferred_stairs('Stairs still off centre after bounded alignment turns')
+            return True
+        angle = max(-12.0, min(12.0, error * 30.0))
+        self._start_spin(now, pose, math.radians(angle), reason='centre detected stairs in camera')
+        if self.goal is None:
+            self._hold_deferred_stairs('No clear turn to centre the stairs')
+            return True
+        self.goal['look'] = True
+        stair['centre_turns'] = stair.get('centre_turns', 0) + 1
+        self.goal['stair_centring'] = True
+        stair.pop('depth_check', None)
+        self.event('stairs_centring_turn', degrees=_r(angle, 1))
+        return True
+
+    def _remember_stairs(self, now, pose, adv, source):
+        if self.course is None or self.record is None or now < self.stairs_until:
+            return
+        if getattr(self, '_pending_stair', None) is not None:
+            return
+        facing = pose[2] + math.radians(adv['heading_deg'])
+        direction = math.cos(facing), math.sin(facing)
+        distance = adv['distance_m']
+        riser = tuple(v + distance * d for v, d in zip(pose[:2], direction))
+        approach = tuple(v - ADVISORY_STAIRS_WALK_TO_M * d for v, d in zip(riser, direction))
+        self._pending_stair = {'riser': riser, 'approach': approach, 'facing': facing,
+                               'seen_from': pose[:2], 'route': None, 'confirm_since': None}
+        self.event('stairs_deferred', riser=list(riser), approach=list(approach), source=source)
+
+    def _hold_deferred_stairs(self, reason):
+        self.event('stairs_return_hold', reason=reason)
+        stair = getattr(self, '_pending_stair', None)
+        if stair is not None:
+            stair['route'], stair['confirm_since'], stair['sent'] = None, None, None
+            stair.pop('centred_after', None)
+            stair.pop('centre_turns', None)
+            stair.pop('depth_check', None)
+        self._operator_pause = True
+        self._pause(reason)
+
+    def _pi_stairs_only_tick(self, now, pose):
+        """--stairs-pi-only: a fresh Pi stairs detection (obstacle YOLO, class "stairs" only, never roller or
+        curtain) starts the stair routine at once: approach in the normal gait until the incline, AI mode, climb,
+        back to navigation mode. No RGB-D, VLM or terrain confirmation. True when it took over this tick."""
+        if not getattr(self.cfg, 'stairs_pi_only', False):
+            return False
+        history = getattr(self, '_pi_stair_poses', [])
+        self._pi_stair_poses = [(t, p) for t, p in history if now - t <= 5.0] + [(now, pose)]
+        pending = getattr(self, '_pi_stair_turn', None)
+        if self.stairs or self.crossing or self.adv_task or self.passage or now < self.stairs_until \
+                or not (self.robot.can_actuate and hasattr(self.robot, 'send_gait')):
+            self._pi_stair_turn = None
+            return False
+        if self.cancel_request is not None:
+            return False                                  # the normal handler waits for Nav2's cancellation
+        reading = self._pi_new_stairs(now)                # None also for a frame from mid-turn (then: settle)
+        settling = now < getattr(self, '_pi_stairs_settle_until', -math.inf)
+        if self.goal is not None:
+            if self.goal.get('pi_stair_turn') and pending is not None and now - pending['t'] <= PI_STAIRS_TURN_MAX_S:
+                return False                              # our facing turn: let it finish (then cancelled if slow)
+            if self.goal.get('ends_at') in PROTECTED_ENDS and self.goal.get('ends_at') != 'room':
+                return False
+            if pending is None and reading is None and not settling:
+                return False
+            self.event('stairs_pi_preempt', goal=self.goal.get('ends_at', self.goal['kind']),
+                       why='stairs' if reading is not None else 'stop to look again')
+            self._cancel_scan_walk(now, 'stairs seen by the Pi')
+            return True
+        if pending is not None:
+            self._pi_stair_turn = None
+            self._pi_stairs_handover(pending, turned=True)
+            return True
+        if reading is None:
+            return settling                               # standing still for a frame taken while still
+        captured, bearing, range_m, place = reading
+        then = min(self._pi_stair_poses, key=lambda item: abs(item[0] - captured))[1]
+        turn = math.remainder(then[2] + bearing - pose[2], math.tau)     # bearing seen from the capture pose
+        sighting = {'bearing_deg': _r(math.degrees(bearing), 1), 'turn_deg': _r(math.degrees(turn), 1),
+                    'range_m': _r(range_m, 2) if range_m is not None else None, 'place': [_r(v, 2) for v in place]}
+        self.event('stairs_pi_seen', **sighting)
+        sighting['t'] = now
+        if PI_STAIRS_ALIGN and abs(turn) > math.radians(PI_STAIRS_FACE_DEG):
+            self._start_spin(now, pose, turn, reason='face the stairs the Pi saw')
+            if self.goal is not None:
+                self.goal['pi_stair_turn'] = True
+                self._pi_stair_turn = sighting
+                return True
+        self._pi_stairs_handover(sighting, turned=False)
+        return True
+
+    def _pi_stairs_reading(self, now):
+        """(capture time on the roam clock, bearing rad left-positive, floor range m or None) of the Pi's freshest
+        stairs box, else None. Range: where the box's bottom edge meets the floor (camera mount), None when that
+        edge is at or above the horizon."""
+        reading = self._object_stair_reading(now)
+        if reading is None:
+            return None
+        captured, error = reading                         # error = (320 - box centre) / 320
+        bearing = math.atan2(error * 320.0, PI_STAIRS_FX_PX)
+        try:
+            boxes = [c for c in json.loads(self.robot.pi_stair_objects[2]).get('stair_candidates', [])
+                     if c.get('name') == 'stairs']
+            bottom = float(max(boxes, key=lambda c: float(c['confidence']))['box']['y2'])
+        except (TypeError, ValueError, KeyError, AttributeError):
+            return captured, bearing, None
+        depression = math.radians(PI_CAMERA_PITCH_DEG) + math.atan2(bottom - PI_STAIRS_CY_PX, PI_STAIRS_FX_PX)
+        if depression <= math.radians(2.0):
+            return captured, bearing, None
+        return captured, bearing, min(4.0, PI_CAMERA_HEIGHT_M / math.tan(depression) / math.cos(bearing))
+
+    def _pi_stairs_place(self, pose, bearing, range_m):
+        """Map (x, y) of the stairs from the capture pose; 0.6 m ahead when the range is unknown."""
+        heading, d = pose[2] + bearing, range_m if range_m is not None else 0.6
+        return pose[0] + d * math.cos(heading), pose[1] + d * math.sin(heading)
+
+    def _pi_new_stairs(self, now):
+        """_pi_stairs_reading plus the map place of the stairs, or None when there is no sighting or it is a
+        flight already handed over (within PI_STAIRS_SAME_M)."""
+        reading = self._pi_stairs_reading(now)
+        if reading is None or not getattr(self, '_pi_stair_poses', None):
+            return None
+        captured, bearing, range_m = reading
+        then = min(self._pi_stair_poses, key=lambda item: abs(item[0] - captured))[1]
+        rotated = math.remainder(self._pi_stair_poses[-1][1][2] - then[2], math.tau)
+        if not PI_STAIRS_ALIGN and abs(rotated) > math.radians(PI_STAIRS_MAX_ROTATED_DEG):
+            if getattr(self, '_pi_stairs_turning_at', None) != captured:      # turning: stop, look again when still
+                self._pi_stairs_turning_at = captured
+                self._pi_stairs_settle_until = now + PI_STAIRS_SETTLE_S
+                self.event('stairs_pi_stop_to_look', rotated_deg=_r(math.degrees(rotated), 1),
+                           bearing_deg=_r(math.degrees(bearing), 1), wait_s=PI_STAIRS_SETTLE_S)
+            return None
+        place = self._pi_stairs_place(then, bearing, range_m)
+        crossed = getattr(self, '_pi_stairs_crossed', [])
+        if any(math.dist(place, done) <= PI_STAIRS_SAME_M for done in crossed):
+            if getattr(self, '_pi_stairs_ignored_at', None) != captured:
+                self._pi_stairs_ignored_at = captured
+                self.event('stairs_pi_already_crossed', place=[_r(v, 2) for v in place])
+            return None
+        return captured, bearing, range_m, place
+
+    def _pi_stairs_handover(self, sighting, turned):
+        self._pi_stairs_crossed = getattr(self, '_pi_stairs_crossed', []) + [tuple(sighting['place'])]
+        self.event('stairs_pi_handover', bearing_deg=sighting['bearing_deg'], range_m=sighting['range_m'],
+                   turned=turned, confirmation='none (Pi stairs YOLO only)')
+        # Operator 2026-11-26: AI mode as soon as the Pi's YOLO sees the stairs (no normal-gait approach until the body
+        # tilts); in AI mode it walks on until the front ultrasound reads STAIR_AI_OBSTACLE_STOP_M.
+        self._begin_stairs('up', 'switch_in', 'pi stairs yolo', over=True, mode='ai')
+
+    def _stairs_on_sight_tick(self, now, pose, sample):
+        stair = getattr(self, '_pending_stair', None)
+        if not getattr(self.cfg, 'stairs_on_sight', False) or stair is None:
+            return False
+        if self.crossing or self.stairs or self.adv_task or self.passage:
+            return False
+        if self.cancel_request is not None:
+            return False  # let the normal cancellation handler wait for the terminal result
+        if self.goal is not None:
+            if self.goal.get('ends_at') == 'stairs' or self.goal.get('stair_centring'):
+                return False  # the current stair movement is already in progress
+            if self.goal.get('ends_at') in PROTECTED_ENDS and self.goal.get('ends_at') != 'room':
+                return False
+            self._centre_pending = None
+            self.look = []
+            self.event('stairs_on_sight_preempt', goal=self.goal.get('ends_at', self.goal['kind']))
+            self._cancel_scan_walk(now, 'stairs on sight')
+            return True
+        self._centre_pending = None
+        if now >= self.choose_after:
+            self._return_to_stairs(now, pose, sample)
+        return True
+
+    def _return_to_stairs(self, now, pose, sample):
+        stair = getattr(self, '_pending_stair', None)
+        if stair is None or self.course is None or not self.course.cells:
+            return False
+        if self.map is None or now - self.map[0] > self.cfg.max_map_age_s:
+            self._deferred_stair_wait(stair, 'map missing or stale')
+            return True
+        if stair['route'] is None:
+            if not getattr(self.cfg, 'stairs_on_sight', False):
+                if self._phase(now) != 'move_on':
+                    return False
+                frontier = self._frontier_goal(now, pose)
+                if frontier and frontier.get('ends_at') == 'frontier' and not self._goal_invalid(frontier):
+                    return False
+            crumbs = list(self.record.breadcrumbs)
+            if not crumbs:
+                self._hold_deferred_stairs('No breadcrumb route to deferred stairs')
+                return True
+            first = min(range(len(crumbs)), key=lambda i: math.dist(crumbs[i], stair['seen_from']))
+            last = min(range(len(crumbs)), key=lambda i: math.dist(crumbs[i], pose[:2]))
+            if math.dist(crumbs[first], stair['seen_from']) > 0.45 or math.dist(crumbs[last], pose[:2]) > 0.45:
+                self._hold_deferred_stairs('Deferred stairs are disconnected from the remembered route')
+                return True
+            stride = -1 if last >= first else 1
+            stair['route'] = [crumbs[i] for i in range(last, first + stride, stride)] + [stair['approach']]
+            self.event('stairs_return_started', waypoints=len(stair['route']))
+        if stair.get('sent') is not None:
+            if math.dist(pose[:2], stair['sent']) > 0.22:
+                self._hold_deferred_stairs('A stair return waypoint was not reached')
+                return True
+            stair['sent'] = None
+        while stair['route'] and math.dist(pose[:2], stair['route'][0]) <= 0.18:
+            stair['route'].pop(0)
+        if stair['route']:
+            x, y = stair['route'][0]
+            if not self._reachable(x, y):
+                self._hold_deferred_stairs('Remembered stair return waypoint is currently blocked')
+                return True
+            stair['route'].pop(0)
+            stair['sent'] = (x, y)
+            final = not stair['route']
+            yaw = stair['facing'] if final else math.atan2(y - pose[1], x - pose[0])
+            self._start_walk(now, pose, {'kind': 'walk', 'x': x, 'y': y, 'yaw': yaw,
+                                         'free_m': None, 'score': 0.0, 'ends_at': 'stairs'})
+            return True
+        return self._confirm_deferred_stairs(now, pose, sample, stair)
+
+    def _deferred_stair_wait(self, stair, reason):
+        if stair.get('waiting_for') != reason:
+            stair['waiting_for'] = reason
+            self.event('stairs_confirmation_wait', reason=reason)
+        return True
+
+    def _placed_stair_depth(self, now, stair):
+        sighting = self._object_stair_reading(now)
+        fresh_since = stair.get('centred_after', stair['confirm_since'])
+        if sighting is None or sighting[0] < fresh_since + PI_STILL_MARGIN_S:
+            stair.pop('depth_check', None)
+            return None
+        _, _, text = self.robot.pi_stair_objects
+        packet = json.loads(text)
+        depth = packet.get('stair_depth')
+        if not isinstance(depth, dict) or depth.get('confirmed') is not True:
+            stair.pop('depth_check', None)
+            self._deferred_stair_wait(stair, depth.get('reason', 'waiting for Pi stair depth') if isinstance(depth, dict)
+                                      else 'waiting for Pi stair depth')
+            return None
+        stamp = packet.get('capture_stamp_ns')
+        distance = depth.get('distance_m')
+        heading = depth.get('heading_deg')
+        depth_stamp = depth.get('depth_stamp_ns')
+        box_center = depth.get('box_center_x')
+        values = (distance, heading, box_center)
+        if (type(stamp) is not int or type(depth_stamp) is not int
+                or depth.get('stamp_ns') != stamp or abs(depth_stamp - stamp) > 40_000_000
+                or depth.get('treads', 0) != 3
+                or not all(type(v) in (int, float) and math.isfinite(v) for v in values)
+                or not 0.4 <= distance <= ADVISORY_STAIRS_TRIGGER_M
+                or abs(heading) > ADVISORY_ALIGN_DEG or abs(box_center - 320) > 32):
+            stair.pop('depth_check', None)
+            self._deferred_stair_wait(stair, 'Pi stair depth outside verified approach range or alignment')
+            return None
+        previous = stair.get('depth_check')
+        if previous and previous[0] == stamp:
+            return distance if previous[3] else None
+        agrees = bool(previous and 0 < stamp - previous[0] <= 6_000_000_000
+                      and abs(distance - previous[1]) <= 0.10 and abs(heading - previous[2]) <= 8)
+        stair['depth_check'] = (stamp, distance, heading, agrees)
+        if not agrees:
+            self._deferred_stair_wait(stair, 'waiting for a second matching Pi stair depth frame')
+            return None
+        if not previous[3]:
+            self.event('stairs_pi_depth_confirmed', distance_m=distance, heading_deg=heading)
+        return distance
+
+    def _confirm_deferred_stairs(self, now, pose, sample, stair):
+        if stair['confirm_since'] is None:
+            stair['confirm_since'] = now
+            self.event('stairs_return_at_approach', pose=list(pose[:2]))
+        since = stair['confirm_since']
+        if now - since > (22.0 if stair.get('object_only') else 10.0):
+            reason = stair.get('waiting_for', 'confirmation timed out')
+            self._hold_deferred_stairs(f'Deferred stairs could not be reconfirmed: {reason}')
+            return True
+        still, _ = self.runner._stationary(0.5)
+        if not still or now - since < 0.5:
+            return self._deferred_stair_wait(stair, 'robot settling at approach')
+        object_only = stair.get('object_only', False)
+        if object_only and math.dist(pose[:2], stair['approach']) > 0.22:
+            self._hold_deferred_stairs('Robot drifted away from the saved stair approach')
+            return True
+        if object_only:
+            if self._centre_on_stair_object(now, pose, stair):
+                return True
+            depth_distance = self._placed_stair_depth(now, stair)
+            if depth_distance is None:
+                return True
+            since = stair.get('centred_after', since)
+        camera = []
+        nuc = getattr(self.robot, 'advisory', None)
+        pi = getattr(self.robot, 'pi_advisory', None)
+        if nuc and now - nuc[0] <= ADVISORY_MAX_AGE_S and nuc[0] >= since + PI_STILL_MARGIN_S:
+            camera.append(nuc[1])
+        if self.cfg.pi_advisory and pi and now - pi[0] <= PI_ADVISORY_MAX_AGE_S:
+            try:
+                stamp = json.loads(pi[2]).get('capture_stamp_ns')
+            except (ValueError, TypeError, AttributeError):
+                stamp = None
+            if isinstance(stamp, (int, float)):
+                latency = pi[1] - stamp / 1e9
+                if PI_LATENCY_RANGE_S[0] <= latency <= PI_LATENCY_RANGE_S[1] and pi[0] - latency >= since + PI_STILL_MARGIN_S:
+                    camera.append(pi[2])
+        if not object_only and not camera:
+            return self._deferred_stair_wait(stair, 'waiting for a fresh camera frame')
+        if not object_only and abs(math.remainder(pose[2] - stair['facing'], math.tau)) > math.radians(15):
+            return self._deferred_stair_wait(stair, 'robot heading differs from saved approach')
+        item = self.robot.telemetry.terrain.latest()
+        if (item is None or item[0] < since + 0.5 or now - item[0] > 0.5
+                or sample.step_ahead_m is None or sample.step_rise_m is None
+                or not STAIR_MIN_RISE_M <= abs(sample.step_rise_m) <= STAIR_MAX_RISE_M):
+            return self._deferred_stair_wait(stair, 'fresh terrain has no stair-height change')
+        if not self._confirmed_step_sample(item[0], sample):
+            return self._deferred_stair_wait(stair, 'waiting for two agreeing terrain samples')
+        if object_only:
+            if not 0.40 <= sample.step_ahead_m <= ADVISORY_STAIRS_TRIGGER_M:
+                return self._deferred_stair_wait(stair, 'measured riser outside the approach range')
+            if sample.step_rise_m <= 0:
+                return self._deferred_stair_wait(stair, 'object detection cannot verify the landing below a drop')
+            if abs(depth_distance - sample.step_ahead_m) > 0.20:
+                return self._deferred_stair_wait(stair, 'Pi depth and terrain disagree on riser distance')
+            self.event('stairs_return_confirmed', direction='up', source='pi_object_and_depth',
+                       rise_m=_r(sample.step_rise_m, 3))
+            stair['traversing'] = True
+            self._begin_stairs('up', 'approach', 'deferred advisory', over=True, mode='ai')
+            return True
+        for text in camera:
+            adv = parse_advisory(text)
+            if adv is None or adv['obstacle'] != 'stairs' or not 0 < adv['distance_m'] <= ADVISORY_STAIRS_TRIGGER_M:
+                continue
+            if abs(adv['heading_deg']) > ADVISORY_ALIGN_DEG or abs(adv['distance_m'] - sample.step_ahead_m) > 0.30:
+                continue
+            direction = 'up' if sample.step_rise_m > 0 else 'down'
+            self.event('stairs_return_confirmed', direction=direction, rise_m=_r(sample.step_rise_m, 3))
+            stair['traversing'] = True
+            self._begin_stairs(direction, 'approach', 'deferred advisory', over=True, mode='ai')
+            return True
+        return self._deferred_stair_wait(stair, 'camera and terrain disagree on stairs, heading, or distance')
+
+    def _confirmed_step_sample(self, stamp, sample):
+        previous = getattr(self, '_step_confirmation', None)
+        value = (stamp, sample.step_ahead_m, sample.step_rise_m)
+        if previous is None or previous[0] != stamp:
+            self._step_confirmation = value
+        return (previous is not None and 0 < stamp - previous[0] <= 0.5
+                and abs(value[1] - previous[1]) <= 0.12
+                and abs(value[2] - previous[2]) <= 0.05
+                and value[2] * previous[2] > 0)
 
     def _advisory_stairs(self, now, pose, adv):
         """Far: walk to ADVISORY_STAIRS_WALK_TO_M before the first riser. Near: face the risers squarely
@@ -3085,6 +5352,8 @@ class RoamSession:
         odom = self.robot.telemetry.odom.latest()
         if odom is None:
             return self._end_crossing(now, 'no odometry')
+        if c.get('back'):
+            return self._probe_back_tick(now, c, odom)
         travelled = math.hypot(odom[1].x - c['origin'][0], odom[1].y - c['origin'][1])
         tilt = self.robot.telemetry.current_tilt()
         if tilt is not None and max(abs(tilt[0]), abs(tilt[1])) > CURTAIN_MAX_TILT_RAD:
@@ -3098,10 +5367,60 @@ class RoamSession:
         if travelled > c['progress'][1] + CURTAIN_STALL_M:
             c['progress'] = (now, travelled)
         elif now - c['progress'][0] > CURTAIN_STALL_S:
+            if c.get('probe'):
+                return self._probe_wall(now, c, travelled, 'legs: no progress')
             return self._end_crossing(now, 'no progress: blocked, maybe not a curtain', travelled)
+        if c.get('probe'):
+            # Legs can paddle against a wall and still count steps; SLAM (LiDAR) shows whether the body moves.
+            pose = self._pose()
+            if pose is not None:
+                moved = math.hypot(pose[0] - c['slam_origin'][0], pose[1] - c['slam_origin'][1])
+                if moved > c['slam_progress'][1] + CURTAIN_STALL_M:
+                    c['slam_progress'] = (now, moved)
+                elif now - c['slam_progress'][0] > CURTAIN_STALL_S:
+                    return self._probe_wall(now, c, travelled, 'SLAM: no progress')
         self.robot.send_velocity(speed, 0.0)
 
+    def _probe_wall(self, now, c, travelled, how):
+        """The probed passage did not give way: a wall. Reverse along the probe path (ground just walked)."""
+        self.robot.send_velocity(0.0, 0.0)
+        odom = self.robot.telemetry.odom.latest()
+        back = min(travelled, PASSAGE_PROBE_BACK_MAX_M)
+        self.event('passage_probe_wall', how=how, travelled_m=_r(travelled, 2), back_m=_r(back, 2))
+        self._reject(now, {'x': c['wall'][0], 'y': c['wall'][1]}, 'passage', 'probe: wall, not a curtain')
+        self.stats['passage_probe_walls'] = self.stats.get('passage_probe_walls', 0) + 1
+        c.update(back=True, back_m=back, origin=(odom[1].x, odom[1].y), t=now, progress=(now, 0.0))
+        if back < CURTAIN_STALL_M:
+            self._end_probe_back(now, 'nothing to reverse', 0.0)
+
+    def _probe_back_tick(self, now, c, odom):
+        moved = math.hypot(odom[1].x - c['origin'][0], odom[1].y - c['origin'][1])
+        speed = min(PASSAGE_PROBE_BACK_SPEED_M_S, self.cfg.mode_speed(self.speed_mode)[0])
+        if moved >= c['back_m']:
+            return self._end_probe_back(now, 'done', moved)
+        if self._rear_obstacle() < PASSAGE_PROBE_REAR_CLEAR_M:
+            return self._end_probe_back(now, 'obstacle behind', moved)
+        if now - c['t'] > 2.0 * c['back_m'] / speed + 3.0:
+            return self._end_probe_back(now, 'timeout', moved)
+        if moved > c['progress'][1] + CURTAIN_STALL_M:
+            c['progress'] = (now, moved)
+        elif now - c['progress'][0] > CURTAIN_STALL_S:
+            return self._end_probe_back(now, 'no progress', moved)
+        self.reverse_ok_until = now + 0.5
+        self.robot.send_velocity(-speed, 0.0)
+
+    def _end_probe_back(self, now, how, moved):
+        """Backed off the wall (or stopped trying): explore on, the passage is remembered as done."""
+        self.robot.send_velocity(0.0, 0.0)
+        self.crossing = None
+        self.curtain_until = now + CURTAIN_COOLDOWN_S
+        self.goal = None
+        self.scan_index = 0
+        self.choose_after = now + MAP_SETTLE_S
+        self.event('passage_probe_back', how=how, reversed_m=_r(moved, 2))
+
     def _end_crossing(self, now, problem, travelled=None):
+        c = self.crossing or {}
         self.robot.send_velocity(0.0, 0.0)
         self.crossing = None
         self.curtain_until = now + CURTAIN_COOLDOWN_S
@@ -3112,7 +5431,7 @@ class RoamSession:
             self._pause(f'curtain crossing stopped: {problem}')
             return
         self.stats['curtain_crossings'] = self.stats.get('curtain_crossings', 0) + 1
-        self.event('curtain_crossed', travelled_m=_r(travelled, 2))
+        self.event('curtain_crossed', travelled_m=_r(travelled, 2), probe=bool(c.get('probe')))
         self.last_clear = -math.inf                      # the curtain is in the costmaps as a wall
         self._clear_costmaps(now, 'curtain crossed')
 
@@ -3136,8 +5455,14 @@ class RoamSession:
         iface = AiModeStairs(self.robot, self.cfg.ai_axis_forward, normal) if mode == 'ai' \
             else HStepGaitStairs(self.robot, self.cfg.rough_gait, normal)
         odom = self.robot.telemetry.odom.latest()
-        origin = (odom[1].x, odom[1].y) if odom else (0.0, 0.0)
+        origin = JumpFreeOdom()                 # distance walked, leg-odometry jumps dropped (run 26 Nov 04:24)
+        if odom:
+            origin.update(odom[0], odom[1].x, odom[1].y)
         kw = {'climb_speed_m_s': climb_speed} if climb_speed else {}
+        if mode == 'ai':
+            kw['min_hold_s'] = STAIR_AI_MIN_HOLD_S
+            kw['obstacle_stop_m'] = STAIR_AI_OBSTACLE_STOP_M
+            kw['walk_m'] = STAIR_AI_WALK_M
         routine = StairRoutine(direction, StairConfig(switch_settle_s=iface.settle_s, **kw), start=start, over=over)
         self.stairs = (routine, iface, origin)
         self.stairs_began = self.robot.now()
@@ -3148,6 +5473,8 @@ class RoamSession:
         """Terrain sees a step (up or down) of stair height right ahead: cross it without the operator."""
         if self._step_crossing(now, sample):
             return True
+        if getattr(self.cfg, 'defer_stairs', False):
+            return False  # camera-confirmed return owns flights in this mode
         if not (self.cfg.auto_stairs and self.robot.can_actuate and hasattr(self.robot, 'send_gait')):
             return False
         if sample.step_ahead_m is None or sample.step_rise_m is None or now < self.stairs_until:
@@ -3171,6 +5498,47 @@ class RoamSession:
             return False
         if sample.step_ahead_m > c.step_trigger_m or not c.step_min_rise_m <= abs(sample.step_rise_m) <= c.step_max_rise_m:
             return False
+        if getattr(c, 'defer_stairs', False):
+            stair = getattr(self, '_pending_stair', None)
+            if stair is not None and self.last_pose is not None and math.dist(
+                    self.last_pose[:2], stair['riser'] or stair['approach']) <= 1.2:
+                return False
+            item = self.robot.telemetry.terrain.latest()
+            if item is None or now - item[0] > 0.5 or not self._confirmed_step_sample(item[0], sample):
+                return False
+            if sample.step_rise_m < 0:
+                self._hold_deferred_stairs('Downward step needs camera and terrain confirmation')
+                return True
+        if self.goal is not None and self.goal.get('square_up'):
+            return False                               # squaring up to this step: cross once the turn is done
+        if sample.step_ahead_m < STEP_START_M - 0.05:
+            first = getattr(self, '_step_close_t', None)
+            if first is None or now - first > 2 * STEP_BACKOFF_REPEAT_S:
+                self._step_close_t = now               # first time this close: do not cross from here
+                self.event('step_too_close', ahead_m=_r(sample.step_ahead_m, 2), rise_m=_r(sample.step_rise_m, 3),
+                           retry_after_s=STEP_BACKOFF_REPEAT_S)
+                return False
+            if now - first < STEP_BACKOFF_REPEAT_S:
+                return False
+        self._step_close_t = None
+        pose = self._pose()
+        if pose is not None and self.course is not None and \
+                now - getattr(self, '_step_square_t', -math.inf) > STEP_SQUARE_REPEAT_S:
+            turn = math.atan2(math.sin(self._grid_axis_yaw(pose[2]) - pose[2]),
+                              math.cos(self._grid_axis_yaw(pose[2]) - pose[2]))
+            if abs(turn) > math.radians(STEP_SQUARE_TOL_DEG):
+                # Operator 2026-11-25 (item 3): meet the block square - turn to the grid axis first (Nav2 Spin, the
+                # capped in-place turn rate), then cross from where it stands.
+                self._step_square_t = now
+                if self.goal is not None:
+                    self.robot.nav_cancel(timeout_s=0.5)
+                    self.goal, self.cancel_request = None, None
+                self.event('step_square_up', turn_deg=_r(math.degrees(turn), 0), ahead_m=_r(sample.step_ahead_m, 2),
+                           rise_m=_r(sample.step_rise_m, 3))
+                self._start_spin(now, pose, turn, reason='square up to the step')
+                if self.goal is not None:
+                    self.goal['square_up'] = True
+                return True
         if self.goal is not None:
             self.robot.nav_cancel(timeout_s=0.5)
             self.goal, self.cancel_request = None, None
@@ -3194,13 +5562,27 @@ class RoamSession:
         routine, iface, start = self.stairs
         tilt = self.robot.telemetry.current_tilt()
         odom = self.robot.telemetry.odom.latest()
-        travelled = math.hypot(odom[1].x - start[0], odom[1].y - start[1]) if odom else 0.0
-        action = routine.step(now, tilt[1] if tilt else None, tilt[0] if tilt else None, travelled)
+        if odom:
+            jump = start.update(odom[0], odom[1].x, odom[1].y)
+            if jump is not None:
+                self.event('stairs_odom_jump_ignored', jump_m=_r(jump, 2), state=routine.state)
+        travelled = start.distance()
+        ahead = self._ultrasound_now(now) if routine.cfg.obstacle_stop_m is not None else None
+        action = routine.step(now, tilt[1] if tilt else None, tilt[0] if tilt else None, travelled, ahead)
+        if routine.walk_end is not None and not getattr(routine, 'obstacle_logged', False):
+            routine.obstacle_logged = True
+            if routine.walk_end == 'obstacle':
+                self.event('stairs_obstacle_stop', ultrasound_m=_r(routine.obstacle_stop, 3),
+                           stop_m=routine.cfg.obstacle_stop_m, travelled_m=_r(travelled, 2))
+            else:
+                self.event('stairs_walk_done', walked_m=_r(travelled - routine.d_state, 2),
+                           walk_m=routine.cfg.walk_m, ultrasound_m=_r(ahead, 3))
         if not (action.done or action.aborted) and self._step_wall_ahead(routine, travelled, tilt[1] if tilt else None):
             routine._enter('switch_out', now, travelled)           # up and facing a wall: hand back to roaming
             self.event('step_crossed_wall_ahead', travelled_m=_r(travelled, 2))
             action = Action(switch='out')
-        if action.switch == 'out' and not action.aborted and now - self.stairs_began < STAIR_MAX_AI_S:
+        if action.switch == 'out' and not action.aborted and routine.cfg.obstacle_stop_m is None and \
+                now - self.stairs_began < STAIR_MAX_AI_S:
             sample = self._terrain_now(now)          # uneven course: more lips ahead -> keep climbing in AI mode
             if sample is not None and sample.step_ahead_m is not None and sample.step_rise_m is not None and \
                     sample.step_ahead_m <= STAIR_CONTINUE_M and \
@@ -3209,14 +5591,26 @@ class RoamSession:
                 routine.inclined, routine.level_since = False, None
                 self.event('stairs_continue', ahead_m=_r(sample.step_ahead_m, 2), rise_m=_r(sample.step_rise_m, 3))
                 action = Action(vx=routine.cfg.climb_speed_m_s)
+        if routine.hold_deferred and not getattr(routine, 'hold_logged', False):
+            routine.hold_logged = True
+            self.event('stairs_min_hold', state=routine.state, in_mode_s=_r(now - routine.t_switch_in, 1),
+                       min_hold_s=routine.cfg.min_hold_s, travelled_m=_r(travelled, 2))
         if routine.state != getattr(self, '_stair_state', None):
             self._stair_state = routine.state
             if routine.state in ('landing', 'descend'):
                 self.event('stairs_' + routine.state, travelled_m=_r(travelled, 2))
         if action.switch == 'in':
             self.event('stairs_switch_in', evidence=iface.switch_in(routine.direction))
+            if getattr(iface, 'manual_evidence', None):
+                self.event('stairs_manual_mode', evidence=iface.manual_evidence)
+            if isinstance(iface, AiModeStairs):
+                self._slam_pause(True, 'AI mode on')
         elif action.switch == 'out':
             self.event('stairs_switch_out', evidence=iface.switch_out())
+            self._slam_pause(False, 'AI mode off')
+        if action.switch and getattr(iface, 'options_evidence', None):
+            self.event('stairs_robot_stops', **iface.options_evidence)
+            iface.options_evidence = None
         if getattr(iface, 'active', False):
             self.runner.own_axis_until = now + OWN_AXIS_GRACE_S     # our axis commands echo on /handle_state
         iface.drive(min(action.vx, self.cfg.mode_speed(self.speed_mode)[0]))   # never above the mode
@@ -3225,11 +5619,23 @@ class RoamSession:
             self.stairs_until = now + STAIR_COOLDOWN_S
             self.goal = None
             self.choose_after = now + MAP_SETTLE_S
+            deferred = getattr(self, '_pending_stair', None)
+            if deferred and deferred.pop('traversing', False):
+                if action.aborted:
+                    self._hold_deferred_stairs(f'Deferred stair traversal aborted: {action.reason}')
+                    return
+                self._pending_stair = None
             if action.aborted:
-                self.event('stairs_aborted', reason=action.reason)
-                self._pause(f'stairs aborted: {action.reason}')
+                # Operator 2026-11-26: a failed crossing does not pause - out of the stair mode, keep exploring.
+                self.event('stairs_aborted', reason=action.reason, then='keep exploring')
             else:
                 self.event('stairs_done', direction=routine.direction, travelled_m=_r(travelled, 2))
+                pose = self._pose()
+                if getattr(self, 'stairs_kind', None) == 'step' and routine.direction == 'up' and pose is not None:
+                    self.on_block = {'t': now, 'x': pose[0], 'y': pose[1], 'heading': pose[2]}
+                    self.event('on_block', heading_deg=_r(math.degrees(pose[2]), 0))
+                elif routine.direction == 'down':
+                    self.on_block = None
 
     def _handle(self, command):
         cmd, arg = command.get('cmd'), command.get('arg')
@@ -3371,6 +5777,9 @@ class RoamSession:
         # Operator 2026-11-21 "engage frontier navigation as well": scan-walk falls back to Nav2 frontier
         # goals (planned path around corners) before turning in place to search.
         self.frontiers = Explorer(self.cfg, self.anchor) if self.cfg.strategy == 'scan_walk' else None
+        self.explorer.raw_maps = self._raw_maps
+        if self.frontiers is not None:
+            self.frontiers.raw_maps = self._raw_maps
         if self.frontiers is not None:
             # Judged as Nav2 does: no lethal/inscribed cost (>= 99) within the body half-width. With the
             # 0.40 m box at cost 70 every frontier in a ~1.5 m course sat in wall inflation (12:37 run).
@@ -3438,6 +5847,7 @@ class RoamSession:
         try:
             while self.state in ('ROAMING', 'PAUSED'):
                 now = r.now()
+                self._trace_motion(now)
                 elapsed = now - self.t_roam
                 while script and script[0][0] <= elapsed:
                     _, cmd, arg = script.pop(0)
@@ -3480,15 +5890,21 @@ class RoamSession:
                             raise SafetyAbort(why)
                         if self.stairs:
                             self._stairs_tick(now)
+                            if not self.stairs:
+                                self._stairs_finished(now)     # observer only (--arena-holds)
+                        elif self.posture_look is not None:
+                            self._posture_look_tick(now)
                         elif self.crossing:
                             self._crossing_tick(now)
                         elif self.nudge:
                             self._nudge_tick(now)
                         else:
                             self._manage_goal(now, pose)
-                        if now - getattr(self, '_limit_sent', -math.inf) >= 1.0:
-                            r.set_speed_limit(self.cfg.mode_speed(self.speed_mode)[0])
-                            self._limit_sent = now
+                        target = self._speed_target(now)
+                        if target != getattr(self, '_limit_value', None) or \
+                                now - getattr(self, '_limit_sent', -math.inf) >= 1.0:
+                            r.set_speed_limit(target)
+                            self._limit_sent, self._limit_value = now, target
                     else:
                         self.runner._check(feed=False)          # paused: dead-man stays locked
                         self._auto_resume_tick(now)
@@ -3505,7 +5921,11 @@ class RoamSession:
                     if now - last_line >= 1.0:
                         last_line = now
                         self._line(status)
-                r.wait(0.05)
+                    self._say_activity(now)
+                if self.stairs and isinstance(self.stairs[1], AiModeStairs) and self.stairs[1].active:
+                    r.wait(max(0.0, STAIR_AI_COMMAND_PERIOD_S - (r.now() - now)))
+                else:
+                    r.wait(0.05)
         except SafetyAbort as error:
             self.reason = str(error)
             self.state = 'SAFETY_STOP'
@@ -3518,6 +5938,7 @@ class RoamSession:
             self.event('safety_stop', reason=self.reason)
         # ---- stop: leave any stair mode first (AI state), then tell the watchdog
         self._leave_stairs(f'session ending: {self.reason}')
+        self._leave_posture(f'session ending: {self.reason}')
         # ---- stop: tell the watchdog first (it must not kill a runner that is stopping)
         try:
             self.channel.write_status(self.status(r.now(), self.last_pose))
@@ -3571,6 +5992,37 @@ class RoamSession:
             self.event('dry_would_stop', reason=why)
         self._dry_last = why
 
+    def _trace_motion(self, now):
+        """Sample IMU roll/pitch, odometry, the commands reaching the robot and what roam is doing (10 Hz, bounded)."""
+        if now - getattr(self, '_trace_t', -math.inf) < TRACE_PERIOD_S:
+            return
+        self._trace_t = now
+        try:
+            t = self.robot.telemetry
+            tilt = t.current_tilt()
+            odom = t.odom.latest()
+            cmd = t.system_cmd.latest() if hasattr(t, 'system_cmd') else None
+            clr = t.clearance.latest() if hasattr(t, 'clearance') else None
+            sample = self._terrain_now(now)
+            goal = self.goal.get('kind') if self.goal else ('stairs' if self.stairs else 'nudge' if self.nudge else '')
+            row = (_r(now - (self.t_roam or now), 2), self.state, goal,
+                   _r(tilt[0], 3) if tilt else '', _r(tilt[1], 3) if tilt else '',
+                   _r(odom[1].vx, 3) if odom else '', _r(odom[1].wz, 3) if odom else '',
+                   _r(cmd[1].vx, 3) if cmd else '', _r(cmd[1].wz, 3) if cmd else '',
+                   _r(clr[1], 3) if clr else '',
+                   _r(sample.obstacle_ahead_m, 3) if sample is not None and sample.obstacle_ahead_m is not None else '',
+                   _r(getattr(sample, 'step_ahead_m', None), 3) if sample is not None and
+                   getattr(sample, 'step_ahead_m', None) is not None else '',
+                   _r(getattr(sample, 'step_rise_m', None), 3) if sample is not None and
+                   getattr(sample, 'step_rise_m', None) is not None else '')
+        except Exception:  # noqa: BLE001 - the trace is informational only
+            return
+        trace = getattr(self, 'motion_trace', None)
+        if trace is None:
+            from collections import deque
+            trace = self.motion_trace = deque(maxlen=TRACE_MAX)
+        trace.append(row)
+
     def _finish(self, summary, outcome):
         if self.state in ('ROAMING', 'PAUSED', 'STOPPING', 'READY') and outcome == 'STOPPED':
             self.state = 'STOPPED'
@@ -3591,6 +6043,18 @@ class RoamSession:
             'events': self.events,
             'goals_vetoed_by_pointcloud': self.explorer.vetoed if self.explorer else 0,
         })
+        trace = list(getattr(self, 'motion_trace', None) or [])
+        if trace:
+            rolls = [abs(r[3]) for r in trace if r[3] != '']
+            pitches = [abs(r[4]) for r in trace if r[4] != '']
+            summary['motion'] = {'samples': len(trace), 'max_abs_roll_rad': max(rolls, default=None),
+                                 'max_abs_pitch_rad': max(pitches, default=None),
+                                 'last_5_s': [dict(zip(TRACE_FIELDS, r)) for r in trace[-50:]]}
+            if self.out_dir is not None:
+                try:
+                    summary['motion']['file'] = str(write_motion_trace(trace, self.out_dir))
+                except OSError as exc:
+                    summary['motion']['file_error'] = str(exc)
         try:
             status = self.status(self.robot.now(), self.last_pose)
             status['state'] = self.state
@@ -3598,6 +6062,34 @@ class RoamSession:
         except Exception:  # noqa: BLE001 - status is informational
             pass
         return outcome, summary
+
+
+def _fast_grid(template, data, ox, oy):
+    """A Grid like template over the numpy array data, origin (ox, oy) - without the per-cell validation loop
+    (values come from a valid SLAM grid; 700k cells took ~60 ms to re-check on every map update)."""
+    g = object.__new__(type(template))
+    for name, value in (('width', int(data.shape[1])), ('height', int(data.shape[0])),
+                        ('resolution', template.resolution), ('data', data.ravel().tolist()),
+                        ('origin_x', float(ox)), ('origin_y', float(oy)), ('origin_yaw', template.origin_yaw)):
+        object.__setattr__(g, name, value)
+    return g
+
+
+# ---------------------------------------------------------------------------------- motion trace (item 9)
+TRACE_PERIOD_S = 0.1                   # operator 2026-11-25: IMU tilt + commands in every run report, 10 Hz
+TRACE_MAX = 12000                      # 20 min at 10 Hz (bounded); motion_trace.csv next to report.json
+TRACE_FIELDS = ('t_s', 'state', 'goal', 'roll_rad', 'pitch_rad', 'odom_vx', 'odom_wz', 'cmd_vx', 'cmd_wz',
+                'clearance_m', 'obstacle_ahead_m', 'step_ahead_m', 'step_rise_m')
+
+
+def write_motion_trace(rows, directory):
+    import csv
+    path = Path(directory) / 'motion_trace.csv'
+    with path.open('w', newline='') as f:
+        w = csv.writer(f)
+        w.writerow(TRACE_FIELDS)
+        w.writerows(rows)
+    return path
 
 
 # ---------------------------------------------------------------------------------- reports
@@ -3699,6 +6191,17 @@ def parse(argv):
     run.add_argument('--no-stop-at-exit', action='store_true', help='keep exploring after reaching the exit')
     run.add_argument('--stair-mode', default='ai', choices=STAIR_MODES,
                      help='steps: ai = AI state + axis commands (default, operator 2026-11-21); hstep = RUG H-Step gait')
+    run.add_argument('--stairs-on-sight', action='store_true',
+                     help='start the stair approach on detection; keep centring and confirmation checks')
+    run.add_argument('--arena-holds', action='store_true',
+                     help='operator 2026-11-26 test mode (operator/arena_holds.sh): face the next grid cell before '
+                          'walking, hold when a step turn stops early or the walk leaves the lane, align to the grid '
+                          'after the stairs, check posture look-around headings. Stairs themselves unchanged')
+    run.add_argument('--stairs-pi-only', action='store_true',
+                     help='operator 2026-11-26: a Pi stairs YOLO detection alone starts the stair handover (face '
+                          'them, approach, AI mode, climb); no RGB-D, VLM or terrain confirmation')
+    run.add_argument('--defer-stairs', action='store_true',
+                     help='remember stairs until reachable exploration is finished, then return and reconfirm')
     run.add_argument('--auto-stairs', action='store_true',
                      help='cross terrain-detected steps automatically in the stair mode (off: AI mode only on '
                           'stairs, whose detection is not done yet; operator 2026-11-21)')
@@ -3745,9 +6248,12 @@ def parse(argv):
                      help='give up on a turn after this long without angular progress (s; was 12)')
     run.add_argument('--passage-wait', type=float, default=PASSAGE_ADVISORY_WAIT_S,
                      help='at a blocked passage, look this long for a way on before pausing (s; was 3)')
+    run.add_argument('--passage-probe', default='on', choices=('on', 'off'),
+                     help='at a blocked passage with no curtain confirmation after --passage-wait: walk into it '
+                          '(through = curtain; stall = wall, reverse out and explore on). off: pause as before')
     run.add_argument('--advisory', default='act', choices=ADVISORY_MODES,
                      help="stair/curtain advisory (~/stair_curtain): act on it, only log it, or ignore it")
-    run.add_argument('--ai-axis-forward', type=int, default=12000,
+    run.add_argument('--ai-axis-forward', type=int, default=AI_AXIS_FORWARD,
                      help='AI-state forward axis value (dead zone 6553; range not in the docs: test it)')
     run.add_argument('--heartbeat', action='store_true',
                      help='send the documented 2 Hz heartbeat 0x21040001 (Comm Interface s1.2.1); unverified')
@@ -3949,7 +6455,8 @@ def build_config(a, state):
                       grid_origin=a.grid_origin, grid_heading_deg=a.grid_heading_deg,
                       stuck_window_s=a.stuck_window, scene_max=a.scene_max, scene_interval_s=a.scene_interval,
                       scene_timeout_s=a.scene_timeout, auto_resume_s=a.auto_resume, reselect=not a.no_reselect,
-                      auto_mode=a.auto_mode == 'on', pi_advisory=a.pi_advisory == 'on')
+                      auto_mode=a.auto_mode == 'on', pi_advisory=a.pi_advisory == 'on',
+                      passage_probe=a.passage_probe == 'on')
 
 
 def parse_script(text):
@@ -4090,6 +6597,18 @@ def run_session(a, state, directory):
         cfg.centre_lane = getattr(a, 'centre_lane', False)
         if cfg.centre_lane and (cfg.decision != 'unified' or cfg.strategy != 'scan_walk'):
             raise ValueError('--centre-lane requires unified scan-walk')
+        cfg.stairs_on_sight = getattr(a, 'stairs_on_sight', False)
+        cfg.arena_holds = getattr(a, 'arena_holds', False)
+        if cfg.arena_holds and not cfg.centre_lane:
+            raise ValueError('--arena-holds builds on --centre-lane (grid steps); use both')
+        cfg.stairs_pi_only = getattr(a, 'stairs_pi_only', False)
+        if cfg.stairs_pi_only and (cfg.stairs_on_sight or getattr(a, 'defer_stairs', False)):
+            raise ValueError('--stairs-pi-only replaces --stairs-on-sight / --defer-stairs; use one')
+        if cfg.stairs_pi_only and (cfg.decision != 'unified' or cfg.strategy != 'scan_walk'):
+            raise ValueError('--stairs-pi-only requires unified scan-walk')
+        cfg.defer_stairs = getattr(a, 'defer_stairs', False) or cfg.stairs_on_sight
+        if cfg.defer_stairs and (cfg.decision != 'unified' or cfg.strategy != 'scan_walk'):
+            raise ValueError('--defer-stairs requires unified scan-walk')
         script = parse_script(a.sim_script)
     except (ConfigError, ValueError) as error:
         print(f'REFUSED: {error}')

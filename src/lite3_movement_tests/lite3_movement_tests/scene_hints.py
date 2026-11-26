@@ -101,10 +101,53 @@ def scene_request(request_id, reason, pose, map_session, stamp):
 
 
 # ---------------------------------------------------------------------------------- scene hold (Pi, nav_hold.py)
-# Operator 2026-11-24: while the Pi asks Claude about a scene (person, object, warning sign), roam stops at the next
-# safe point, squares up to the 1 x 1 m course grid and waits for the result (at most the hold's expiry, 6 s) -
-# except on stairs, curtains and rollers. Contract: ~/live_mission/PI_SCENE_EVENTS.md.
+# Operator 2026-11-24: when the Pi sees a scene trigger (person, object, warning sign), roam stops at the next
+# safe point, squares up to the 1 x 1 m course grid and waits - except on stairs, curtains and rollers. Operator
+# 2026-11-26: the Pi sends Claude only a frame taken while the dog stands still, and the hold ends as soon as that
+# frame is taken (at most the hold's expiry, 5 s). Contract: ~/live_mission/PI_SCENE_EVENTS.md.
 HOLD_TOPIC = '/group8/navigation/hold_request'
+# Operator 2026-11-25 (item 7): camera capture round trip. Roam stops in a pocket and publishes a request; the capture
+# service (scene_capture.py) snaps a picture, asks Claude about it, stores it for later upload and answers with an
+# ack carrying the same id. Roam then moves off. JSON strings (std_msgs/String) both ways.
+CAPTURE_REQUEST_TOPIC = '/group8/navigation/capture_request'
+CAPTURE_ACK_TOPIC = '/group8/navigation/capture_ack'
+
+
+def capture_request(request_id, cell, pose, session=None, reason='pocket', **extra):
+    """extra: room scans add scan_id, view_id ('left' / 'right' / 'extra-<side>'), final, qr_only."""
+    import json
+    return json.dumps({'id': request_id, 'reason': reason, 'cell': list(cell) if cell is not None else None,
+                       'pose': [round(v, 3) for v in pose[:3]] if pose else None, 'session': session, **extra})
+
+
+# Operator 2026-11-26: room scans. The Pi (camera owner) answers each view with a capture_ack and the whole scan
+# with a room_scan_result on this topic (room type, findings per view_id, locally decoded QR, additional_view).
+ROOM_SCAN_TOPIC = '/group8pi/perception/room_scans'
+
+
+def room_scan_result(text, scan_id):
+    """The room_scan_result / room_scan_failed dict for scan_id from one message, or None."""
+    import json
+    try:
+        msg = json.loads(text)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(msg, dict) or msg.get('scan_id') != scan_id or \
+            msg.get('event') not in ('room_scan_result', 'room_scan_failed'):
+        return None
+    return msg
+
+
+def capture_ack(text, request_id):
+    """The ack dict for request_id from one ack message, or None (other ids, bad JSON)."""
+    import json
+    try:
+        ack = json.loads(text)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(ack, dict) or ack.get('id') != request_id:
+        return None
+    return ack
 HOLD_MAX_AGE_S = 30.0          # a hold published longer ago than this is stale whatever its expiry says
 
 

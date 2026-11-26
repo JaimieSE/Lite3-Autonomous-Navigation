@@ -70,7 +70,11 @@ def test_unfinished_means_unseen_floor_or_an_open_way_into_unmapped_space():
         for x in (0.0, 1.0):
             cov2.update((x, 0.0, yaw), walled)
     g.update(walled, cov2)
-    assert not g.unfinished((1, 0))                  # walled in and looked at: finished
+    # A walled dead end never walked into is a room (2026-11-26): read from the cell in front, never a come-back
+    # target, so the dog is not sent into it (was: "looked at but never walked: still to explore", 2026-11-24).
+    assert g.is_room((1, 0)) and not g.unfinished((1, 0))
+    g.update(walled, cov2, breadcrumbs=[(1.0, 0.0)])
+    assert not g.unfinished((1, 0))                  # walked through: explored
 
 
 def test_connection_states_and_failure_memory():
@@ -117,7 +121,10 @@ def test_a_visited_cell_is_explored_never_a_place_to_come_back_to():
     slam = grid_of(free=[(-0.5, 2.5, -0.5, 0.5)])
     g = CourseGrid(0.0, 0.0, 0.0)
     g.update(slam, CameraCoverage((0.0, 0.0), 4.0), breadcrumbs=[(1.0, 0.0)])
-    assert not g.unfinished((1, 0)) and g.unfinished((2, 0))       # walked through (1, 0); (2, 0) not yet
+    assert g.unfinished((1, 0))                                    # walked, but the camera has not covered it
+    g.note_inspection((1, 0))
+    g.note_inspection((1, 0))
+    assert not g.unfinished((1, 0)) and g.unfinished((2, 0))       # two inspection visits: done; (2, 0) not yet
     g.note_failure(0.0, (0.0, 0.0), (1.0, 0.0), 'terrain')
     for t in (1.0, 100.0, 1000.0):
         g.note_failure(t, (0.0, 0.0), (1.0, 0.0), 'terrain')
@@ -131,3 +138,127 @@ def test_cells_outside_the_course_walls_are_never_come_back_targets():
     g = CourseGrid(0.0, 0.0, 0.0)
     g.update(slam, CameraCoverage((0.0, 0.0), 4.0), reach=reach)
     assert g.unfinished((1, 0)) and not g.cells[(3, 0)]['reachable'] and not g.unfinished((3, 0))
+
+
+def test_explored_means_walked_through_not_just_seen():
+    """Operator 2026-11-24 (grid runs): everything the camera saw counted as explored and the dog stopped 1.4 m out."""
+    slam = grid_of(free=[(-0.5, 3.5, -0.5, 0.5)])
+    cov = CameraCoverage((0.0, 0.0), 5.0)
+    for yaw in (0.0, 3.14159):
+        cov.update((0.0, 0.0, yaw), slam)
+    g = CourseGrid(0.0, 0.0, 0.0)
+    g.update(slam, cov, breadcrumbs=[(0.0, 0.0)])
+    assert g.cells[(2, 0)]['seen'] > 0.7 and g.unfinished((2, 0))
+    assert 0.5 <= g.pull(2.0, 0.0) < 1.0                  # seen but not walked: still half the pull
+    assert g.inspected((0, 0)) == (g.cells[(0, 0)]['seen'] >= 0.5)   # walked: inspected once the camera covered it
+
+
+# ---------------------------------------------------------------------------------- operator 2026-11-25
+def _room_map(open_side=True):
+    """Floor x -0.5..2.5, y -0.5..0.5; cell (2, 0) walled on three sides (top, bottom, far end), open to (1, 0)."""
+    walls = [(-0.6, 2.6, 0.5, 0.6), (-0.6, 2.6, -0.6, -0.5), (2.5, 2.6, -0.6, 0.6)]
+    if not open_side:
+        walls.append((1.47, 1.53, -0.6, 0.6))
+    return grid_of(free=[(-0.5, 2.5, -0.5, 0.5)], occupied=walls)
+
+
+def test_three_walls_round_a_cell_make_a_room_read_from_its_open_side():
+    g = CourseGrid(0.0, 0.0, 0.0)
+    g.update(_room_map())
+    assert g.cells[(2, 0)]['walls'] == 3 and g.is_room((2, 0)) and (2, 0) in g.rooms_unread()
+    x, y, yaw = g.room_viewpoint((2, 0))
+    assert math.dist((x, y), g.centre(1, 0)) < 0.2 and abs(yaw) < 0.3      # middle of (1, 0), facing the room
+    g.mark_room_read((2, 0), 'kitchen')
+    assert (2, 0) not in g.rooms_unread() and g.summary()['rooms_read'] == {'2,0': 'kitchen'}
+    texts = [m['text'] for m in g.markers() if m['ns'] == 'grid_rooms']
+    assert 'ROOM read' in texts
+
+
+def test_a_passage_that_opens_is_reported_once():
+    g = CourseGrid(0.0, 0.0, 0.0)
+    g.update(_room_map(open_side=False))
+    assert g.edges[frozenset(((1, 0), (2, 0)))] == 'blocked'
+    g.update(_room_map(open_side=True))
+    assert frozenset(((1, 0), (2, 0))) in g.reopened
+    g.update(_room_map(open_side=True))
+    assert g.reopened == []
+
+
+def test_goal_points_are_the_middle_of_the_cell_when_it_is_free():
+    g = CourseGrid(0.0, 0.0, 0.0)
+    g.update(grid_of(free=[(-0.5, 3.5, -1.5, 1.5)]))
+    p = g.return_point((1, 0))
+    assert math.dist(p, (1.0, 0.0)) <= 0.15 and math.dist(g.centre_point((1, 0)), (1.0, 0.0)) <= 0.15
+    blocked = grid_of(free=[(-0.5, 3.5, -1.5, 1.5)], occupied=[(0.9, 1.1, -0.1, 0.1)])
+    g.update(blocked)
+    assert g.centre_point((1, 0)) is None and math.dist(g.return_point((1, 0)), (1.0, 0.0)) > 0.15
+
+
+def test_pending_mission_evidence_keeps_a_walked_cell_uninspected():
+    g = CourseGrid(0.0, 0.0, 0.0)
+    g.update(grid_of(free=[(-0.5, 2.5, -0.5, 0.5)]), breadcrumbs=[(1.0, 0.0)])
+    g.note_inspection((1, 0))
+    g.note_inspection((1, 0))
+    g.mark_pending((1, 0), 'survivor: QR not read yet')
+    assert g.unfinished((1, 0))
+    g.resolve((1, 0))
+    assert not g.unfinished((1, 0))
+    g.block_cell((2, 0), 0.0, 20.0)
+    assert not g.unfinished((2, 0), 5.0) and g.unfinished((2, 0), 25.0)
+
+
+def test_a_prop_beside_a_cell_is_not_a_wall_and_a_visited_cell_is_never_a_room():
+    """Operator 2026-11-25 (Arena B 18:04 SGT): the start cell between the kitchen set and another prop was read as a
+    room. A wall runs along >= 80 % of a side; a visited cell (the start cell included) is never a room."""
+    walls = [(-0.6, 2.6, 0.5, 0.6), (-0.6, 2.6, -0.6, -0.5)]               # long walls above and below
+    prop = grid_of(free=[(-0.5, 2.5, -0.5, 0.5)], occupied=walls + [(2.5, 2.6, -0.2, 0.2)])   # 0.4 m prop at the end
+    g = CourseGrid(0.0, 0.0, 0.0)
+    g.update(prop)
+    assert g.side_cover((2, 0), (3, 0)) < 0.8 and g.cells[(2, 0)]['walls'] == 2       # the prop is not a wall
+    g.update(_room_map())
+    assert g.side_cover((2, 0), (3, 0)) >= 0.8 and g.cells[(2, 0)]['walls'] == 3 and g.is_room((2, 0))
+    g.update(_room_map(), breadcrumbs=[(2.0, 0.0)])
+    assert not g.is_room((2, 0))
+
+
+def test_two_walls_make_a_room_operator_2026_11_26():
+    """Operator 2026-11-26: a cell walled on 2 sides is a room (was 3). A corner counts; a cell with one wall does
+    not. Operator 2026-11-26 (later): a corridor cell between two parallel walls is a PATH, not a room."""
+    from lite3_movement_tests.course_grid import ROOM_WALLS
+    assert ROOM_WALLS == 2
+    corner = grid_of(free=[(-0.5, 2.5, -1.5, 0.5)], occupied=[(-0.6, 2.6, 0.5, 0.6), (2.5, 2.6, -1.6, 0.6)])
+    g = CourseGrid(0.0, 0.0, 0.0)
+    g.update(corner)
+    assert g.cells[(2, 0)]['walls'] == 2 and g.is_room((2, 0))              # top + far end: a corner
+    assert g.cells[(1, -1)]['walls'] == 0 and not g.is_room((1, -1))
+    assert g.cells[(1, 0)]['walls'] == 1 and not g.is_room((1, 0))          # one wall only
+    g.update(_room_map())
+    assert g.cells[(1, 0)]['walls'] == 2 and g.is_path((1, 0)) and not g.is_room((1, 0))   # corridor = path
+
+
+def test_rviz_colours_unexplored_room_scanned_path_and_features():
+    """Operator 2026-11-26: yellow unexplored, blue room seen and scanned, green path (not a room), grey stairs/curtain.
+    A corridor (walls on two opposite sides) is a path, never a room."""
+    g = CourseGrid(0.0, 0.0, 0.0)
+    g.update(_room_map(), breadcrumbs=[(0.0, 0.0)])            # (2, 0) dead end; (1, 0) corridor; walked (0, 0)
+    assert g.is_path((1, 0)) and not g.is_room((1, 0)) and g.is_room((2, 0))
+    g.mark_room_read((2, 0), 'kitchen')
+    g.mark_feature((1, 0), 'curtain')
+    kinds = {m['ns'] + str(m['id']): m for m in g.markers() if m['ns'] == 'grid' and m['type'] == 'cube_list'}
+    colour = {round(m['color'][2], 2): len(m['points']) for m in kinds.values()}
+    by_rgb = {tuple(round(x, 2) for x in m['color'][:3]): m['points'] for m in kinds.values()}
+    assert (0.15, 0.45, 1.0) in by_rgb and (2.0, 0.0, 0.0) in by_rgb[(0.15, 0.45, 1.0)]       # blue: room scanned
+    assert (0.55, 0.55, 0.55) in by_rgb and (1.0, 0.0, 0.0) in by_rgb[(0.55, 0.55, 0.55)]     # grey: curtain
+    assert colour
+
+
+def test_a_corridor_with_something_in_front_of_an_open_end_is_a_room():
+    """Operator 2026-11-26: walls on two opposite sides and a wall / obstacle in front of an open end = a room."""
+    g = CourseGrid(0.0, 0.0, 0.0)
+    g.update(_room_map())
+    assert g.is_path((1, 0)) and not g.is_room((1, 0))                   # both ends open: a path
+    blocked = grid_of(free=[(-0.5, 2.5, -0.5, 0.5)],
+                      occupied=[(-0.6, 2.6, 0.5, 0.6), (-0.6, 2.6, -0.6, -0.5), (2.5, 2.6, -0.6, 0.6),
+                                (1.47, 1.53, -0.25, 0.25)])               # an obstacle across part of the far end
+    g.update(blocked)
+    assert not g.is_path((1, 0)) and g.is_room((1, 0))

@@ -1,0 +1,56 @@
+{
+  "status": "REVIEW ONLY - NOT A LAUNCH FILE",
+  "activation_ready": false,
+  "automatic_start": false,
+  "ssh_environment": {
+    "address_reported_by_user": "192.168.10.78",
+    "observed_environment": "Ubuntu 22.04 x86_64 LXC, ROS 2 Humble",
+    "ros_domain_observed": 8,
+    "assignment_confirmed_by_user": true
+  },
+  "vendor": {
+    "repository": "https://github.com/DeepRoboticsLab/Lite3_ROS",
+    "commit": "e4ab5dc1c7f3ff46274162a1ef302253936578aa",
+    "component_to_review": "jetson2motion",
+    "motion_host_candidate": "192.168.1.120",
+    "motion_host_candidate_source": "UPSTREAM DEFAULT ONLY - NOT VERIFIED",
+    "udp_target_port_candidate": 43893,
+    "udp_receive_port_candidate": 43897,
+    "port_ownership_verified": false,
+    "deploy_full_vendor_launch": false,
+    "motion_host_reachable": true,
+    "motion_host_connectivity_evidence": "Two ICMP replies from 192.168.1.120; SSH banner received; no login or control commands",
+    "command_free_bridge_startup": "Succeeded in /lite3_robot_link; observed cmd_vel publisher count 0, subscriber count 1; bounded process terminated",
+    "receive_only_telemetry_check": "No packets received at 192.168.1.78:43897 in 4 seconds",
+    "candidate_shutdown_fix": "Separate review derivative; pinned upstream copy unchanged"
+  },
+  "movement_plan": {
+    "kind": "forward_only_one_shot",
+    "speed_metres_per_second": 0.03,
+    "duration_seconds": 0.5,
+    "update_rate_hz": 20,
+    "software_update_timeout_seconds": 0.2,
+    "physical_limits_verified": false,
+    "live_transport_implemented": false
+  },
+  "handback": {
+    "sequence": [
+      "LATCH_AUTONOMY_OFF",
+      "ZERO_VELOCITY",
+      "REQUEST_MANUAL_MODE",
+      "CONFIRM_MANUAL_MODE"
+    ],
+    "manual_mode_code_from_lab": "0x21010C02",
+    "manual_mode_type_from_lab": 0,
+    "acknowledgment_source": null,
+    "independent_stop_procedure_verified": false
+  },
+  "unresolved_before_activation": [
+    "Verify the deployed host/environment and firmware match",
+    "Verify target motion-host address and UDP port ownership without starting a second bridge",
+    "Account for every source of velocity and mode commands",
+    "Provide an independent stop/watchdog and operator kill trigger",
+    "Implement and review the live adapter separately from the immutable test harness",
+    "Establish Manual-mode confirmation and the supervised physical test procedure"
+  ]
+}

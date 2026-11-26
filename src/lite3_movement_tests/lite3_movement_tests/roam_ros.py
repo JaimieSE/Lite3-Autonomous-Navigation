@@ -2,6 +2,7 @@
 raw LiDAR point clouds. Subscriptions only; nothing here publishes beyond NavRobot itself."""
 
 import os
+import json
 import math
 import threading
 import time
@@ -95,10 +96,24 @@ class RoamRobot(NavRobot):
         from .scene_hints import PI_DETECTIONS_TOPIC, PI_SCENES_TOPIC, SCENE_REQUEST_TOPIC
         self.pi_scene_messages = deque(maxlen=30)
         from .scene_hints import pi_stair_curtain
+        self.pi_stair_objects = None
         self.pi_advisory = None                  # (arrival monotonic, arrival wall s, advisory JSON) from the Pi
+        # Every Pi detections frame: (arrival monotonic, arrival wall s, capture_stamp_ns). The posture look holds
+        # each view until YOLO has processed frames captured there (operator 2026-11-26).
+        self.pi_frames = deque(maxlen=60)
 
         def pi_detections(m):
-            self.pi_scene_messages.append((time.monotonic(), m.data))
+            received = time.monotonic()
+            self.pi_scene_messages.append((received, m.data))
+            try:
+                stamp = json.loads(m.data).get('capture_stamp_ns')
+            except (ValueError, AttributeError):
+                stamp = None
+            if type(stamp) is int and stamp > 0:
+                self.pi_frames.append((received, time.time(), stamp))
+            # Candidate arrays are published only on obstacle-model frames.
+            if '"stair_candidates"' in m.data:
+                self.pi_stair_objects = (received, time.time(), m.data)
             reading = pi_stair_curtain(m.data)   # Orbbec on the Pi: its stair/curtain detector drives the stairs
             if reading is not None:
                 self.pi_advisory = (time.monotonic(), time.time(), reading)
@@ -107,6 +122,19 @@ class RoamRobot(NavRobot):
             (time.monotonic(), m.data)), qos_profile_sensor_data)
         scene_pub = node.create_publisher(String, SCENE_REQUEST_TOPIC, 10)
         self.publish_scene_request = lambda text: scene_pub.publish(String(data=text))
+        # Camera capture round trip (scene_capture.py): request out, ack in (operator 2026-11-25, item 7)
+        from .scene_hints import CAPTURE_ACK_TOPIC, CAPTURE_REQUEST_TOPIC
+        reliable = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
+        capture_pub = node.create_publisher(String, CAPTURE_REQUEST_TOPIC, reliable)
+        self.publish_capture_request = lambda text: capture_pub.publish(String(data=text))
+        self.capture_acks = deque(maxlen=20)
+        node.create_subscription(String, CAPTURE_ACK_TOPIC, lambda m: self.capture_acks.append(
+            (time.monotonic(), m.data)), reliable)
+        # Room scan results from the Pi (operator 2026-11-26): room type + findings, may ask for one more view
+        from .scene_hints import ROOM_SCAN_TOPIC
+        self.room_scan_msgs = deque(maxlen=20)
+        node.create_subscription(String, ROOM_SCAN_TOPIC, lambda m: self.room_scan_msgs.append(
+            (time.monotonic(), m.data)), reliable)
         # Scene hold from ~/live_mission/nav_hold.py (Pi scene understanding): RELIABLE + TRANSIENT_LOCAL, latest only
         from .scene_hints import HOLD_TOPIC
         self.scene_hold_msg = None

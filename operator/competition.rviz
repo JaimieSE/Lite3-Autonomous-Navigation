@@ -67,6 +67,13 @@ Visualization Manager:
         Value: /live_mission/candidate_markers
         Durability Policy: Volatile
         Reliability Policy: Reliable
+    - Class: rviz_default_plugins/MarkerArray
+      Name: Stairs (Pi YOLO + RGB-D)
+      Enabled: true
+      Topic:
+        Value: /group8pi/stair_markers
+        Durability Policy: Transient Local
+        Reliability Policy: Reliable
   Tools:
     - Class: rviz_default_plugins/MoveCamera
     - Class: rviz_default_plugins/Interact

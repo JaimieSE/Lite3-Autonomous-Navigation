@@ -149,7 +149,7 @@ def test_repeated_goal_failures_pause_instead_of_pushing_on(tmp_path):
 # ---- configuration --------------------------------------------------------------------
 @pytest.mark.parametrize('kwargs', [dict(speed_limit=0.12, stack_max_speed=0.10), dict(geofence_m=12), dict(max_minutes=500),
                                     dict(abort_clearance_m=0.01), dict(max_sensor_age_s=0.8),
-                                    dict(min_lidar_hz=5), dict(modes={'slow': (0.6, 0.1)}),
+                                    dict(min_lidar_hz=0.5), dict(modes={'slow': (0.6, 0.1)}),
                                     dict(modes={'warp': 0.05}), dict(speed_limit=0.04),
                                     dict(stack_max_speed=0.05, speed_limit=0.08)])
 def test_config_outside_envelope_is_refused(kwargs):
@@ -186,14 +186,40 @@ def watched(**faults):
     return t
 
 
+def test_watchdog_allows_a_slow_short_reverse():
+    """Dead-end probe back-off (operator 2026-11-26): slow and short reverse is not a watchdog trip."""
+    logic = R.WatchdogLogic(0.10, 3.0)
+    logic.origin = (0.0, 0.0)
+    t = watched(vx=-0.12, x=-0.5)                                 # lenient: a bit over the 0.10 limit
+    assert logic.evaluate(t, 100.95) == [] and logic.evaluate(t, 100.95 + 0.31) == []
+
+
+def test_watchdog_trips_on_a_reverse_longer_than_the_back_off():
+    logic = R.WatchdogLogic(0.10, 3.0)
+    logic.origin = (0.0, 0.0)
+    t, reasons = Telemetry(), []
+    for i in range(500):                                          # 0.10 m/s backwards for 25 s = 2.5 m
+        ts = 100 + i * 0.05
+        t.on_joint(ts, ('a',), (0.0,))
+        t.on_odom(ts, -0.005 * i, 0, 0.3, 0, 0, 0, 1, 0, 0, 0)
+        t.on_imu(ts, 0, 0, 0, 1, (0, 0, 0), (0, 0, 9.8))
+        t.raw_cloud.add(ts, 360000)
+        t.on_system_cmd(ts, -0.05, 0.0, 0.0)
+        reasons += logic.evaluate(t, ts)
+    assert any('reversed' in r for r in reasons) and not any('beyond limits' in r for r in reasons)
+
+
 @pytest.mark.parametrize('faults, text', [
-    (dict(vx=0.15), 'beyond limits'), (dict(vx=-0.05), 'beyond limits'), (dict(bytes=900), 'nearly empty'),
-    (dict(x=4.0), 'geofence'), (dict(quat=(0.3, 0, 0, 0.954)), 'tilt'),
+    (dict(vx=0.15), 'beyond limits'), (dict(vx=-0.20), 'beyond limits'), (dict(bytes=900), 'nearly empty'),
+    (dict(x=4.0), 'geofence'), (dict(quat=(0.37, 0, 0, 0.929)), 'tilt'),
 ])
 def test_watchdog_trips(faults, text):
     logic = R.WatchdogLogic(0.10, 3.0)
     logic.origin = (0.0, 0.0)
     t = watched(**faults)
+    if 'bytes' in faults:                         # 2026-11-26: "nearly empty" needs 3 s of near-empty clouds
+        for k in range(20):
+            t.raw_cloud.add(98.0 + k * 0.1, faults['bytes'])
     reasons = logic.evaluate(t, 100.95)
     reasons = logic.evaluate(t, 100.95 + 0.31) if not reasons else reasons
     assert any(text in r for r in reasons), reasons
@@ -215,7 +241,8 @@ def test_watchdog_tolerates_observed_link_gaps_but_not_longer_ones():
     assert not any('stale' in r for r in logic.evaluate(t, 100.95 + 0.85))
     late = logic.evaluate(t, 100.95 + 1.3)
     assert any('joints telemetry stale' in r for r in late), late
-    assert any('raw LiDAR' in r and 'stale' in r for r in late), late
+    assert not any('raw LiDAR' in r for r in late), late        # 2026-11-26 (curtains): LiDAR may drop out 3 s
+    assert any('raw LiDAR' in r and 'stale' in r for r in logic.evaluate(t, 100.95 + 3.4))
 
 
 def test_actual_speed_limit_is_tied_to_the_selected_mode(tmp_path):
@@ -520,8 +547,8 @@ def test_roaming_uses_its_own_freshness_limits_and_keeps_the_rest():
     assert seq['telemetry'] == {'max_age_s': R.ROAM_TELEMETRY_AGE_S} and R.ROAM_TELEMETRY_AGE_S == 1.0
     nav = next(s for s in seq['steps'] if s['id'] == 'nav_readiness')
     assert nav['max_odom_lag_s'] == R.ROAM_MAX_ODOM_LAG_S == 1.0
-    assert R.HARD_MIN_LIDAR_HZ == 6.0 and R.WatchdogLogic.TELEMETRY_AGE_S == 1.0   # was 8.0 (12:37 run)
-    assert R.ROAM_RAW_LIDAR_STALE_S == 1.0 and R.ROAM_LIDAR_RATE_WINDOW_S == 5.0
+    assert R.HARD_MIN_LIDAR_HZ == 1.0 and R.WatchdogLogic.TELEMETRY_AGE_S == 1.0   # 1 Hz since 2026-11-26 (curtains)
+    assert R.ROAM_RAW_LIDAR_STALE_S == 3.0 and R.ROAM_LIDAR_RATE_WINDOW_S == 5.0
 
 
 def test_observed_floor_opens_directions_the_slam_map_left_unknown():
@@ -633,7 +660,8 @@ def test_documented_ai_switches_are_off_by_default_and_encoded_as_documented():
     import socket, struct
     from lite3_movement_tests import ros_io
     assert ros_io.AI_OPTIONS_CODE == 0x21012109
-    assert ros_io.AI_OPTIONS == {'all_off': 0x00, 'auto_stop': 0x20, 'obstacle_avoidance': 0x40}
+    assert ros_io.AI_OPTIONS == {'all_off': 0x00, 'auto_stop': 0x20, 'obstacle_avoidance': 0x40,
+                                  'avoidance_off': 0x00}   # 0x00 to the perception host (stairs, 26 Nov)
     assert R.RoamConfig().ai_options == ()
     with pytest.raises(ConfigError):
         R.RoamConfig(ai_options=('tracking_please',))
@@ -698,8 +726,9 @@ def test_stairs_command_runs_the_routine_from_pause_and_resumes_roaming(tmp_path
     from lite3_movement_tests import stairs as ST
     original = ST.StairRoutine.step
 
-    def on_stairs(self, t, pitch, roll, travelled):         # 0.45 m incline starting 5 cm ahead
-        return original(self, t, 0.17 if 0.05 <= travelled < 0.5 else 0.0, roll, travelled)
+    def on_stairs(self, t, pitch, roll, travelled, obstacle_m=None):   # 0.45 m incline starting 5 cm ahead
+        return original(self, t, 0.17 if 0.05 <= travelled < 0.5 else 0.0, roll, travelled,
+                        0.05 if travelled >= 0.6 else 1.0)          # AI mode: ultrasound sees a wall at the top
     monkeypatch.setattr(ST.StairRoutine, 'step', on_stairs)
     script = [(5, 'pause', None), (6, 'stairs', 'up')]
     _, summary, robot, _ = roam(tmp_path, script=script, stop_after=80,
@@ -743,15 +772,16 @@ def test_detected_step_is_crossed_automatically_in_ai_mode(tmp_path, monkeypatch
     monkeypatch.setattr(Telemetry, 'on_terrain', on_terrain)
     original_step = ST.StairRoutine.step
 
-    def on_ledge(self, t, pitch, roll, travelled):                  # body tilts while the feet climb
-        return original_step(self, t, 0.2 if 0.02 <= travelled < 0.2 else 0.0, roll, travelled)
+    def on_ledge(self, t, pitch, roll, travelled, obstacle_m=None):  # body tilts while the feet climb
+        return original_step(self, t, 0.2 if 0.02 <= travelled < 0.2 else 0.0, roll, travelled,
+                             0.05 if travelled >= 0.3 else 1.0)    # AI mode: ultrasound sees a wall past the ledge
     monkeypatch.setattr(ST.StairRoutine, 'step', on_ledge)
     _, summary, robot, _ = roam(tmp_path, stop_after=60, cfg=R.RoamConfig(strategy='scan_walk', auto_stairs=True))
     names = [e['event'] for e in summary['events']]
     assert 'safety_stop' not in names and 'paused' not in names
     assert names.index('stairs_detected') < names.index('stairs_start') < names.index('stairs_done')
     simple = [s[2] for s in robot.sent if s[1] == 'simple']
-    assert simple[:2] == [IO.AI_ENTER, IO.AI_GAIT_BASIC] and simple[2:4] == [IO.AI_EXIT, IO.NAVIGATION_MODE]
+    assert simple[:3] == [IO.MANUAL_MODE, IO.AI_ENTER, IO.AI_GAIT_BASIC] and simple[3:5] == [IO.AI_EXIT, IO.NAVIGATION_MODE]
     axis = [s for s in robot.sent if s[1] == 'axis']
     assert axis and all(s[2] == IO.AXIS_FORWARD for s in axis) and max(s[3] for s in axis) > IO.AXIS_FORWARD_DEAD_ZONE
     assert axis[-1][3] == 0                                          # stopped before leaving AI state
@@ -811,7 +841,8 @@ def test_consecutive_lips_keep_ai_mode_on_until_the_ground_is_flat(tmp_path, mon
     _, summary, robot, _ = roam(tmp_path, stop_after=70, cfg=R.RoamConfig(strategy='scan_walk', auto_stairs=True,
                                                                          step_crossing=False))   # AI path only
     names = [e['event'] for e in summary['events']]
-    assert 'stairs_continue' in names and 'safety_stop' not in names
+    # AI mode now ends on the front ultrasound (operator 2026-11-26), not on more lips ahead: one walk to the wall
+    assert 'stairs_obstacle_stop' in names and 'stairs_continue' not in names and 'safety_stop' not in names
     simple = [s[2] for s in robot.sent if s[1] == 'simple']
     assert simple.count(IO.AI_ENTER) == 1 and simple.count(IO.AI_EXIT) == 1      # one AI session for the run
     assert names.index('stairs_continue') < names.index('stairs_done')
@@ -864,6 +895,7 @@ def test_walk_cut_short_by_the_standoff_is_remembered():
     s._terrain_now = lambda now: None
     s._pause = lambda why: None
     s._walk_failed = lambda now, why, goal=None: R.RoamSession._walk_failed(s, now, why, goal)
+    s._speckle_probe = lambda now, goal, why: False
     R.RoamSession._end_walk(s, 10.0, (0.22, 0.0, 0.0), 'obstacle ahead (walking standoff)')
     assert s.events == ['walk_failed'] and s.goal is None
     assert sw.avoided(0.77, -0.12, 11.0)            # the next straight-on goal there is skipped
@@ -905,10 +937,10 @@ def test_dead_end_with_a_passage_stops_in_front_of_it(tmp_path, monkeypatch):
     monkeypatch.setattr(R.RoamSession, '_frontier_goal', lambda *a, **kw: None)
     monkeypatch.setattr(R, 'blocked_passage', lambda grid, pose, **kw: {
         'yaw': pose[2] + math.pi / 2, 'wall_m': 0.40, 'unknown': 0.9, 'width_deg': 25})
-    outcome, summary, _, _ = roam(tmp_path, cfg=R.RoamConfig(strategy='scan_walk', passage_wait_s=0.0),
-                                  stop_after=100)
+    outcome, summary, _, _ = roam(tmp_path, cfg=R.RoamConfig(strategy='scan_walk', passage_wait_s=0.0,
+                                                           passage_probe=False), stop_after=100)
     names = [e['event'] for e in summary['events']]
-    assert 'blocked_passage' in names and 'backtrack' not in names
+    assert 'blocked_passage' in names and 'backtrack' not in names and 'passage_probe' not in names
     paused = [e for e in summary['events'] if e['event'] == 'paused']
     assert paused and 'blocked passage' in paused[0]['reason']
     assert summary['stats']['passage_stops'] == 1
@@ -1044,24 +1076,24 @@ def test_advisory_stairs_go_up_over_the_landing_and_down_then_roam_on(tmp_path, 
     _advise(monkeypatch, 3.0, distance_m=0.7)
     original_step = ST.StairRoutine.step
 
-    def staircase(self, t, pitch, roll, travelled):
+    def staircase(self, t, pitch, roll, travelled, obstacle_m=None):
         p = 0.0
         if 0.1 <= travelled < 0.5:
             p = -0.17                                   # up
         elif 0.75 <= travelled < 1.15:
             p = 0.17                                    # down
-        return original_step(self, t, p, roll, travelled)
+        return original_step(self, t, p, roll, travelled, 0.05 if travelled >= 1.3 else 1.0)   # AI: wall past
     monkeypatch.setattr(ST.StairRoutine, 'step', staircase)
     _, summary, robot, _ = roam(tmp_path, cfg=R.RoamConfig(strategy='scan_walk'), stop_after=90)
     names = [e['event'] for e in summary['events']]
     assert next(e for e in summary['events'] if e['event'] == 'stairs_start')['over'] is True
-    assert names.index('stairs_start') < names.index('stairs_landing') < names.index('stairs_descend') \
-        < names.index('stairs_done')
+    # AI mode walks over the top and down until the front ultrasound reads 10 cm (operator 2026-11-26)
+    assert names.index('stairs_start') < names.index('stairs_obstacle_stop') < names.index('stairs_done')
     first = names[:names.index('stairs_done') + 1]          # (the fake keeps reporting stairs: later re-climbs)
     assert first.count('stairs_switch_in') == 1 and first.count('stairs_switch_out') == 1   # AI held over the top
     assert 'paused' not in first
     simple = [s[2] for s in robot.sent if s[1] == 'simple']
-    assert simple[:4] == [IO.AI_ENTER, IO.AI_GAIT_BASIC, IO.AI_EXIT, IO.NAVIGATION_MODE]
+    assert simple[:5] == [IO.MANUAL_MODE, IO.AI_ENTER, IO.AI_GAIT_BASIC, IO.AI_EXIT, IO.NAVIGATION_MODE]
 
 
 def test_mission_events_are_logged_once_and_do_not_change_movement(tmp_path, monkeypatch):
@@ -1228,7 +1260,7 @@ def test_hazard_staleness_matches_terrain_limit_in_docs_mode():
         pass
     s = Stub()
     s.cfg = R.RoamConfig(strategy='scan_walk', docs_stops=True)
-    assert R.RoamSession._hazard_max_age(s) == R.HAZARD_STALE_DOCS_S == R.ROAM_RAW_LIDAR_STALE_S == 1.0
+    assert R.RoamSession._hazard_max_age(s) == R.HAZARD_STALE_DOCS_S == R.ROAM_RAW_LIDAR_STALE_S == 3.0   # 2026-11-26
     s.cfg = R.RoamConfig(strategy='scan_walk')
     assert R.RoamSession._hazard_max_age(s) == R.HAZARD_STALE_S == 0.5
 
@@ -1264,8 +1296,8 @@ def test_terrain_step_is_crossed_in_the_high_step_gait_never_ai(tmp_path, monkey
     from lite3_movement_tests import ros_io as IO, stairs as ST
     _terrain_step(monkeypatch, 0.20)
     original_step = ST.StairRoutine.step
-    monkeypatch.setattr(ST.StairRoutine, 'step', lambda self, t, p, r, d: original_step(
-        self, t, 0.2 if 0.05 <= d < 0.3 else 0.0, r, d))                  # body tilts while stepping up
+    monkeypatch.setattr(ST.StairRoutine, 'step', lambda self, t, p, r, d, o=None: original_step(
+        self, t, 0.2 if 0.05 <= d < 0.3 else 0.0, r, d, o))               # body tilts while stepping up
     _, summary, robot, _ = roam(tmp_path, stop_after=60, cfg=R.RoamConfig(strategy='scan_walk'))
     ev = summary['events']
     start = next(e for e in ev if e['event'] == 'stairs_start')
@@ -1278,10 +1310,10 @@ def test_terrain_step_is_crossed_in_the_high_step_gait_never_ai(tmp_path, monkey
 
 def test_step_crossing_ends_when_a_wall_is_ahead(tmp_path, monkeypatch):
     from lite3_movement_tests import stairs as ST
-    _terrain_step(monkeypatch, 0.20, obstacle_after=2.0)
+    _terrain_step(monkeypatch, 0.20, seconds=40.0, obstacle_after=17.0)   # crossing starts once walking at it
     original_step = ST.StairRoutine.step
-    monkeypatch.setattr(ST.StairRoutine, 'step', lambda self, t, p, r, d: original_step(
-        self, t, 0.2 if 0.05 <= d < 0.2 else 0.0, r, d))
+    monkeypatch.setattr(ST.StairRoutine, 'step', lambda self, t, p, r, d, o=None: original_step(
+        self, t, 0.2 if 0.05 <= d < 0.2 else 0.0, r, d, o))
     _, summary, _, _ = roam(tmp_path, stop_after=60, cfg=R.RoamConfig(strategy='scan_walk'))
     names = [e['event'] for e in summary['events']]
     assert 'step_crossed_wall_ahead' in names
@@ -1342,3 +1374,85 @@ def test_give_up_timings_are_longer_by_default_and_set_per_run():
     assert (c.stuck_s, c.goal_time_factor, c.goal_time_base_s, c.spin_stall_s, c.passage_wait_s) == (30, 4, 45, 20, 6)
     with pytest.raises(R.ConfigError):
         R.RoamConfig(stuck_s=500)
+
+
+def test_posture_look_around_restores_the_session_gait(tmp_path):
+    """Run 26 Nov 05:35: after pose mode -> move mode the robot walked on in its default flat gait, not rug."""
+    _, summary, robot, _ = roam(tmp_path, cfg=R.RoamConfig(strategy='scan_walk', gait='rug_hstep'), stop_after=60)
+    ev = summary['events']
+    names = [e['event'] for e in ev]
+    assert 'posture_look_end' in names and 'safety_stop' not in names
+    for i, name in enumerate(names):
+        if name == 'posture_look_end':
+            assert ev[i + 1]['event'] == 'gait' and ev[i + 1]['gait'] == 'rug_hstep'
+    gaits = [s[2] for s in robot.sent if s[1] == 'gait']
+    assert gaits and all(g == 'rug_hstep' for g in gaits)             # never flat
+
+
+def _dead_end_passage(monkeypatch):
+    monkeypatch.setattr(R.ScanWalk, 'choose', lambda *a, **kw: None)
+    monkeypatch.setattr(R.ScanWalk, 'straight_ahead', lambda *a, **kw: None)
+    monkeypatch.setattr(R.RoamSession, '_frontier_goal', lambda *a, **kw: None)
+    monkeypatch.setattr(R, 'blocked_passage', lambda grid, pose, **kw: {
+        'yaw': pose[2] + math.pi / 2, 'wall_m': 0.40, 'unknown': 0.9, 'width_deg': 25})
+
+
+def test_dead_end_probe_walks_through_a_curtain_instead_of_pausing(tmp_path, monkeypatch):
+    """Operator 2026-11-26: no confirmation at a blocked passage -> probe it; it gives way, so it was a curtain."""
+    _dead_end_passage(monkeypatch)
+    _, summary, robot, _ = roam(tmp_path, cfg=R.RoamConfig(strategy='scan_walk', passage_wait_s=0.0), stop_after=100)
+    names = [e['event'] for e in summary['events']]
+    assert names.index('passage_waiting') < names.index('passage_probe') < names.index('curtain_crossed')
+    crossed = next(e for e in summary['events'] if e['event'] == 'curtain_crossed')
+    assert crossed['probe'] is True
+    first = names.index('curtain_crossed')
+    assert not any(e['event'] == 'paused' for e in summary['events'][:first])
+    assert summary['stats']['passage_probes'] >= 1 and 'passage_stops' not in summary['stats']
+    assert all(v >= 0 for t, kind, *rest in robot.sent if kind == 'vel' for v in rest[:1])   # never reversed
+
+
+def test_dead_end_probe_into_a_wall_reverses_out_and_explores_on(tmp_path, monkeypatch):
+    """The passage does not give way (SLAM pose stays put): a wall. Reverse along the probe path, no pause,
+    no safety abort for the reverse command, and the reverse is at most the back-off speed."""
+    _dead_end_passage(monkeypatch)
+    original_pose = R.RoamSession._pose
+
+    def pose(self):
+        p = original_pose(self)
+        c = self.crossing
+        if p is not None and c is not None and c.get('probe') and not c.get('back'):
+            return (c['slam_origin'][0], c['slam_origin'][1], p[2])            # body not moving: a wall
+        return p
+    monkeypatch.setattr(R.RoamSession, '_pose', pose)
+    monkeypatch.setattr(R.RoamSession, '_rear_obstacle', lambda self: math.inf)
+    outcome, summary, robot, _ = roam(tmp_path, cfg=R.RoamConfig(strategy='scan_walk', passage_wait_s=0.0),
+                                      stop_after=60)
+    names = [e['event'] for e in summary['events']]
+    assert names.index('passage_probe') < names.index('passage_probe_wall') < names.index('passage_probe_back')
+    wall = next(e for e in summary['events'] if e['event'] == 'passage_probe_wall')
+    assert wall['how'] == 'SLAM: no progress'
+    back = next(e for e in summary['events'] if e['event'] == 'passage_probe_back')
+    assert back['how'] == 'done' and back['reversed_m'] == pytest.approx(wall['back_m'], abs=0.05)
+    assert 'curtain_crossed' not in names[:names.index('passage_probe_back')]
+    assert not any(e['event'] in ('paused', 'abort') for e in summary['events'][:names.index('passage_probe_back')])
+    assert 'reverse command' not in str(outcome)
+    reverse = [v for t, kind, v, w in (x for x in robot.sent if x[1] == 'vel') if v < 0]
+    assert reverse and min(reverse) >= -R.PASSAGE_PROBE_BACK_SPEED_M_S - 1e-9
+    assert summary['stats']['passage_probe_walls'] == 1
+
+
+def test_reverse_outside_a_probe_back_off_is_still_a_violation(tmp_path):
+    """The no-reverse rule stays for everything else."""
+    _, _, robot, session = roam(tmp_path, cfg=R.RoamConfig(strategy='scan_walk'), stop_after=5)
+    now = robot.now()
+    robot.telemetry.on_system_cmd(now, -0.10, 0.0, 0.0)
+    assert 'reverse command' in (session.roam_violation(now) or '')
+    session.reverse_ok_until = now + 0.5
+    assert 'reverse command' not in (session.roam_violation(now) or '')
+    robot.telemetry.on_system_cmd(now, -0.30, 0.0, 0.0)                 # well past the back-off: still refused
+    assert 'reverse command' in (session.roam_violation(now) or '')
+
+
+def test_passage_probe_flag():
+    assert R.RoamConfig().passage_probe is True
+    assert R.RoamConfig(passage_probe=False).passage_probe is False

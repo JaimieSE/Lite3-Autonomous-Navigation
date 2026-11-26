@@ -109,6 +109,9 @@ def main(argv=None):
                 else:
                     logic.heartbeat_s = a.heartbeat
                 reasons = logic.evaluate(robot.telemetry, now, active, time.time())
+                for note in logic.notes:
+                    print(note, flush=True)
+                logic.notes.clear()
                 if reasons:
                     state.update(tripped=True, reasons=reasons)
                     write()

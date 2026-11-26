@@ -37,7 +37,7 @@ def test_velocity_caps_match_validated_envelope_and_no_reverse():
     assert smoother['max_velocity'][2] <= 1.5 and smoother['min_velocity'][2] >= -1.5
     behaviors = get('behavior_server', 'ros__parameters')
     assert behaviors['behavior_plugins'] == ['spin', 'wait']
-    assert behaviors['max_rotational_vel'] <= 1.5
+    assert behaviors['max_rotational_vel'] <= 0.5          # in-place turns capped (2026-11-25 flip)
 
 
 def test_behavior_tree_has_no_blind_reverse():

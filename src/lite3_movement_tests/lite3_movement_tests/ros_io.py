@@ -29,7 +29,8 @@ POSTURE_TOGGLE = 0x21010202   # documented stand/sit toggle; also used by univer
 # 0x00 all AI off / 0x20 auto stop -> motion host (here via /simple_cmd); 0x40 obstacle avoidance -> the
 # PERCEPTION host UDP 192.168.1.103:43899 (documented address; differs per network, configurable).
 AI_OPTIONS_CODE = 0x21012109
-AI_OPTIONS = {'all_off': 0x00, 'auto_stop': 0x20, 'obstacle_avoidance': 0x40}
+AI_OPTIONS = {'all_off': 0x00, 'auto_stop': 0x20, 'obstacle_avoidance': 0x40, 'avoidance_off': 0x00}
+AI_OPTIONS_PERCEPTION = ('obstacle_avoidance', 'avoidance_off')   # sent to the perception host (UDP)
 PERCEPTION_HOST_DEFAULT = ('192.168.1.103', 43899)
 
 
@@ -47,6 +48,15 @@ AI_ENTER = 0x21010528
 AI_EXIT = 0x2101052B
 AI_GAIT_BASIC = 0x2101052A
 NAVIGATION_MODE = 0x21010C03
+# s1.2.7: navigation mode takes speed commands from the perception host, manual mode those from the controller.
+# Axis commands are the controller's joystick output (s1.2.3), so AI-state walking needs manual mode.
+MANUAL_MODE = 0x21010C02
+# s1.2.4 motion modes (not in AI state) and s1.2.3.1 pose-mode axis: body yaw, positive rotates right, dead zone
+# +-9553; without an axis command for 1 s the robot returns to its normal standing posture.
+POSE_MODE = 0x21010D05
+MOVE_MODE = 0x21010D06
+AXIS_YAW = 0x21010135
+AXIS_YAW_DEAD_ZONE = 9553
 AXIS_FORWARD = 0x21010130
 AXIS_FORWARD_DEAD_ZONE = 6553
 HEARTBEAT_CODE = 0x21040001
@@ -55,6 +65,7 @@ GAITS = {'flat_slow': 0x21010300, 'flat_medium': 0x21010307, 'flat_fast': 0x2101
          'rug_general': 0x21010401, 'rug_grip': 0x21010402, 'rug_hstep': 0x21010407}
 NODE_NAME = 'lite3_movement_test'
 SENSORS = ('imu', 'joint', 'odom2', 'odom', 'ultrasound')
+ULTRASOUND_TOPIC = '/us_publisher/ultrasound_distance'
 
 
 @dataclass(frozen=True)
@@ -93,7 +104,7 @@ class RosRobot:
         from geometry_msgs.msg import Twist
         from nav_msgs.msg import Odometry
         from sensor_msgs.msg import Imu, JointState
-        from std_msgs.msg import Bool
+        from std_msgs.msg import Bool, Float64
 
         self._rclpy = rclpy
         self.wiring = wiring
@@ -135,6 +146,8 @@ class RosRobot:
             (m.linear_acceleration.x, m.linear_acceleration.y, m.linear_acceleration.z)), sensor)
         tel.create_subscription(Twist, '/handle_state', lambda m: t.on_handle(
             now(), m.linear.x, m.linear.y, m.angular.z), sensor)
+        # Robot's front ultrasound (motion_receiver, Float64 m, 200 Hz; operator 2026-11-26: AI-mode stairs stop on it).
+        tel.create_subscription(Float64, ULTRASOUND_TOPIC, lambda m: t.on_ultrasound(now(), m.data), sensor)
         for name in SENSORS:
             tel.create_subscription(Bool, f'/sensor_status/{name}_isalive',
                                     lambda m, n=name: t.on_sensor_alive(now(), n, m.data), sensor)
@@ -205,7 +218,7 @@ class RosRobot:
     def send_ai_option(self, name, perception_host=PERCEPTION_HOST_DEFAULT):
         """Documented perception switch (s1.2.11). Robot must not be in AI state."""
         value = AI_OPTIONS[name]
-        if name == 'obstacle_avoidance':
+        if name in AI_OPTIONS_PERCEPTION:
             return {'published': send_perception_udp(AI_OPTIONS_CODE, value, perception_host),
                     'to': f'{perception_host[0]}:{perception_host[1]}'}
         return self.send_simple_command(AI_OPTIONS_CODE, value)
@@ -315,6 +328,7 @@ OPS_STOP_TOPIC = '/lite3_ops/stop_cmd_vel'
 OPS_HOLD_TOPIC = '/lite3_ops/hold'
 CLEAR_COSTMAP_SERVICES = ('/global_costmap/clear_entirely_global_costmap',
                           '/local_costmap/clear_entirely_local_costmap')
+SLAM_PAUSE_SERVICE = '/slam_toolbox/pause_new_measurements'   # a TOGGLE (slam_toolbox/srv/Pause)
 MUX_OUT_TOPIC = '/lite3_ops/mux_out'           # twist_mux -> collision_monitor
 CM_NODE = 'collision_monitor'                  # the ONLY publisher of /cmd_vel
 TERRAIN_NODE = 'lite3_terrain_monitor'
@@ -420,6 +434,12 @@ class NavRobot(RosRobot):
             from nav2_msgs.srv import ClearEntireCostmap
             self._ClearEntireCostmap = ClearEntireCostmap
             self._clear_clients = [node.create_client(ClearEntireCostmap, name) for name in CLEAR_COSTMAP_SERVICES]
+            try:
+                from slam_toolbox.srv import Pause
+                self._SlamPause = Pause
+                self._slam_pause_client = node.create_client(Pause, SLAM_PAUSE_SERVICE)
+            except ImportError:                          # slam_toolbox interfaces not installed
+                self._slam_pause_client = None
 
     def stop_path_status(self):
         """Is the commanded-stop path discovered end to end? Publishers created moments ago drop
@@ -481,6 +501,22 @@ class NavRobot(RosRobot):
         while not future.done() and time.monotonic() < deadline:
             time.sleep(0.02)
         return future.result() if future.done() else None
+
+    def slam_toggle_pause(self):
+        """Toggle slam_toolbox between taking new scans and ignoring them (map and map->odom stay up). The service
+        is a toggle with no state readback, so callers must track what they switched. Short timeouts: the roam loop
+        waits on this. Returns delivery evidence; answered=True means slam_toolbox handled the toggle."""
+        if not self.can_actuate:
+            raise RuntimeError('read-only interface changes nothing')
+        client = getattr(self, '_slam_pause_client', None)
+        if client is None:
+            return {'answered': False, 'reason': 'slam_toolbox interfaces not installed'}
+        if not client.wait_for_service(timeout_sec=0.3):
+            return {'answered': False, 'reason': f'{SLAM_PAUSE_SERVICE} not available'}
+        result = self._call(client, self._SlamPause.Request(), timeout=1.0)
+        if result is None:
+            return {'answered': False, 'reason': 'no answer within 1 s (state unknown)'}
+        return {'answered': True, 'status': bool(result.status)}
 
     def clear_costmaps(self):
         """Nav2 ClearEntireCostmap on the global and local costmap (the recovery Nav2's default behaviour
