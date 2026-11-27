@@ -911,7 +911,7 @@ def test_nav2_leaving_the_centre_lane_keeps_walking(tmp_path, monkeypatch):
     state = {'n': 0}
 
     def changed(self, now):
-        if self.goal and 'centre_lane' in self.goal and state['n'] == 0:
+        if self.goal and 'centre_lane' in self.goal and state['n'] < 3:   # (other branches call it first too)
             state['n'] += 1
             return True
         return False
@@ -1118,3 +1118,105 @@ def test_plain_activity_words_for_the_special_states():
     assert s._plain_activity(0.0) == 'Walking to an unexplored cell'
     s.state, s.auto_resume_at, s.goal = 'PAUSED', 15.0, None
     assert s._plain_activity(0.0) == 'Paused - resumes by itself in 15 s'
+
+
+def test_a_step_is_crossed_only_square_and_level():
+    """Arena B 2026-11-26 21:53 SGT side flip: the square-up turn stopped after 2 of 35 deg and the crossing started
+    ~33 deg off square, already pitched 0.2 rad. Now: square and level, or back up / give the walk up."""
+    import types
+    from lite3_movement_tests.telemetry import Telemetry
+    t = Telemetry()
+    s = R.RoamSession.__new__(R.RoamSession)
+    s.course = CourseGrid(0.0, 0.0, 0.0)
+    s.robot = types.SimpleNamespace(telemetry=t, nav_cancel=lambda timeout_s=0.5: True)
+    s.events, s.stats, s.goal = [], {}, {'kind': 'walk', 'x': 1.0, 'y': 0.0, 'yaw': 0.0}
+    s.event = lambda name, **d: s.events.append((name, d))
+    t.on_imu(0.0, 0, 0, 0, 1, (0, 0, 0), (0, 0, 9.8))                       # level
+    assert s._step_not_ready((0.0, 0.0, math.radians(5))) is None        # 5 deg off: square enough
+    assert 'off square' in s._step_not_ready((0.0, 0.0, math.radians(33)))
+    t.on_imu(1.0, 0.0, 0.1, 0, 0.995, (0, 0, 0), (0, 0, 9.8))              # ~11 deg pitch
+    assert 'tilted' in s._step_not_ready((0.0, 0.0, 0.0))
+    backs, failed = [], []
+    s._back_for_room = lambda now, pose, why: backs.append(why) or True
+    sample = types.SimpleNamespace(step_ahead_m=0.5, step_rise_m=0.21)
+    assert s._step_not_crossed(2.0, (0.0, 0.0, 0.6), sample, '33 deg off square') is True
+    assert backs and s.goal is None and s.events[0][0] == 'step_not_crossed'
+    s.goal = {'kind': 'walk', 'x': 1.0, 'y': 0.0, 'yaw': 0.0}
+    s._back_for_room = lambda now, pose, why: False                       # nothing behind to back into
+    s._walk_failed = lambda now, why, goal=None: failed.append(why)
+    s._step_not_crossed(3.0, (0.0, 0.0, 0.6), sample, 'tilted 11 deg')
+    assert failed == ['step met tilted 11 deg'] and s.stairs_until > 3.0
+
+
+def test_competition_walking_is_the_20_nov_sequence_with_centre_lanes_and_no_spinning(tmp_path):
+    """Operator 2026-11-26: use the walking of the run that covered the most meaningful ground (20 Nov: 7.2 m out,
+    74.5 m2 mapped, 16/17 goals, no turns on the spot); keep cell-centre walking, 90-degree turns and the 0.5 rad/s
+    turn. No look-arounds, pose looks or photo stops in this mode."""
+    c = R.RoamConfig(strategy='scan_walk', stop_at_exit=False, start_mode='normal', decision='sequence',
+                     auto_resume_s=15.0)
+    c.centre_lane = True
+    _, summary, _, session = roam(tmp_path, stop_after=120, cfg=c)
+    n = names(summary)
+    assert session.course is not None                                     # grid kept for centre lanes
+    assert n.count('walk') >= 4 and summary['stats']['distance_m'] > 5.0
+    for banned in ('look_around', 'posture_look_start', 'capture_request', 'room_scan_start', 'decision'):
+        assert banned not in n
+    assert math.isclose(R.SCAN_STEP_RAD, math.radians(90)) and R.LOOK_STEP_DEG == 90.0
+
+
+def _grid_cfg(**kw):
+    return R.RoamConfig(strategy='scan_walk', stop_at_exit=False, start_mode='normal', decision='grid',
+                        auto_resume_s=15.0, **kw)
+
+
+def test_grid_mode_walks_cell_to_cell_with_exact_90_degree_turns_and_never_into_a_room(tmp_path):
+    """Operator 2026-11-26 evening spec: straight cell-centre legs, every turn 90 degrees (corrected to 3), no goal
+    in a room, the room read from the cell in front, frontier only once the grid is done."""
+    _, summary, _, session = roam(tmp_path, stop_after=400, cfg=_grid_cfg(geofence_m=5.0), map_obstacles=_pocket())
+    ev, n = summary['events'], names(summary)
+    walks = [e for e in ev if e['event'] == 'walk']
+    assert len(walks) >= 10 and summary['stats']['distance_m'] > 8.0
+    assert all(not session.course.is_room(session.course.cell(w['x'], w['y'])) for w in walks)
+    for e in ev:
+        if e['event'] == 'grid_turn':
+            k = round(e['turn_deg'] / 90.0) * 90.0
+            assert abs(e['turn_deg'] - k) <= 5.0                  # a 90-degree multiple (or a small correction)
+    assert 'room_protocol_start' in n and 'room_protocol_done' in n
+    assert 'look_around' not in n and 'decision' not in n
+    first_frontier = next((i for i, w in enumerate(walks) if w.get('ends_at') == 'frontier'), None)
+    if first_frontier is not None:
+        assert 'grid_complete' in n[:n.index('walk') + 1 + first_frontier * 2 + 50]
+
+
+def test_inside_a_room_the_dog_backs_out_when_the_opening_is_behind():
+    from test_course_grid import _room_map
+    s = R.RoamSession.__new__(R.RoamSession)
+    s.events, s.stats, s.nudge = [], {}, None
+    s.event = lambda name, **d: s.events.append(name)
+    s.course = CourseGrid(0.0, 0.0, 0.0)
+    s.course.update(_room_map())
+    odom = type('O', (), {'x': 2.0, 'y': 0.0})()
+    s.robot = type('Rb', (), {'can_actuate': True, 'telemetry': type('T', (), {
+        'odom': type('Od', (), {'latest': staticmethod(lambda: (0.0, odom))})(),
+        'current_tilt': staticmethod(lambda: (0.0, 0.0))})()})()
+    s._stable = lambda now: True
+    assert s._grid_leave_room(0.0, (2.0, 0.0, 0.0), (2, 0), (1, 0))   # facing the closed end: opening behind
+    assert s.nudge['sign'] == -1 and s.nudge['length'] <= R.ROOM_BACKOUT_MAX_M and s.events[-1] == 'room_backout'
+
+
+def test_it_steadies_before_standing_still_on_uneven_ground():
+    s = R.RoamSession.__new__(R.RoamSession)
+    s.events = []
+    s.event = lambda name, **d: s.events.append(name)
+    tilt = [(0.0, 0.2)]
+    sent = []
+    s.robot = type('Rb', (), {'send_velocity': lambda self, vx, wz: sent.append((vx, wz)),
+                              'telemetry': type('T', (), {'current_tilt': staticmethod(lambda: tilt[0])})()})()
+    assert s._grid_wait_stable(0.0, 'turn') and s.events == ['stabilising']   # tilted: waits
+    assert s._grid_wait_stable(5.0, 'turn')
+    tilt[0] = (0.0, 0.02)
+    assert s._grid_wait_stable(6.0, 'turn')                                   # level, not yet for 1 s
+    assert not s._grid_wait_stable(7.1, 'turn')                               # level for 1 s: go
+    tilt[0] = (0.0, 0.2)
+    s._grid_wait_stable(10.0, 'photo')
+    assert not s._grid_wait_stable(20.5, 'photo') and s.events[-1] == 'not_stable'   # gives up after 10 s

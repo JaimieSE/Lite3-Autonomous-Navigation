@@ -205,6 +205,57 @@ delays robot telemetry and commands.
 `stop` ends roam, the reporter, `nav_hold` and navigation. If roam ends by itself, the reporter and `nav_hold`
 stop with it; RViz and navigation stay up until `stop`.
 
+### 6.1 Watch the reports live
+
+In a second NUC terminal, as soon as the run has started:
+
+```bash
+~/live_mission/watch_reports.sh
+```
+
+It follows the current run (the manual fallback's run when that is on) and changes nothing. Ctrl+C stops it.
+
+| Line | Meaning |
+|---|---|
+| `Run: … reporter: POST http://…/task_report_B` | the reporter is **live** on that arena (`DRY RUN` = practice, nothing posted) |
+| `scan fallback-…` / `result fallback-…` | a room photo was taken / Claude's answer (room, findings, QR) |
+| `SENT {…}` | a report was posted to the scorer (the seven keys) |
+| `… HTTP 200 … "status":"accepted" … "score"` | the scorer's reply, with its score |
+| `Mx pending: …` / `held` | not posted yet: still waiting for confirmed evidence (the reason is given) |
+| `already accepted earlier in this run (not re-sent): [...]` | after a reporter restart: those tasks are done |
+
+Only confirmed answers are posted. Each survivor is reported as soon as her room scan comes back: **M03** if
+Claude saw a QR code in that room, **M05** if not. Every answer, posted or held, is also in
+`…/candidates.jsonl` next to `mission_reports.jsonl`.
+
+### 6.2 Manual scene fallback (when autonomy is stuck)
+
+Drive by hand while the NUC still takes the room photos and reports them:
+
+```bash
+~/live_mission/scene_check.sh --fallback on --live
+```
+
+- Roam pauses (map, Nav2 and the A1 origin stay up). Switch the remote to manual and drive.
+- Stop in a room, or in front of one facing into it: after 1 s still, one photo of that room is taken and
+  reported. It fires once per visit; leave the cell and come back for another photo.
+- The arena is taken from the running competition. A different `--arena` is refused unless you add
+  `--arena-override`. Without `--live` it is a dry run.
+
+Back to autonomy:
+
+```bash
+~/live_mission/scene_check.sh --fallback off
+```
+
+Then put the robot back in navigation (auto) mode on the remote and run `operator/roam.sh resume`. The
+fallback never moves the robot and never resumes roam.
+
+After the reporter's code changes mid-run: `~/live_mission/scene_check.sh --fallback on --live --restart-reporter`
+(same run folder; answers already accepted are not re-sent).
+
+Teleoperating from the start, without roam: section 7.
+
 Then:
 1. Dashboard: press **STOP**.
 2. Note the arena and run number for the log name (Arena A / Arena B).
@@ -217,6 +268,8 @@ Then:
 | `log/operator/competition-<time>-physical/preflight.txt` | readiness check |
 | `…/reporter.log` | mission reporter decisions |
 | `…/mission_reports.jsonl` | every payload posted to the scoring endpoint |
+| `…/candidates.jsonl` | every candidate answer, posted or held (with the reason) |
+| `…/scene_fallback.log`, `…/reporter-fallback.log` | manual scene fallback: photos taken and its reporter |
 | `…/nav_hold.log` | Pi scene holds |
 | `log/operator/run-*/roam/*/report.md` | roam report (the newest folder) |
 | `log/operator/run-*/roam/*/mission_events.json` | mission events seen during roam |
@@ -231,6 +284,22 @@ Exactly like an official run, but the reporter only prints payloads and posts no
 ```bash
 operator/competition_start.sh --physical --arena A --dry-report
 ```
+
+Teleoperated only, on a test course (no roam; you drive with the remote, photos and reports as in 6.2). Put
+the dog in A1, square to the walls, facing +X; that pose sets A1 and the room grid:
+
+```bash
+operator/start_navigation.sh
+```
+```bash
+~/live_mission/scene_check.sh --fallback on
+```
+```bash
+~/live_mission/watch_reports.sh
+```
+
+Add `--live` to post (it scores against the real arena's answers). Finish with
+`~/live_mission/scene_check.sh --fallback off` and `operator/competition_start.sh stop`.
 
 Without the robot moving (real sensors, robot still, RViz shows what roam would do):
 

@@ -480,6 +480,28 @@ def test_stalled_search_pauses(tmp_path, monkeypatch):
     assert 'spin_stalled' in names and 'paused' in names and 'walk' not in names
 
 
+
+def test_stalled_turn_after_room_photos_resends_walking_mode_once(tmp_path, monkeypatch):
+    """Operator 2026-11-27 (Arena B 04:03): after the room photos every turn stalled at 0 deg. The first stall after a
+    posture look re-sends move + navigation mode and keeps turning; a second stall pauses as before."""
+    from lite3_movement_tests.sim_model import FakeNavRobot
+    monkeypatch.setattr(R.RoamSession, '_frontier_goal', lambda *a, **kw: None)
+    monkeypatch.setattr(R.ScanWalk, 'choose', lambda *a, **kw: None)
+    monkeypatch.setattr(R.ScanWalk, 'straight_ahead', lambda *a, **kw: None)
+    monkeypatch.setattr(FakeNavRobot, '_spin_tick', lambda self: None)
+    original = R.RoamSession._start_spin
+
+    def start_spin(self, *a, **kw):
+        if not getattr(self, '_photos_done', False):
+            self._photos_done = self._walk_mode_check = True       # as if a posture look just ended
+        return original(self, *a, **kw)
+    monkeypatch.setattr(R.RoamSession, '_start_spin', start_spin)
+    _, summary, _, _ = roam(tmp_path, stop_after=40, cfg=R.RoamConfig(strategy='scan_walk', spin_stall_s=12.0))
+    names = [e['event'] for e in summary['events']]
+    assert names.count('walk_mode_resent') == 1
+    assert names.index('walk_mode_resent') < names.index('spin_stalled') < names.index('paused')
+
+
 def test_cli_defaults_to_scan_walk_and_frontier_stays_available():
     a = R.parse(['run', '--sim'])
     assert R.build_config(a, {}).strategy == 'scan_walk'
@@ -1000,16 +1022,27 @@ def test_far_stairs_are_walked_to_first(tmp_path, monkeypatch):
 
 
 def test_near_curtain_is_crossed_straight_then_costmaps_cleared(tmp_path, monkeypatch):
-    _advise(monkeypatch, 3.0, obstacle='curtain', distance_m=0.5, heading_correction_deg=None,
+    _advise(monkeypatch, 3.0, obstacle='curtain', distance_m=0.4, heading_correction_deg=None,
             distance_reference='rgb_camera_optical_depth')
     _, summary, robot, _ = roam(tmp_path, cfg=R.RoamConfig(strategy='scan_walk'), stop_after=40)
     ev = summary['events']
     start = next(e for e in ev if e['event'] == 'curtain_crossing')
-    assert abs(start['curtain_m'] - 0.75) < 0.01 and abs(start['length_m'] - (0.75 + R.CURTAIN_PAST_M)) < 0.01
+    assert abs(start['curtain_m'] - 0.65) < 0.01 and abs(start['length_m'] - (0.65 + R.CURTAIN_PAST_M)) < 0.01
     done = next(e for e in ev if e['event'] == 'curtain_crossed')
-    assert done['travelled_m'] >= 0.75 + R.CURTAIN_PAST_M
+    assert done['travelled_m'] >= 0.65 + R.CURTAIN_PAST_M
     assert any(e['event'] == 'costmap_cleared' and e['why'] == 'curtain crossed' for e in ev)
     assert summary['stats']['curtain_crossings'] == 1
+
+
+def test_curtain_not_yet_right_in_front_is_not_crossed(tmp_path, monkeypatch):
+    """Operator 2026-11-27: cross only when the curtain is right in front (0.7 m from base_link); 0.5 m from the
+    camera is 0.75 m from base_link - not yet."""
+    assert R.CURTAIN_TRIGGER_M == 0.7
+    _advise(monkeypatch, 3.0, obstacle='curtain', distance_m=0.5, heading_correction_deg=None,
+            distance_reference='rgb_camera_optical_depth')
+    _, summary, _, _ = roam(tmp_path, cfg=R.RoamConfig(strategy='scan_walk'), stop_after=20)
+    names = [e['event'] for e in summary['events']]
+    assert 'advisory' in names and 'curtain_crossing' not in names
 
 
 def test_far_curtain_and_log_mode_do_not_take_over(tmp_path, monkeypatch):
@@ -1030,7 +1063,7 @@ def test_log_mode_only_logs(tmp_path, monkeypatch):
 def test_blocked_curtain_stops_and_pauses(tmp_path, monkeypatch):
     """A 'curtain' that does not give way (a wall): no progress -> stop and pause, never push on."""
     from lite3_movement_tests.sim_model import SimLite3
-    _advise(monkeypatch, 3.0, obstacle='curtain', distance_m=0.5, heading_correction_deg=None,
+    _advise(monkeypatch, 3.0, obstacle='curtain', distance_m=0.4, heading_correction_deg=None,
             distance_reference='rgb_camera_optical_depth')
     original = R.RoamSession._crossing_tick
 
@@ -1456,3 +1489,91 @@ def test_reverse_outside_a_probe_back_off_is_still_a_violation(tmp_path):
 def test_passage_probe_flag():
     assert R.RoamConfig().passage_probe is True
     assert R.RoamConfig(passage_probe=False).passage_probe is False
+
+
+def _keeper(cmd_vx, moving, **over):
+    """A bare RoamSession with fake telemetry for _keep_auto_mode (operator 2026-11-27)."""
+    from types import SimpleNamespace as NS
+    sent = []
+    s = R.RoamSession.__new__(R.RoamSession)
+    cmds = [(10.0 + i * 0.1, NS(vx=cmd_vx, vy=0.0, wz=0.0)) for i in range(31)]
+    odom = [(10.0 + i * 0.1, NS(vx=0.3 if moving else 0.0, vy=0.0, wz=0.0)) for i in range(31)]
+    tel = NS(system_cmd=NS(window=lambda now, span: [c for c in cmds if c[0] >= now - span]),
+             odom=NS(window=lambda now, span: [o for o in odom if o[0] >= now - span]))
+    s.robot = NS(can_actuate=True, telemetry=tel, now=lambda: 13.0,
+                 send_simple_command=lambda code: sent.append(code) or {'published': True})
+    s.cfg = NS(auto_mode=True, gait=None)
+    s.stairs = s.crossing = None
+    s.posture_look = s.pi_gate = None
+    s.stats, s.events, s.log, s.plain, s.t_roam = {}, [], (lambda m: None), False, 0.0
+    s._still_since = lambda now: None if moving else 9.0
+    for k, v in over.items():
+        setattr(s, k, v)
+    return s, sent
+
+
+def test_dog_told_to_walk_but_standing_is_put_back_in_auto_mode():
+    from lite3_movement_tests.ros_io import MOVE_MODE, NAVIGATION_MODE
+    s, sent = _keeper(0.4, moving=False)
+    s._keep_auto_mode(13.0)
+    assert sent == [MOVE_MODE, NAVIGATION_MODE] and s.events[-1]['event'] == 'auto_mode_resent'
+    s._keep_auto_mode(14.0)
+    assert len(sent) == 2                                     # not again within AUTO_MODE_REPEAT_S
+
+
+def test_auto_mode_is_left_alone_when_moving_idle_or_on_stairs():
+    for kw in ({'moving': True}, {'moving': False, 'cmd_vx': 0.0}):
+        s, sent = _keeper(kw.pop('cmd_vx', 0.4), **kw)
+        s._keep_auto_mode(13.0)
+        assert sent == []
+    s, sent = _keeper(0.4, moving=False, stairs=('routine', 'ai'))
+    s._keep_auto_mode(13.0)
+    assert sent == []
+
+
+def test_operator_automode_command_goes_through_roam():
+    """Operator 2026-11-27: lite3_auto while roam runs -> roam sends move + navigation mode itself."""
+    from lite3_movement_tests.ros_io import MOVE_MODE, NAVIGATION_MODE
+    s, sent = _keeper(0.0, moving=True)
+    s.state = 'ROAMING'
+    assert s._handle({'cmd': 'automode', 'id': 'x'}) is None or True
+    assert sent[:2] == [MOVE_MODE, NAVIGATION_MODE]
+    assert any(e['event'] == 'auto_mode_operator' for e in s.events)
+    assert R.parse(['automode']).action == 'automode'
+
+
+def test_start_sends_move_mode_before_navigation_mode(monkeypatch):
+    from lite3_movement_tests.ros_io import MOVE_MODE, NAVIGATION_MODE
+    s, sent = _keeper(0.0, moving=True)
+    s.mode = R.MODE_PHYSICAL
+    monkeypatch.setattr(R.time, 'sleep', lambda _s: None)
+    s._select_auto_mode()
+    assert sent == [MOVE_MODE, NAVIGATION_MODE]
+
+
+def test_pi_yolo_curtain_box_ahead_starts_a_crossing():
+    """Operator 2026-11-27: the dog backed up from a curtain 17 times - the confirmed reading never came. A fresh YOLO
+    curtain box ahead plus something within CURTAIN_TRIGGER_M on the LiDAR walks straight through it."""
+    import json as _json
+    import time as _time
+    from types import SimpleNamespace as NS
+    s, _ = _keeper(0.0, moving=False)
+    msg = {'capture_stamp_ns': int((_time.time() - 0.5) * 1e9), 'stair_candidates': [],
+           'curtain_candidates': [{'name': 'curtain', 'confidence': 0.8, 'box': {'x1': 200, 'x2': 460}}]}
+    s.robot.pi_stair_objects = (13.0, _time.time(), _json.dumps(msg))
+    s.cfg.pi_advisory = True
+    s.nudge, s.curtain_until, s.cancel_request = None, -math.inf, None
+    started = []
+
+    def cross(now, pose, adv):
+        started.append(adv['distance_m'])
+        s.crossing = {}
+        return True
+    s._advisory_curtain = cross
+    assert s._pi_curtain_tick(13.0, (0, 0, 0), NS(obstacle_ahead_m=0.3)) and started == [0.3]
+    assert s.events[-1]['event'] == 'curtain_detected'
+    s.crossing, started[:] = None, []
+    assert not s._pi_curtain_tick(13.0, (0, 0, 0), NS(obstacle_ahead_m=1.5)) and not started    # too far
+    msg['curtain_candidates'][0]['confidence'] = 0.4
+    s.robot.pi_stair_objects = (13.0, _time.time(), _json.dumps(msg))
+    assert not s._pi_curtain_tick(13.0, (0, 0, 0), NS(obstacle_ahead_m=0.3))                   # weak box

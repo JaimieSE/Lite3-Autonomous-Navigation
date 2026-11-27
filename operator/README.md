@@ -234,6 +234,8 @@ Those are only this workflow's processes.
 
 ### 8.1 LiDAR fragment fix (Linux IP fragment reassembly)
 
+**Default from 2026-11-27:** installed once with `sudo install -m 644 operator/90-lidar-ipfrag.conf /etc/sysctl.d/ && sudo sysctl --system`, so it survives reboots.
+
 **What happens.** Each LiDAR message is large: 401 KB on `/livox/lidar` and 442
 KB on `/livox/points`, both at 10 Hz, about 8.5 MB/s together. The navigation relay now requests only the native Livox scan (about 4 MB/s) and converts it to PointCloud2 on group8. Other subscribers to either source topic can still add traffic. Each one arrives
 as roughly 45 IP fragments per 64 KB datagram. The kernel's default reassembly

@@ -22,7 +22,7 @@
 #   --no-capture      do not start the camera capture (NUC relay + Pi Claude half); pockets then get no reading:
 #                     roam waits 12 s for an ack that never comes, then moves on
 #   --no-centre-lane  walk the chosen goals directly (default: cell centre to cell centre on the 1 x 1 m grid)
-# When roam ends, the reporter stops; RViz and navigation stay up ("stop" ends navigation too).
+# When roam ends, RViz, navigation and the mission reporter stay up ("stop" ends them; operator 2026-11-27).
 # Every other option goes to roam (operator/roam.sh start), e.g. --max-minutes 30, --auto-resume 20,
 # --weights "grid=2", --geofence 10. Speed is normal (regular) by default.
 # THE HANDHELD REMOTE / E-STOP IS THE EMERGENCY STOP.
@@ -93,9 +93,19 @@ done
 if [ -f "$ROAM_PID_FILE" ] && kill -0 "$(cat "$ROAM_PID_FILE")" 2>/dev/null; then
   echo "Roam is already running (pid $(cat "$ROAM_PID_FILE")): operator/competition_start.sh status | stop"; exit 3
 fi
-# The unified decision and self-resuming pauses are roam's defaults; say so explicitly for the record.
-case " ${ROAM_ARGS[*]} " in *" --decision "*) ;; *) ROAM_ARGS+=(--decision unified) ;; esac
+# Operator 2026-11-26: competition runs walk the way the 20 Nov run did (the run that covered the most meaningful
+# ground: 7.2 m out, 74.5 m2 mapped, 16/17 goals, no turns on the spot): the sequence decision - hold the heading
+# and walk on, else the smallest turn that opens, else a frontier, else 90-degree search turns. Kept from later:
+# cell-centre walking (centre lanes), 90-degree turns, 0.5 rad/s turning. No look-arounds, pose looks or photo stops.
+# Pass --decision unified for the newer one-evaluator search.
+# Operator 2026-11-26 evening spec (replaces the line above's default): the grid decision - corridor cells walked
+# centre to centre with exact 90-degree turns, rooms (dead ends) read from the front with 3 body-twist views, never
+# entered, frontier only once the grid is done. --decision sequence / unified still select the others.
+case " ${ROAM_ARGS[*]} " in *" --decision "*) ;; *) ROAM_ARGS+=(--decision grid) ;; esac
 case " ${ROAM_ARGS[*]} " in *" --speed "*) ;; *) ROAM_ARGS+=(--speed normal) ;; esac
+# Operator 2026-11-27: the terminal shows plain, important lines only (raw lines: <report dir>/terminal_full.log).
+# Pass --terminal full for the old detailed output.
+case " ${ROAM_ARGS[*]} " in *" --terminal "*) ;; *) ROAM_ARGS+=(--terminal plain) ;; esac
 # Operator 2026-11-26: the Pi's stairs YOLO alone hands over to the AI-mode stair crossing (no RGB-D / VLM / terrain
 # reconfirmation). Pass --stairs-on-sight or --defer-stairs to use the confirmed paths instead.
 case " ${ROAM_ARGS[*]} " in *" --stairs-on-sight "*|*" --defer-stairs "*|*" --stairs-pi-only "*) ;;
@@ -124,6 +134,14 @@ if [ "$MODE" != sim ]; then
     "$OPERATOR_DIR/preflight.sh" --direct-telemetry 2>&1 | tee "$RUN/preflight.txt" | tail -15 || true
   else
     echo "== Readiness check: runs once, as navigation starts"
+  fi
+  # The previous run's reporter outlives roam (posting in manual): stop it before this run starts its own.
+  if [ -f "$PIDS_FILE" ] && [ $REPORTER -eq 1 ]; then
+    grep '^reporter ' "$PIDS_FILE" > "$PIDS_FILE.old" || true
+    PIDS_SAVE="$PIDS_FILE"; PIDS_FILE="$PIDS_FILE.old"
+    ( helpers_stop() { while read -r name pid; do [ -n "$pid" ] && kill -INT "$pid" 2>/dev/null && \
+        echo "   stopping the previous $name (pid $pid)"; done < "$PIDS_FILE"; }; helpers_stop )
+    PIDS_FILE="$PIDS_SAVE"; rm -f "$PIDS_FILE.old"
   fi
   : > "$PIDS_FILE"
   # Stairs and curtains come from the Pi (Orbbec on the Pi, same stair/curtain detector): warn if it is silent.
@@ -196,11 +214,19 @@ fi
 
 on_exit() {
   code=$?
-  echo "== Roam ended (exit $code). Stopping the Pi mission reporter; RViz and navigation stay up."
+  echo "== Roam ended (exit $code). RViz, navigation and the mission reporter stay up."
   if [ -f "$PIDS_FILE" ]; then
-    grep -v '^rviz ' "$PIDS_FILE" > "$PIDS_FILE.keep" || true      # (reporter and nav_hold stop with roam)
+    # Operator 2026-11-27: a manual scene fallback (scene_check.sh --fallback on) still running needs the mission
+    # reporter - roam ending (e.g. remote takeover) must not stop it. It stops with the fallback or with "stop".
+    # Operator 2026-11-27: "It should be posting at all times, even in manual" - the reporter is never stopped
+    # with roam (manual driving + scene_check.sh --fallback keeps posting); only "competition_start.sh stop" ends it.
+    KEEP='^rviz \|^reporter '
+    echo "   The mission reporter keeps running (posting continues in manual); 'stop' ends it."
+    grep "$KEEP" "$PIDS_FILE" > "$PIDS_FILE.stay" || true
+    grep -v "$KEEP" "$PIDS_FILE" > "$PIDS_FILE.keep" || true      # (reporter and nav_hold stop with roam)
     mv "$PIDS_FILE.keep" "$PIDS_FILE"
     helpers_stop
+    mv "$PIDS_FILE.stay" "$PIDS_FILE"                              # "stop" ends these later
   fi
   echo "   Reports: $(ls -dt "$LOG_ROOT"/run-*/roam/*/ 2>/dev/null | head -1) (report.md, mission_events.json)"
   [ "$MODE" != sim ] && echo "   Mission reports (dry): $RUN/reporter.log, $RUN/mission_reports.jsonl   End everything: operator/competition_start.sh stop"

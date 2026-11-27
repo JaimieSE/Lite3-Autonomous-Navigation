@@ -262,3 +262,39 @@ def test_a_corridor_with_something_in_front_of_an_open_end_is_a_room():
                                 (1.47, 1.53, -0.25, 0.25)])               # an obstacle across part of the far end
     g.update(blocked)
     assert not g.is_path((1, 0)) and g.is_room((1, 0))
+
+
+def test_dead_end_is_three_walls_corridor_is_two_or_fewer_including_an_l():
+    """Operator 2026-11-26 evening spec: corridor = <= 2 walls (facing each other, or an L corner); dead end / room
+    = 3 straight walls joined at the corners."""
+    g = CourseGrid(0.0, 0.0, 0.0)
+    g.update(_room_map())                                         # (2, 0): walls above, below and at the far end
+    assert g.is_room((2, 0)) and g.is_dead_end((2, 0)) and not g.is_corridor((2, 0))
+    assert g.is_corridor((1, 0)) and not g.is_room((1, 0))        # two facing walls: a corridor
+    l_shape = grid_of(free=[(-0.5, 2.5, -0.5, 1.5)], occupied=[(-0.6, 2.6, -0.6, -0.5), (2.5, 2.6, -0.6, 1.6)])
+    g.update(l_shape)
+    assert g.cells[(2, 0)]['walls'] == 2 and g.is_corridor((2, 0)) and not g.is_room((2, 0))   # an L corner
+    g.update(_room_map(), breadcrumbs=[(2.0, 0.0)])
+    assert g.is_room((2, 0))                                      # a room it stands in stays a room
+
+
+def test_a_room_filled_by_a_prop_is_still_read_from_its_opening():
+    """Operator 2026-11-27 (Arena A): the toy kitchen fills its room and stands partly in the opening - the room was
+    never read. 3 real walls + an opening that is not a wall (a prop may stand in it) = a room read from the front."""
+    walls = [(-0.6, 2.6, 0.5, 0.6), (-0.6, 2.6, -0.6, -0.5), (2.5, 2.6, -0.6, 0.6)]
+    kitchen = [(1.55, 2.45, -0.45, 0.45), (1.47, 1.55, -0.2, 0.2)]          # fills the cell, 0.4 m into the opening
+    g = CourseGrid(0.0, 0.0, 0.0)
+    g.update(grid_of(free=[(-0.5, 2.5, -0.5, 0.5)], occupied=walls + kitchen))
+    assert g.cells[(2, 0)]['walls'] >= 3                     # the kitchen face may count as a 4th wall
+    assert g.is_room((2, 0)) and g.room_opening((2, 0)) == (1, 0) and (2, 0) in g.rooms_unread()
+    x, y, _ = g.room_viewpoint((2, 0))
+    assert math.dist((x, y), g.centre(1, 0)) < 0.35
+
+
+def test_a_corridor_cell_full_of_blocks_is_not_a_room():
+    """Blocks filling a corridor cell (two open ends) must stay crossable: two walkable neighbours, not a room."""
+    walls = [(-0.6, 3.6, 0.5, 0.6), (-0.6, 3.6, -0.6, -0.5)]
+    blocks = [(1.48, 2.52, -0.45, 0.45)]
+    g = CourseGrid(0.0, 0.0, 0.0)
+    g.update(grid_of(free=[(-0.5, 3.5, -0.5, 0.5)], occupied=walls + blocks))
+    assert not g.is_room((2, 0))

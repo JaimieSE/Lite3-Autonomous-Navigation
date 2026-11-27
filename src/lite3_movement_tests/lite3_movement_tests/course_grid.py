@@ -33,6 +33,8 @@ import numpy as np
 
 CELL_M = 1.0
 HALF_SIZE_M = 12.0                    # cells kept within this of the origin (geofence max 10 m + margin)
+PROP_FACE_MARGIN = 0.05               # a prop face covers its side at least this much less than a wall
+PROP_ROOM_MAPPED = 0.5                # a room filled by a prop: at least this much of the cell mapped (27 Nov)
 MIN_FREE_M2 = 0.20                    # less mapped free floor than this: not a place to go
 VISIT_REACH_M = 0.20                  # walked through = the dog's centre came within this of the cell (its body,
                                        # 0.61 x 0.37 m, was then inside it): a cell along a wall has only ~0.5 m of
@@ -41,7 +43,9 @@ SEEN_DONE = 0.70                      # camera has seen this much of the free fl
 SEEN_INSPECTED = 0.50                 # inspected = walked through + the camera saw at least this much of the floor
 INSPECT_VISITS = 2                    # ... or this many inspection visits (floor hidden behind blocks)
 CENTRE_TOL_M = 0.15                   # a goal point is "the middle of the cell" within this of the centre
-ROOM_WALLS = 2                        # operator 2026-11-26: 2 walls (was 3, operator 2026-11-25)
+ROOM_WALLS = 3                        # operator 2026-11-26 (evening spec): a dead end / room = 3 straight walls
+                                      # joined at the corners (a U). <= 2 walls - facing each other or an L - is a
+                                      # corridor the dog walks into. (Was 2 earlier that day, 3 on 25 Nov.)
 WALL_SIDE_COVER = 0.80                # a side is a wall when the map is occupied along >= 80 % of it (not a prop)
 WALL_BAND_M = 0.12                    # ... within this of the side line
 OPEN_NEIGHBOUR_MAPPED = 0.50          # a neighbour mapped less than this behind a passable edge: still to explore
@@ -327,11 +331,46 @@ class CourseGrid:
 
     # ------------------------------------------------------------------ rooms (operator 2026-11-25)
     def is_room(self, c):
-        """Walls along ROOM_WALLS (2) sides or more, enough floor, inside the course, and NOT a cell the dog has been in (its start cell
-        included): it already saw that one from inside (operator 2026-11-25, Arena B 18:04 SGT)."""
+        """A dead end (operator 2026-11-26 evening spec): straight walls along 3 sides (3 of 4 sides are always joined at
+        the corners: a U), enough floor, inside the course. Never a goal; read from the cell in front. A room the dog
+        is standing in stays a room (the room protocol backs it out)."""
         info = self.cells.get(c)
-        return info is not None and info.get('walls', 0) >= ROOM_WALLS and info['free_m2'] >= MIN_FREE_M2 and \
-            info.get('reachable', True) and not info['visited'] and not self.is_path(c)
+        if info is None:
+            return False
+        walls = info.get('walls', 0)
+        if walls == ROOM_WALLS and info['free_m2'] >= MIN_FREE_M2 and info.get('reachable', True):
+            return True
+        # Operator 2026-11-27 (Arena A kitchen set / workbench): a tall prop filling the room covers its opening too
+        # (4 "walls", little free floor). Still a room when exactly one neighbour is open corridor the dog can stand in.
+        if walls >= ROOM_WALLS and info['free_m2'] < MIN_FREE_M2 and info.get('mapped', 0.0) >= PROP_ROOM_MAPPED:
+            return self.room_opening(c) is not None
+        return False
+
+    def _walkable(self, n):
+        info = self.cells.get(n)
+        return info is not None and info['free_m2'] >= MIN_FREE_M2 and info.get('reachable', True)
+
+    def room_opening(self, c):
+        """The neighbour across the room's open side, or None. 3 walls: the side that is not a wall (a prop may
+        stand in it). Filled by a prop (4 'walls'): the only neighbour that is open corridor."""
+        sides = [n for n in self.neighbours(c) if not (self.edges.get(frozenset((c, n))) == 'blocked'
+                                                         and self.side_cover(c, n) >= WALL_SIDE_COVER)]
+        if sides:
+            return sides[0] if sides[0] in self.cells else None
+        # The prop's face covers its side less completely than a wall panel: the clearly least covered walkable side.
+        open_ = sorted((self.side_cover(c, n), n) for n in self.neighbours(c) if self._walkable(n))
+        if len(open_) == 1 or (len(open_) > 1 and open_[1][0] - open_[0][0] >= PROP_FACE_MARGIN):
+            return open_[0][1]
+        return None
+
+    def is_dead_end(self, c):
+        return self.is_room(c)
+
+    def is_corridor(self, c):
+        """<= 2 walls (facing each other, or an L corner, or fewer): the dog walks into it."""
+        info = self.cells.get(c)
+        return info is not None and info.get('walls', 0) <= 2 and info['free_m2'] >= MIN_FREE_M2 and \
+            info.get('reachable', True)
 
     def wall_sides(self, c):
         """The neighbours across a wall side of c (blocked and covered, as counted in 'walls')."""
@@ -361,8 +400,10 @@ class CourseGrid:
 
     def room_viewpoint(self, c, ok=None):
         """(x, y, yaw): the middle of the cell in front of the room's open side, facing into the room; None if none."""
+        opening = self.room_opening(c) if c in self.cells else None
         for n in self.neighbours(c):
-            if self.edges.get(frozenset((c, n))) == 'blocked':
+            # Operator 2026-11-27: read from the room's opening, even when a prop stands in it.
+            if n != opening and self.edges.get(frozenset((c, n))) == 'blocked':
                 continue
             p = self.return_point(n, ok=ok)
             if p is not None:

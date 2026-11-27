@@ -78,7 +78,7 @@ def test_stairs_off_to_the_side_turn_to_face_them_first(tmp_path, monkeypatch):
 
 def test_rollers_curtains_and_weak_boxes_never_start_ai_mode(tmp_path, monkeypatch):
     for case, kw in (('roller', dict(name='roller')), ('curtain', dict(name='curtain')),
-                     ('weak', dict(confidence=0.899))):
+                     ('weak', dict(confidence=R.PI_STAIRS_MIN_CONFIDENCE - 0.001))):
         with monkeypatch.context() as m:
             pi_stair_boxes(m, 6.0, **kw)
             (tmp_path / case).mkdir()

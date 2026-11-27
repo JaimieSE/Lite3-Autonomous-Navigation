@@ -778,8 +778,9 @@ class NavRobot(RosRobot):
         posture_pubs = names(system.get_publishers_info_by_topic(w.posture_topic))
         if set(posture_pubs) - allowed_posture:
             problems.append(f'unexpected {w.posture_topic} publishers {posture_pubs}')
-        if names(vel.get_publishers_info_by_topic(w.posture_topic)):
-            problems.append(f'group-domain {w.posture_topic} publishers present')
+        group_posture_pubs = names(vel.get_publishers_info_by_topic(w.posture_topic))
+        if group_posture_pubs:      # operator 2026-11-27: name the sender (e.g. Group 07's operator_gui)
+            problems.append(f'group-domain {w.posture_topic} publishers present: {sorted(group_posture_pubs)}')
         return not problems, {'problems': problems, 'cmd_vel_publishers': cmd_pubs,
                               'system_publishers': sys_pubs}
 

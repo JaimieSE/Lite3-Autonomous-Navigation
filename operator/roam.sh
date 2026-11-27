@@ -83,7 +83,7 @@ case "$CMD" in
     set -e
     rm -f "$ROAM_PID_FILE"
     exit $CODE ;;
-  pause|resume|stop|status|modes)
+  pause|resume|stop|status|modes|automode)
     exec python3 -m lite3_movement_tests.roam "$CMD" ;;
   plan)
     case " $* " in *" --max-speed "*) ;; *) set -- --max-speed "${ROAM_NAV_MAX_SPEED:-0.50}" "$@" ;; esac
@@ -101,5 +101,5 @@ case "$CMD" in
   help|-h|--help)
     sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'
     exec python3 -m lite3_movement_tests.roam run --help ;;
-  *) echo "Unknown command '$CMD' (start, plan, pause, resume, stop, speed, gait, stairs, status, modes, help)"; exit 2 ;;
+  *) echo "Unknown command '$CMD' (start, plan, pause, resume, stop, automode, speed, gait, stairs, status, modes, help)"; exit 2 ;;
 esac

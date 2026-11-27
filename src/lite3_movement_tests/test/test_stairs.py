@@ -358,7 +358,7 @@ def test_ai_walk_ignores_the_front_sensor_until_it_has_climbed():
 
 
 def test_ai_mode_walks_faster_by_default():
-    """Operator 2026-11-26: AI mode faster - forward joystick value 22000 (was 18000, 12000)."""
+    """Operator 2026-11-27: forward joystick value 22000 for faster AI mode (was 18000, the 06:24 SGT stairs run)."""
     from lite3_movement_tests import roam as R
     assert R.AI_AXIS_FORWARD == 22000 and R.RoamConfig().ai_axis_forward == 22000
     assert R.build_parser().parse_args(['run']).ai_axis_forward == 22000 if hasattr(R, 'build_parser') else True
